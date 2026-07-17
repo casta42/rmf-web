@@ -32,4 +32,10 @@ config = {
     # e.g.
     #   Run with sim time: ["-p", "use_sim_time:=true"]
     "ros_args": [],
+    # when True, logs are emitted as JSON lines instead of plain text.
+    "json_logging": False,
+    # battery fraction (0.0 depleted - 1.0 full) below which a low battery alert is created.
+    "low_battery_threshold": 0.15,
+    # seconds a robot may stay stationary while executing a task before a stuck alert is created.
+    "stuck_timeout": 60,
 }

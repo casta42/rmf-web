@@ -33,7 +33,7 @@ from .models import (
     User,
 )
 from .models import tortoise_models as ttm
-from .repositories import TaskRepository
+from .repositories import AlertRepository, TaskRepository
 from .rmf_io import HealthWatchdog, RmfBookKeeper, rmf_events
 from .types import is_coroutine
 
@@ -118,6 +118,9 @@ async def lifespan(_app: FastIO):
     health_watchdog = HealthWatchdog(
         rmf_events,
         logger=logger.getChild("HealthWatchdog"),
+        alert_repository=AlertRepository(
+            User(username="__rmf_internal__", is_admin=True), None
+        ),
     )
     await health_watchdog.start()
 

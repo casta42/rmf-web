@@ -1,5 +1,7 @@
+import asyncio
 import logging
-from typing import Any, Callable, Dict, Optional, TypeVar, cast
+from datetime import datetime
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Set, TypeVar, cast
 
 from reactivex import Observable, compose
 from reactivex import operators as ops
@@ -19,17 +21,23 @@ from api_server.models import (
     DispenserState,
     DoorHealth,
     DoorState,
+    FleetState,
     HealthStatus,
     Ingestor,
     IngestorHealth,
     IngestorState,
     LiftHealth,
     LiftState,
+    RobotHealth,
 )
 from api_server.models import tortoise_models as ttm
 
-from .events import RmfEvents
+from .events import RmfEvents, alert_events
 from .operators import filter_not_none, heartbeat, most_critical
+
+if TYPE_CHECKING:
+    # not imported at runtime, `api_server.repositories` imports `api_server.rmf_io`
+    from api_server.repositories import AlertRepository
 
 T = TypeVar("T", bound=BasicHealth)
 
@@ -43,16 +51,24 @@ class HealthWatchdog:
         *,
         scheduler: Optional[Scheduler] = None,
         logger: Optional[logging.Logger] = None,
+        alert_repository: Optional["AlertRepository"] = None,
     ):
         self.rmf = rmf_events
         self.scheduler = scheduler
         self.logger = logger or logging.getLogger(self.__class__.__name__)
+        self.alert_repository = alert_repository
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # robots currently in an offline episode, an alert is created only on
+        # the transition into the episode (FR-17)
+        self._offline_robots: Set[str] = set()
 
     async def start(self):
+        self._loop = asyncio.get_event_loop()
         await self._watch_door_health()
         await self._watch_lift_health()
         await self._watch_dispenser_health()
         await self._watch_ingestor_health()
+        await self._watch_robot_health()
 
     @staticmethod
     def _combine_most_critical(
@@ -385,3 +401,67 @@ class HealthWatchdog:
                 subjects[state.guid].on_next(state)
 
         self.rmf.ingestor_states.subscribe(on_state)
+
+    async def _watch_robot_health(self):
+        """
+        FR-17: Watches robot liveliness based on the fleet states received from the
+        fleet adapters. A robot whose fleet stops reporting it within `LIVELINESS`
+        is marked `DEAD` and a "robot" category alert is created, once per offline
+        episode.
+        """
+
+        def to_robot_health(id_: str, has_heartbeat: bool):
+            if has_heartbeat:
+                return RobotHealth(
+                    id_=id_, health_status=HealthStatus.HEALTHY, health_message=""
+                )
+            return RobotHealth(
+                id_=id_,
+                health_status=HealthStatus.DEAD,
+                health_message="heartbeat failed",
+            )
+
+        def watch(id_: str, obs: Observable):
+            obs.pipe(
+                heartbeat(self.LIVELINESS),
+                ops.map(lambda has_heartbeat: to_robot_health(id_, has_heartbeat)),
+            ).subscribe(self.rmf.robot_health.on_next, scheduler=self.scheduler)
+
+        subjects: Dict[str, BehaviorSubject] = {}
+
+        def on_state(state: FleetState):
+            if state.name is None or not state.robots:
+                return
+            for robot_name in state.robots:
+                id_ = f"{state.name}/{robot_name}"
+                if id_ not in subjects:
+                    subjects[id_] = BehaviorSubject(state)
+                    watch(id_, subjects[id_])
+                else:
+                    subjects[id_].on_next(state)
+
+        self.rmf.fleet_states.subscribe(on_state)
+        self.rmf.robot_health.subscribe(self._on_robot_health)
+
+    def _on_robot_health(self, health: RobotHealth):
+        if health.health_status == HealthStatus.DEAD:
+            if health.id_ not in self._offline_robots:
+                self._offline_robots.add(health.id_)
+                self._create_robot_offline_alert(health.id_)
+        elif health.health_status == HealthStatus.HEALTHY:
+            self._offline_robots.discard(health.id_)
+
+    def _create_robot_offline_alert(self, robot_id: str):
+        alert_repository = self.alert_repository
+        if alert_repository is None or self._loop is None:
+            return
+        fleet, _, robot = robot_id.partition("/")
+        unix_millis = round(datetime.now().timestamp() * 1e3)
+        alert_id = f"robot_offline__{fleet}__{robot}__{unix_millis}"
+
+        async def create():
+            alert = await alert_repository.create_alert(alert_id, "robot")
+            if alert is not None:
+                alert_events.alerts.on_next(alert)
+
+        self._loop.create_task(create())

@@ -19,6 +19,7 @@ from api_server.models import (
     IngestorState,
     LiftHealth,
     LiftState,
+    RobotHealth,
 )
 from api_server.models import tortoise_models as ttm
 
@@ -101,6 +102,7 @@ class RmfBookKeeper:
         self._record_dispenser_health()
         self._record_ingestor_state()
         self._record_ingestor_health()
+        self._record_robot_health()
 
     async def stop(self):
         for sub in self._subscriptions:
@@ -213,4 +215,15 @@ class RmfBookKeeper:
 
         self._subscriptions.append(
             self.rmf.ingestor_health.subscribe(lambda x: self._create_task(update(x)))
+        )
+
+    def _record_robot_health(self):
+        async def update(health: RobotHealth):
+            await ttm.RobotHealth.update_or_create(
+                health.model_dump(exclude={"id_"}), id_=health.id_
+            )
+            self._report_health(health, self._loggers.robot_health)
+
+        self._subscriptions.append(
+            self.rmf.robot_health.subscribe(lambda x: self._create_task(update(x)))
         )

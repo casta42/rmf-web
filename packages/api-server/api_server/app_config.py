@@ -21,6 +21,14 @@ class AppConfig:
     aud: str
     iss: Optional[str]
     ros_args: List[str]
+    # FR-27: when True, logs are emitted as JSON lines instead of plain text.
+    json_logging: bool = False
+    # FR-17: battery fraction (0.0 depleted - 1.0 full) below which a low
+    # battery alert is created.
+    low_battery_threshold: float = 0.15
+    # FR-17: seconds a robot may stay stationary while executing a task before
+    # a stuck alert is created.
+    stuck_timeout: float = 60
 
     def __post_init__(self):
         self.public_url = urllib.parse.urlparse(cast(str, self.public_url))
