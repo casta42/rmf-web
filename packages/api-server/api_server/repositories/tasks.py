@@ -4,7 +4,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import tortoise.functions as tfuncs
 from fastapi import Depends, HTTPException
-from tortoise.exceptions import FieldError, IntegrityError
+from tortoise.exceptions import FieldError, IntegrityError, TransactionManagementError
 from tortoise.expressions import Expression, Q
 from tortoise.query_utils import Prefetch
 from tortoise.transactions import in_transaction
@@ -65,10 +65,14 @@ class TaskRepository:
         # transaction snapshot that predates the winner's commit, so it sees
         # nothing, tries to create, and aborts on the duplicate key. The row
         # is guaranteed to exist by then, so one retry in a fresh transaction
-        # always resolves to the update path.
+        # always resolves to the update path. The escaping exception is
+        # usually TransactionManagementError, not the IntegrityError itself:
+        # tortoise's get_or_create catches the IntegrityError and re-runs the
+        # get on the same already-aborted postgres transaction (verified live
+        # in the post-soak smoke).
         try:
             await self._save_task_state_once(task_state)
-        except IntegrityError:
+        except (IntegrityError, TransactionManagementError):
             await self._save_task_state_once(task_state)
 
     async def _save_task_state_once(self, task_state: TaskState) -> None:
