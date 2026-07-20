@@ -182,16 +182,16 @@ async def process_msg(msg: Dict[str, Any], fleet_repo: FleetRepository) -> None:
         await task_repo.save_task_state(task_state)
         task_events.task_states.on_next(task_state)
 
-        if task_state.status == mdl.TaskStatus.completed:
-            alert = await alert_repo.create_alert(task_state.booking.id, "task")
-            if alert is not None:
-                alert_events.alerts.on_next(alert)
-        elif task_state.status in (
+        # F-22: alerts are exceptions (FR-17) - a cleanly completed task must
+        # NOT leave an open alert. The upstream completed-task alert grew
+        # monotonically with dispatch count during the soak (81 open alerts
+        # after 2.5 h of traffic) and buried the real ones. Only failed and
+        # canceled tasks alert; terminal states may be re-broadcast, so alert
+        # once per task.
+        if task_state.status in (
             mdl.TaskStatus.failed,
             mdl.TaskStatus.canceled,
         ):
-            # FR-17: failed and canceled tasks raise an alert as well. Terminal
-            # states may be re-broadcast, only alert once per task.
             if not await alert_repo.alert_exists(task_state.booking.id):
                 alert = await alert_repo.create_alert(task_state.booking.id, "task")
                 if alert is not None:

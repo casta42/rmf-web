@@ -59,16 +59,29 @@ class TaskRepository:
             )
 
     async def save_task_state(self, task_state: TaskState) -> None:
+        # F-19: update_or_create is get-then-create, and two writers race on
+        # first insert - the dispatch_task response handler vs the _internal
+        # websocket ingest. The loser's select_for_update() ran inside a
+        # transaction snapshot that predates the winner's commit, so it sees
+        # nothing, tries to create, and aborts on the duplicate key. The row
+        # is guaranteed to exist by then, so one retry in a fresh transaction
+        # always resolves to the update path.
+        try:
+            await self._save_task_state_once(task_state)
+        except IntegrityError:
+            await self._save_task_state_once(task_state)
+
+    async def _save_task_state_once(self, task_state: TaskState) -> None:
         async with in_transaction():
             db_task_state, created = await DbTaskState.update_or_create(
                 {
                     "data": task_state.model_dump_json(),
-                    "category": task_state.category.root
-                    if task_state.category
-                    else None,
-                    "assigned_to": task_state.assigned_to.name
-                    if task_state.assigned_to
-                    else None,
+                    "category": (
+                        task_state.category.root if task_state.category else None
+                    ),
+                    "assigned_to": (
+                        task_state.assigned_to.name if task_state.assigned_to else None
+                    ),
                     "unix_millis_start_time": task_state.unix_millis_start_time
                     and datetime.fromtimestamp(
                         task_state.unix_millis_start_time / 1000
@@ -82,9 +95,11 @@ class TaskRepository:
                     and datetime.fromtimestamp(
                         task_state.booking.unix_millis_request_time / 1000
                     ),
-                    "requester": task_state.booking.requester
-                    if task_state.booking.requester
-                    else None,
+                    "requester": (
+                        task_state.booking.requester
+                        if task_state.booking.requester
+                        else None
+                    ),
                 },
                 id_=task_state.booking.id,
             )

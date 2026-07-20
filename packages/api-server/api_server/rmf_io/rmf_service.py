@@ -93,7 +93,7 @@ class RmfService:
             # this subscription callback, which runs in the rclpy.spin() thread
             # (see ros.py) and would terminate it -- after which the node stops
             # processing every subscription and all later calls time out.
-            logging.warning(
+            self._logger.warning(
                 f"Ignoring duplicate response for request id: {msg.request_id}"
             )
             return
