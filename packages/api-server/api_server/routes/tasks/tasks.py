@@ -13,9 +13,12 @@ from api_server.dependencies import (
     start_time_between_query,
 )
 from api_server.fast_io import FastIORouter, SubscriptionRequest
-from api_server.repositories import TaskRepository, task_repo_dep
+from api_server.models import tortoise_models as ttm
+from api_server.models.building_map import BuildingMap
+from api_server.repositories import FleetRepository, TaskRepository, task_repo_dep
 from api_server.response import RawJSONResponse
 from api_server.rmf_io import task_events, tasks_service
+from api_server.routes.tasks import dispatch_guard
 
 router = FastIORouter(tags=["Tasks"])
 
@@ -50,8 +53,7 @@ async def query_task_states(
         finish_time_between_query
     ),
     status: Optional[str] = Query(None, description="comma separated list of statuses"),
-    label: str
-    | None = Query(
+    label: str | None = Query(
         None,
         description="comma separated list of labels, each item must be in the form <key>=<value>, multiple items will filter tasks with all the labels",
     ),
@@ -144,6 +146,27 @@ async def post_dispatch_task(
     request: mdl.DispatchTaskRequest = Body(...),
     task_repo: TaskRepository = Depends(task_repo_dep),
 ):
+    # F-34 dispatch guard: reject a patrol whose final destination is
+    # already occupied by a parked robot (collision course on hardware
+    # with finishing_request "nothing"; fails open on missing data).
+    place = dispatch_guard.patrol_final_place(request.request)
+    if place is not None:
+        ttm_map = await ttm.BuildingMap.first()
+        if ttm_map is not None:
+            vertex = dispatch_guard.find_vertex(
+                BuildingMap.from_tortoise(ttm_map), place
+            )
+            if vertex is not None:
+                fleets = await FleetRepository(task_repo.user).get_all_fleets()
+                occupier = dispatch_guard.parked_robot_near(fleets, *vertex)
+                if occupier is not None:
+                    raise HTTPException(
+                        409,
+                        detail=(
+                            f"destination [{place}] is occupied by parked "
+                            f"robot [{occupier}] (F-34); dispatch rejected"
+                        ),
+                    )
     resp = mdl.TaskDispatchResponse.model_validate_json(
         await tasks_service().call(request.model_dump_json(exclude_none=True))
     )
