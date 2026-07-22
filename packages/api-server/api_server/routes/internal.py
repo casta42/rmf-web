@@ -2,13 +2,14 @@
 import math
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from api_server import models as mdl
 from api_server.app_config import app_config
 from api_server.logger import logger as base_logger
+from api_server.models import tortoise_models as ttm
 from api_server.models.rmf_api.robot_state import Status as RobotStatus
 from api_server.repositories import AlertRepository, FleetRepository, TaskRepository
 from api_server.rmf_io import alert_events, fleet_events, rmf_events, task_events
@@ -28,6 +29,13 @@ STUCK_MOVE_EPSILON = 0.05
 # FR-17 stuck robot alerts: a stuck episode re-arms only after the robot moves
 # more than this distance (meters) away from the stuck position.
 STUCK_REARM_DISTANCE = 0.2
+# F-12 ghost charge tasks: reap at most this often per fleet (seconds).
+CHARGE_GHOST_REAP_PERIOD = 30.0
+CHARGE_GHOST_CATEGORY = "Charge Battery"
+# F-12: an idle robot at/above this SoC finished charging even if the auto
+# charge task never said so (recharge_soc is 1.0 fleet-side; margin for the
+# publish race between battery state and task state).
+CHARGE_GHOST_FULL_SOC = 0.9
 
 
 @dataclass
@@ -37,7 +45,7 @@ class _StuckState:
     x: float
     y: float
     since_millis: int
-    alerted: bool = False
+    alert_id: Optional[str] = None
 
 
 # per `{fleet}/{robot}`, whether a low battery alert was already created for the
@@ -45,6 +53,10 @@ class _StuckState:
 _low_battery_alerted: Dict[str, bool] = {}
 # per `{fleet}/{robot}` stuck episode tracking (FR-17)
 _stuck_states: Dict[str, _StuckState] = {}
+# per fleet, wall-clock time of the last ghost charge task reap (F-12)
+_last_charge_reap: Dict[str, float] = {}
+# robots whose stale stuck alerts from a previous server life were swept (F-29)
+_stuck_stale_swept: set = set()
 
 
 def log_phase_has_error(phase: mdl.Phases) -> bool:
@@ -110,42 +122,51 @@ def _is_executing_task(robot: mdl.RobotState) -> bool:
 
 def check_robot_stuck(
     robot_id: str, robot: mdl.RobotState, now_millis: int
-) -> Optional[str]:
+) -> Tuple[Optional[str], Optional[str]]:
     """
-    FR-17: Returns a "robot_stuck" alert id when the robot has moved less than
+    FR-17: Returns `(new_alert_id, resolved_alert_id)` (at most one is set).
+    A "robot_stuck" alert id is returned when the robot has moved less than
     `STUCK_MOVE_EPSILON` meters over `stuck_timeout` seconds while executing a
-    task, once per stuck episode. An episode re-arms only after the robot moves
-    more than `STUCK_REARM_DISTANCE` meters away from the stuck position.
+    task, once per stuck episode.
+
+    F-29: the episode's alert is returned for resolution — alerts are current
+    exceptions, not history (F-22) — as soon as the robot moves more than
+    `STUCK_REARM_DISTANCE` meters away from the stuck position OR stops
+    executing a task (86 unresolved pages accumulated over the 2026-07-20
+    soak, mostly patrols dispatched to the robot's current waypoint that
+    finished without any motion). Either way the episode re-arms.
     """
     if robot.location is None:
-        return None
+        return None, None
     state = _stuck_states.get(robot_id)
     if state is None:
         _stuck_states[robot_id] = _StuckState(
             robot.location.x, robot.location.y, now_millis
         )
-        return None
+        return None, None
     dist = math.hypot(robot.location.x - state.x, robot.location.y - state.y)
-    if state.alerted:
-        if dist > STUCK_REARM_DISTANCE:
+    if state.alert_id is not None:
+        if dist > STUCK_REARM_DISTANCE or not _is_executing_task(robot):
+            resolved = state.alert_id
             _stuck_states[robot_id] = _StuckState(
                 robot.location.x, robot.location.y, now_millis
             )
-        return None
+            return None, resolved
+        return None, None
     if dist >= STUCK_MOVE_EPSILON:
         _stuck_states[robot_id] = _StuckState(
             robot.location.x, robot.location.y, now_millis
         )
-        return None
+        return None, None
     if not _is_executing_task(robot):
         # an idle or charging robot is expected to be stationary
         state.since_millis = now_millis
-        return None
+        return None, None
     if now_millis - state.since_millis >= app_config.stuck_timeout * 1000:
-        state.alerted = True
         fleet, _, robot_name = robot_id.partition("/")
-        return f"robot_stuck__{fleet}__{robot_name}__{now_millis}"
-    return None
+        state.alert_id = f"robot_stuck__{fleet}__{robot_name}__{now_millis}"
+        return state.alert_id, None
+    return None, None
 
 
 async def process_robot_alerts(fleet_state: mdl.FleetState) -> None:
@@ -155,15 +176,86 @@ async def process_robot_alerts(fleet_state: mdl.FleetState) -> None:
     now_millis = round(datetime.now().timestamp() * 1e3)
     for robot_name, robot in fleet_state.robots.items():
         robot_id = f"{fleet_state.name}/{robot_name}"
+        if robot_id not in _stuck_stale_swept:
+            # F-29: episode tracking is in-memory — open stuck alerts from a
+            # previous server life can never be resolved by it, so sweep them
+            # on the robot's first sighting.
+            _stuck_stale_swept.add(robot_id)
+            await alert_repo.resolve_alerts_by_prefix(
+                f"robot_stuck__{fleet_state.name}__{robot_name}__"
+            )
+        stuck_new, stuck_resolved = check_robot_stuck(robot_id, robot, now_millis)
+        if stuck_resolved is not None:
+            await alert_repo.resolve_alert(stuck_resolved)
         for alert_id in (
             check_low_battery(robot_id, robot, now_millis),
-            check_robot_stuck(robot_id, robot, now_millis),
+            stuck_new,
         ):
             if alert_id is None:
                 continue
             alert = await alert_repo.create_alert(alert_id, "robot")
             if alert is not None:
                 alert_events.alerts.on_next(alert)
+
+
+def classify_charge_ghost(robot: mdl.RobotState, task_id: str) -> Optional[str]:
+    """F-12: terminal status owed to a standby ChargeBattery task assigned to
+    this robot, or None to leave the task alone.
+
+    The Humble fleet adapter's automatic charge tasks never publish a
+    terminal state: superseded by the next dispatch they stay `standby`
+    forever and survive rmf-core restarts as ghosts (135 accumulated over
+    the 2026-07-20 soak). Upstream is off-limits (no hard fork), so the
+    api-server closes them out from observed fleet state instead:
+      - robot executing a different task -> the charge task was superseded
+        -> "killed" (honest: terminated, goal not necessarily reached);
+      - robot not executing and back at/above CHARGE_GHOST_FULL_SOC ->
+        the charge finished but never said so -> "completed".
+    A standby charge task the robot is about to run (idle, still low) is
+    left untouched.
+    """
+    if not task_id or robot.task_id == task_id:
+        return None
+    if _is_executing_task(robot):
+        return "killed"
+    if (
+        robot.status != RobotStatus.charging
+        and robot.battery is not None
+        and robot.battery >= CHARGE_GHOST_FULL_SOC
+    ):
+        return "completed"
+    return None
+
+
+async def reap_charge_ghosts(fleet_state: mdl.FleetState) -> None:
+    """F-12: close out ghost ChargeBattery tasks (see classify_charge_ghost).
+    Runs at most once per CHARGE_GHOST_REAP_PERIOD per fleet."""
+    if fleet_state.name is None or not fleet_state.robots:
+        return
+    now = datetime.now().timestamp()
+    if now - _last_charge_reap.get(fleet_state.name, 0.0) < CHARGE_GHOST_REAP_PERIOD:
+        return
+    _last_charge_reap[fleet_state.name] = now
+    for robot_name, robot in fleet_state.robots.items():
+        # NB: the DB column stores the stringified enum ("Status.standby"),
+        # so filter with the enum member exactly like query_task_states does.
+        ghosts = await ttm.TaskState.filter(
+            status=mdl.TaskStatus.standby,
+            category=CHARGE_GHOST_CATEGORY,
+            assigned_to=robot_name,
+        )
+        for ghost in ghosts:
+            verdict = classify_charge_ghost(robot, ghost.id_)
+            if verdict is None:
+                continue
+            task_state = mdl.TaskState(**ghost.data)
+            task_state.status = mdl.TaskStatus(verdict)
+            await task_repo.save_task_state(task_state)
+            task_events.task_states.on_next(task_state)
+            logger.info(
+                f"F-12: reaped ghost charge task {ghost.id_} for "
+                f"{fleet_state.name}/{robot_name} -> {verdict}"
+            )
 
 
 async def process_msg(msg: Dict[str, Any], fleet_repo: FleetRepository) -> None:
@@ -214,6 +306,7 @@ async def process_msg(msg: Dict[str, Any], fleet_repo: FleetRepository) -> None:
         # feeds the health watchdog's robot heartbeats (FR-17 robot offline)
         rmf_events.fleet_states.on_next(fleet_state)
         await process_robot_alerts(fleet_state)
+        await reap_charge_ghosts(fleet_state)
 
     elif payload_type == "fleet_log_update":
         fleet_log = mdl.FleetLog(**msg["data"])

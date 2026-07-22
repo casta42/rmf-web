@@ -52,6 +52,35 @@ class AlertRepository:
         alert_pydantic = await ttm.AlertPydantic.from_tortoise_orm(alert)
         return alert_pydantic
 
+    async def resolve_alert(self, alert_id: str) -> bool:
+        """F-29: delete an active alert whose condition has cleared.
+
+        Alerts are current exceptions, not history (F-22) — a stuck robot
+        that moves again (or finishes its task in place) must not leave a
+        standing page behind. Returns True when an active alert was
+        removed."""
+        deleted = await ttm.Alert.filter(id=alert_id).delete()
+        if deleted:
+            logger.info(f"Resolved alert {alert_id} (condition cleared)")
+        return bool(deleted)
+
+    async def resolve_alerts_by_prefix(self, original_id_prefix: str) -> int:
+        """F-29: delete every ACTIVE alert whose original_id starts with the
+        prefix; acknowledged history clones (acknowledged_by set) are kept.
+
+        Used to sweep stale episode alerts on api-server restart: episode
+        tracking is in-memory, so an open robot_stuck alert from a previous
+        server life is unverifiable history, not a current exception."""
+        deleted = await ttm.Alert.filter(
+            original_id__startswith=original_id_prefix, acknowledged_by=None
+        ).delete()
+        if deleted:
+            logger.info(
+                f"Resolved {deleted} stale alert(s) matching "
+                f"{original_id_prefix}* (server restart sweep)"
+            )
+        return int(deleted)
+
     async def acknowledge_alert(self, alert_id: str) -> Optional[ttm.AlertPydantic]:
         alert = await ttm.Alert.get_or_none(id=alert_id)
         if alert is None:
