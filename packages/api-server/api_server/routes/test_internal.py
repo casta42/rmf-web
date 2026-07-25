@@ -1,17 +1,20 @@
 import unittest
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from api_server.app_config import app_config
-from api_server.models import RobotState
+from api_server.models import FleetState, RobotState
 from api_server.models.rmf_api.location_2D import Location2D
 from api_server.models.rmf_api.robot_state import Status as RobotStatus
 
 from .internal import (
     CHARGE_GHOST_FULL_SOC,
+    CURRENT_RUN_SLACK,
     LOW_BATTERY_HYSTERESIS,
     STUCK_REARM_DISTANCE,
     _low_battery_alerted,
     _stuck_states,
+    charge_ghost_stale_cutoff,
     check_low_battery,
     check_robot_stuck,
     classify_charge_ghost,
@@ -268,3 +271,43 @@ class TestClassifyChargeGhost(unittest.TestCase):
     def test_empty_task_id_never_classified(self):
         robot = make_robot_state(task_id="patrol.dispatch-1")
         self.assertIsNone(classify_charge_ghost(robot, ""))
+
+
+class TestChargeGhostStaleCutoff(unittest.TestCase):
+    """F-37: a reap may only touch rows written during the current RMF run."""
+
+    NOW = datetime(2026, 7, 25, 16, 0, 0, tzinfo=timezone.utc)
+
+    def make_fleet_state(self, unix_millis_time: Optional[int]) -> FleetState:
+        robot = make_robot_state()
+        robot.unix_millis_time = unix_millis_time
+        return FleetState(name="test_fleet", robots={"test_robot": robot})
+
+    def test_sim_clock_yields_bringup_cutoff(self):
+        # sim clock 2 h into the run: rows older than bringup (minus slack)
+        # are from a previous run
+        two_hours_ms = 2 * 3600 * 1000
+        cutoff = charge_ghost_stale_cutoff(
+            self.make_fleet_state(two_hours_ms), self.NOW
+        )
+        assert cutoff is not None
+        bringup = self.NOW - timedelta(hours=2)
+        self.assertEqual(cutoff, bringup - CURRENT_RUN_SLACK)
+        # a row from yesterday's run is stale, one from this run is not
+        self.assertLess(self.NOW - timedelta(days=1), cutoff)
+        self.assertGreater(self.NOW - timedelta(hours=1), cutoff)
+
+    def test_wall_clock_never_stale(self):
+        # production: RMF runs on the wall epoch, the cutoff lands in 1970
+        # and no honest row can predate it
+        epoch_now_ms = round(self.NOW.timestamp() * 1000)
+        cutoff = charge_ghost_stale_cutoff(
+            self.make_fleet_state(epoch_now_ms), self.NOW
+        )
+        assert cutoff is not None
+        self.assertLess(cutoff.year, 1971)
+
+    def test_no_clock_disables_reaping(self):
+        self.assertIsNone(
+            charge_ghost_stale_cutoff(self.make_fleet_state(None), self.NOW)
+        )

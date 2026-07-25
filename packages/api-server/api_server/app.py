@@ -76,6 +76,18 @@ async def lifespan(_app: FastIO):
         db_url=app_config.db_url,
         modules={"models": ["api_server.models.tortoise_models"]},
     )
+    # F-37: generate_schemas only creates missing tables, it never alters
+    # existing ones — add the wall-clock provenance columns to a database
+    # that predates them. Must run BEFORE generate_schemas: that call also
+    # emits the model's index DDL against existing tables and fails if the
+    # column is missing. IF EXISTS keeps a fresh (empty) database working,
+    # where generate_schemas creates everything itself. Idempotent.
+    await Tortoise.get_connection("default").execute_script(
+        "ALTER TABLE IF EXISTS taskstate ADD COLUMN IF NOT EXISTS "
+        "created_at TIMESTAMPTZ NULL;"
+        "ALTER TABLE IF EXISTS taskstate ADD COLUMN IF NOT EXISTS "
+        "updated_at TIMESTAMPTZ NULL;"
+    )
     # FIXME: do this outside the app as recommended by the docs
     await Tortoise.generate_schemas()
     shutdown_cbs.append(Tortoise.close_connections())

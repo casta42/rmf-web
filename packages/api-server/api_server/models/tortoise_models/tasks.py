@@ -27,6 +27,14 @@ class TaskState(Model):
     status = CharField(255, null=True, index=True)
     unix_millis_request_time = DatetimeField(null=True, index=True)
     requester = CharField(255, null=True, index=True)
+    # F-37: wall-clock row provenance. The task's own unix_millis_* fields
+    # are on RMF's clock, which is the sim clock under use_sim_time and
+    # restarts from zero at every sim bringup — so ids and timestamps from
+    # different runs interleave in a database that outlives them. These two
+    # fields record when THIS database saw the row, on the one clock that
+    # never restarts. NULL means the row predates the upgrade.
+    created_at = DatetimeField(auto_now_add=True, null=True, index=True)
+    updated_at = DatetimeField(auto_now=True, null=True)
     labels: ReverseRelation["TaskLabel"]
 
 

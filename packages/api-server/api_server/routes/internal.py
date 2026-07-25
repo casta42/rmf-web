@@ -1,7 +1,7 @@
 # NOTE: This will eventually replace `gateway.py``
 import math
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -36,6 +36,11 @@ CHARGE_GHOST_CATEGORY = "Charge Battery"
 # charge task never said so (recharge_soc is 1.0 fleet-side; margin for the
 # publish race between battery state and task state).
 CHARGE_GHOST_FULL_SOC = 0.9
+# F-37: slack when deciding whether a task row was written during the
+# current RMF run. Covers sim-clock RTF drift over a 24 h window (1 % of a
+# day is ~15 min) — a stale row from a previous run is hours older, so a
+# generous margin cannot resurrect one.
+CURRENT_RUN_SLACK = timedelta(minutes=30)
 
 
 @dataclass
@@ -227,15 +232,42 @@ def classify_charge_ghost(robot: mdl.RobotState, task_id: str) -> Optional[str]:
     return None
 
 
+def charge_ghost_stale_cutoff(
+    fleet_state: mdl.FleetState, now: datetime
+) -> Optional[datetime]:
+    """F-37: wall-clock time before which a task row cannot belong to the
+    current RMF run. Robot states carry RMF's clock (`unix_millis_time`),
+    which under use_sim_time restarts from zero at sim bringup — so
+    `now - unix_millis_time` is the bringup time. On real deployments the
+    clock is the wall epoch, the cutoff lands in 1970 and nothing is ever
+    considered stale. None (no robot reported a clock) disables reaping —
+    without a cutoff a reap could complete a task from a previous run
+    against today's robot state, which is how the round-three soak grew
+    completed rows for four-day-old tasks."""
+    clock_ms = [
+        r.unix_millis_time
+        for r in fleet_state.robots.values()
+        if r.unix_millis_time is not None
+    ]
+    if not clock_ms:
+        return None
+    return now - timedelta(milliseconds=max(clock_ms)) - CURRENT_RUN_SLACK
+
+
 async def reap_charge_ghosts(fleet_state: mdl.FleetState) -> None:
     """F-12: close out ghost ChargeBattery tasks (see classify_charge_ghost).
-    Runs at most once per CHARGE_GHOST_REAP_PERIOD per fleet."""
+    Runs at most once per CHARGE_GHOST_REAP_PERIOD per fleet. Rows written
+    before the current RMF run (or before the F-37 provenance columns
+    existed) are left untouched."""
     if fleet_state.name is None or not fleet_state.robots:
         return
     now = datetime.now().timestamp()
     if now - _last_charge_reap.get(fleet_state.name, 0.0) < CHARGE_GHOST_REAP_PERIOD:
         return
     _last_charge_reap[fleet_state.name] = now
+    stale_cutoff = charge_ghost_stale_cutoff(fleet_state, datetime.now(timezone.utc))
+    if stale_cutoff is None:
+        return
     for robot_name, robot in fleet_state.robots.items():
         # NB: the DB column stores the stringified enum ("Status.standby"),
         # so filter with the enum member exactly like query_task_states does.
@@ -245,6 +277,8 @@ async def reap_charge_ghosts(fleet_state: mdl.FleetState) -> None:
             assigned_to=robot_name,
         )
         for ghost in ghosts:
+            if ghost.created_at is None or ghost.created_at < stale_cutoff:
+                continue  # previous-run row (F-37)
             verdict = classify_charge_ghost(robot, ghost.id_)
             if verdict is None:
                 continue
