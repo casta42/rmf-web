@@ -53,9 +53,12 @@ class _StuckState:
     alert_id: Optional[str] = None
 
 
-# per `{fleet}/{robot}`, whether a low battery alert was already created for the
-# current low battery episode (FR-17)
-_low_battery_alerted: Dict[str, bool] = {}
+# per `{fleet}/{robot}`, the open low_battery alert id of the current low
+# battery episode (FR-17); resolved and removed on recovery (F-39)
+_low_battery_alerted: Dict[str, str] = {}
+# robots whose stale low_battery alerts from a previous server life were
+# swept (F-39, same reasoning as the F-29 stuck sweep)
+_low_battery_stale_swept: set = set()
 # per `{fleet}/{robot}` stuck episode tracking (FR-17)
 _stuck_states: Dict[str, _StuckState] = {}
 # per fleet, wall-clock time of the last ghost charge task reap (F-12)
@@ -92,25 +95,35 @@ def task_log_has_error(task_log: mdl.TaskEventLog) -> bool:
 
 def check_low_battery(
     robot_id: str, robot: mdl.RobotState, now_millis: int
-) -> Optional[str]:
+) -> Tuple[Optional[str], Optional[str]]:
     """
-    FR-17: Returns a "low_battery" alert id when the robot's battery drops below
+    FR-17: Returns `(new_alert_id, resolved_alert_id)` (at most one is set).
+    A "low_battery" alert id is returned when the robot's battery drops below
     `low_battery_threshold`, once per low battery episode. `RobotState.battery`
     is a fraction, 0.0 (depleted) to 1.0 (fully charged), and so is the
     threshold.
+
+    F-39: the episode's alert is returned for resolution once the battery
+    recovers past threshold + hysteresis — alerts are current exceptions,
+    not history (F-22/F-29). The round-three soak ended with low_battery
+    alerts from robots that had long recharged (and two stale ones from
+    days-old runs) still open.
     """
     if robot.battery is None:
-        return None
+        return None, None
     threshold = app_config.low_battery_threshold
-    if _low_battery_alerted.get(robot_id, False):
+    open_alert = _low_battery_alerted.get(robot_id)
+    if open_alert is not None:
         if robot.battery > threshold + LOW_BATTERY_HYSTERESIS:
-            _low_battery_alerted[robot_id] = False
-        return None
+            del _low_battery_alerted[robot_id]
+            return None, open_alert
+        return None, None
     if robot.battery < threshold:
-        _low_battery_alerted[robot_id] = True
         fleet, _, robot_name = robot_id.partition("/")
-        return f"low_battery__{fleet}__{robot_name}__{now_millis}"
-    return None
+        alert_id = f"low_battery__{fleet}__{robot_name}__{now_millis}"
+        _low_battery_alerted[robot_id] = alert_id
+        return alert_id, None
+    return None, None
 
 
 def _is_executing_task(robot: mdl.RobotState) -> bool:
@@ -189,11 +202,23 @@ async def process_robot_alerts(fleet_state: mdl.FleetState) -> None:
             await alert_repo.resolve_alerts_by_prefix(
                 f"robot_stuck__{fleet_state.name}__{robot_name}__"
             )
+        if robot_id not in _low_battery_stale_swept:
+            # F-39: same for low_battery alerts stranded by a previous
+            # server life (two from days-old runs were still open at the
+            # round-three soak end); the current episode re-alerts within
+            # one fleet-state update if the battery is genuinely low.
+            _low_battery_stale_swept.add(robot_id)
+            await alert_repo.resolve_alerts_by_prefix(
+                f"low_battery__{fleet_state.name}__{robot_name}__"
+            )
+        battery_new, battery_resolved = check_low_battery(robot_id, robot, now_millis)
+        if battery_resolved is not None:
+            await alert_repo.resolve_alert(battery_resolved)
         stuck_new, stuck_resolved = check_robot_stuck(robot_id, robot, now_millis)
         if stuck_resolved is not None:
             await alert_repo.resolve_alert(stuck_resolved)
         for alert_id in (
-            check_low_battery(robot_id, robot, now_millis),
+            battery_new,
             stuck_new,
         ):
             if alert_id is None:

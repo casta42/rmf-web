@@ -45,49 +45,59 @@ class TestCheckLowBattery(unittest.TestCase):
         self.threshold = app_config.low_battery_threshold
 
     def test_alerts_once_per_episode(self):
-        alert_id = check_low_battery(
+        alert_id, resolved = check_low_battery(
             ROBOT_ID, make_robot_state(battery=self.threshold - 0.01), 1000
         )
         self.assertEqual(alert_id, "low_battery__test_fleet__test_robot__1000")
+        self.assertIsNone(resolved)
         # still low, no new alert
-        self.assertIsNone(
+        self.assertEqual(
             check_low_battery(
                 ROBOT_ID, make_robot_state(battery=self.threshold - 0.02), 2000
-            )
+            ),
+            (None, None),
         )
 
-    def test_rearms_after_hysteresis(self):
-        check_low_battery(
+    def test_resolves_and_rearms_after_hysteresis(self):
+        alert_id, _ = check_low_battery(
             ROBOT_ID, make_robot_state(battery=self.threshold - 0.01), 1000
         )
-        # above the threshold but within the hysteresis margin, stays armed off
-        self.assertIsNone(
+        # above the threshold but within the hysteresis margin: the episode
+        # stays open, nothing resolves (F-39)
+        self.assertEqual(
             check_low_battery(
                 ROBOT_ID, make_robot_state(battery=self.threshold + 0.01), 2000
-            )
+            ),
+            (None, None),
         )
-        self.assertIsNone(
+        self.assertEqual(
             check_low_battery(
                 ROBOT_ID, make_robot_state(battery=self.threshold - 0.01), 3000
-            )
+            ),
+            (None, None),
         )
-        # recovers past threshold + hysteresis, the next drop alerts again
-        self.assertIsNone(
+        # recovery past threshold + hysteresis resolves the episode's alert
+        self.assertEqual(
             check_low_battery(
                 ROBOT_ID,
                 make_robot_state(
                     battery=self.threshold + LOW_BATTERY_HYSTERESIS + 0.01
                 ),
                 4000,
-            )
+            ),
+            (None, alert_id),
         )
-        alert_id = check_low_battery(
+        # the next drop opens a fresh episode
+        new_id, resolved = check_low_battery(
             ROBOT_ID, make_robot_state(battery=self.threshold - 0.01), 5000
         )
-        self.assertEqual(alert_id, "low_battery__test_fleet__test_robot__5000")
+        self.assertEqual(new_id, "low_battery__test_fleet__test_robot__5000")
+        self.assertIsNone(resolved)
 
     def test_no_alert_without_battery(self):
-        self.assertIsNone(check_low_battery(ROBOT_ID, make_robot_state(), 1000))
+        self.assertEqual(
+            check_low_battery(ROBOT_ID, make_robot_state(), 1000), (None, None)
+        )
 
 
 class TestCheckRobotStuck(unittest.TestCase):

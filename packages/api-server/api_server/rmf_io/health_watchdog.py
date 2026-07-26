@@ -449,7 +449,13 @@ class HealthWatchdog:
                 self._offline_robots.add(health.id_)
                 self._create_robot_offline_alert(health.id_)
         elif health.health_status == HealthStatus.HEALTHY:
+            # F-39: alerts are current exceptions, not history (F-22/F-29)
+            # — a recovered heartbeat must close its offline alert. The
+            # 00:33–00:44 blip on the round-three soak left ~12 offline
+            # alerts open forever for robots that were demonstrably
+            # working minutes later.
             self._offline_robots.discard(health.id_)
+            self._resolve_robot_offline_alerts(health.id_)
 
     def _create_robot_offline_alert(self, robot_id: str):
         alert_repository = self.alert_repository
@@ -465,3 +471,20 @@ class HealthWatchdog:
                 alert_events.alerts.on_next(alert)
 
         self._loop.create_task(create())
+
+    def _resolve_robot_offline_alerts(self, robot_id: str):
+        """F-39: resolve every open robot_offline alert of this robot —
+        by id prefix, which also sweeps alerts stranded by previous
+        server lives (episode tracking is in-memory, same reasoning as
+        the F-29 stuck-alert sweep) and by ingest hiccups that flip
+        several episodes before the first resolution lands."""
+        alert_repository = self.alert_repository
+        if alert_repository is None or self._loop is None:
+            return
+        fleet, _, robot = robot_id.partition("/")
+        prefix = f"robot_offline__{fleet}__{robot}__"
+
+        async def resolve():
+            await alert_repository.resolve_alerts_by_prefix(prefix)
+
+        self._loop.create_task(resolve())
