@@ -38,4 +38,6 @@ config = {
     "low_battery_threshold": 0.15,
     # seconds a robot may stay stationary while executing a task before a stuck alert is created.
     "stuck_timeout": 60,
+    # path to the site's zones.yaml served read-only at /zones (None disables).
+    "zones_file": None,
 }

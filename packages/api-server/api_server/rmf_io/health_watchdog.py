@@ -466,7 +466,14 @@ class HealthWatchdog:
         alert_id = f"robot_offline__{fleet}__{robot}__{unix_millis}"
 
         async def create():
-            alert = await alert_repository.create_alert(alert_id, "robot")
+            alert = await alert_repository.create_alert(
+                alert_id,
+                "robot",
+                severity=ttm.Alert.Severity.Critical,
+                fleet=fleet,
+                robot=robot,
+                message="Robot heartbeat lost — offline",
+            )
             if alert is not None:
                 alert_events.alerts.on_next(alert)
 
@@ -485,6 +492,8 @@ class HealthWatchdog:
         prefix = f"robot_offline__{fleet}__{robot}__"
 
         async def resolve():
-            await alert_repository.resolve_alerts_by_prefix(prefix)
+            # FR-31: archived, not deleted; emit so open-alert views update live.
+            for resolved in await alert_repository.resolve_alerts_by_prefix(prefix):
+                alert_events.alerts.on_next(resolved)
 
         self._loop.create_task(resolve())

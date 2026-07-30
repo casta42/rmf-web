@@ -213,17 +213,40 @@ async def process_robot_alerts(fleet_state: mdl.FleetState) -> None:
             )
         battery_new, battery_resolved = check_low_battery(robot_id, robot, now_millis)
         if battery_resolved is not None:
-            await alert_repo.resolve_alert(battery_resolved)
+            resolved = await alert_repo.resolve_alert(battery_resolved)
+            if resolved is not None:
+                alert_events.alerts.on_next(resolved)
         stuck_new, stuck_resolved = check_robot_stuck(robot_id, robot, now_millis)
         if stuck_resolved is not None:
-            await alert_repo.resolve_alert(stuck_resolved)
-        for alert_id in (
-            battery_new,
-            stuck_new,
-        ):
-            if alert_id is None:
-                continue
-            alert = await alert_repo.create_alert(alert_id, "robot")
+            resolved = await alert_repo.resolve_alert(stuck_resolved)
+            if resolved is not None:
+                alert_events.alerts.on_next(resolved)
+        if battery_new is not None:
+            battery_pct = (
+                f"{round(robot.battery * 100)} %" if robot.battery is not None else "low"
+            )
+            alert = await alert_repo.create_alert(
+                battery_new,
+                "robot",
+                severity=ttm.Alert.Severity.Warning,
+                fleet=fleet_state.name,
+                robot=robot_name,
+                message=f"Battery at {battery_pct}",
+            )
+            if alert is not None:
+                alert_events.alerts.on_next(alert)
+        if stuck_new is not None:
+            alert = await alert_repo.create_alert(
+                stuck_new,
+                "robot",
+                severity=ttm.Alert.Severity.Warning,
+                fleet=fleet_state.name,
+                robot=robot_name,
+                message=(
+                    f"Robot has not moved for {round(app_config.stuck_timeout)} s "
+                    "while on a task"
+                ),
+            )
             if alert is not None:
                 alert_events.alerts.on_next(alert)
 
@@ -344,7 +367,19 @@ async def process_msg(msg: Dict[str, Any], fleet_repo: FleetRepository) -> None:
             mdl.TaskStatus.canceled,
         ):
             if not await alert_repo.alert_exists(task_state.booking.id):
-                alert = await alert_repo.create_alert(task_state.booking.id, "task")
+                assigned = task_state.assigned_to
+                alert = await alert_repo.create_alert(
+                    task_state.booking.id,
+                    "task",
+                    severity=(
+                        ttm.Alert.Severity.Critical
+                        if task_state.status == mdl.TaskStatus.failed
+                        else ttm.Alert.Severity.Info
+                    ),
+                    fleet=assigned.group if assigned is not None else None,
+                    robot=assigned.name if assigned is not None else None,
+                    message=f"Task {task_state.booking.id} {task_state.status.value}",
+                )
                 if alert is not None:
                     alert_events.alerts.on_next(alert)
 
@@ -354,7 +389,12 @@ async def process_msg(msg: Dict[str, Any], fleet_repo: FleetRepository) -> None:
         task_events.task_event_logs.on_next(task_log)
 
         if task_log_has_error(task_log):
-            alert = await alert_repo.create_alert(task_log.task_id, "task")
+            alert = await alert_repo.create_alert(
+                task_log.task_id,
+                "task",
+                severity=ttm.Alert.Severity.Critical,
+                message=f"Task {task_log.task_id} reported an error in its event log",
+            )
             if alert is not None:
                 alert_events.alerts.on_next(alert)
 

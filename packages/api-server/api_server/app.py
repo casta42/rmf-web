@@ -82,12 +82,43 @@ async def lifespan(_app: FastIO):
     # emits the model's index DDL against existing tables and fails if the
     # column is missing. IF EXISTS keeps a fresh (empty) database working,
     # where generate_schemas creates everything itself. Idempotent.
-    await Tortoise.get_connection("default").execute_script(
-        "ALTER TABLE IF EXISTS taskstate ADD COLUMN IF NOT EXISTS "
-        "created_at TIMESTAMPTZ NULL;"
-        "ALTER TABLE IF EXISTS taskstate ADD COLUMN IF NOT EXISTS "
-        "updated_at TIMESTAMPTZ NULL;"
-    )
+    # Postgres-only syntax: sqlite (tests, sqlite_local_config dev runs)
+    # always starts fresh, so generate_schemas covers it and the ALTERs
+    # must not run there.
+    if Tortoise.get_connection("default").capabilities.dialect == "postgres":
+        await Tortoise.get_connection("default").execute_script(
+            "ALTER TABLE IF EXISTS taskstate ADD COLUMN IF NOT EXISTS "
+            "created_at TIMESTAMPTZ NULL;"
+            "ALTER TABLE IF EXISTS taskstate ADD COLUMN IF NOT EXISTS "
+            "updated_at TIMESTAMPTZ NULL;"
+            # FR-31 alert model v2 (idempotent, same pattern as F-37 above).
+            # Pre-v2 rows get severity 'warning' and null context fields;
+            # generate_schemas below cannot alter existing tables, so the
+            # new columns must be added here.
+            "ALTER TABLE IF EXISTS alert ADD COLUMN IF NOT EXISTS "
+            "severity VARCHAR(8) NOT NULL DEFAULT 'warning';"
+            "ALTER TABLE IF EXISTS alert ADD COLUMN IF NOT EXISTS "
+            "fleet VARCHAR(255) NULL;"
+            "ALTER TABLE IF EXISTS alert ADD COLUMN IF NOT EXISTS "
+            "robot VARCHAR(255) NULL;"
+            "ALTER TABLE IF EXISTS alert ADD COLUMN IF NOT EXISTS "
+            "message TEXT NULL;"
+            "ALTER TABLE IF EXISTS alert ADD COLUMN IF NOT EXISTS "
+            "resolved_by VARCHAR(255) NULL;"
+            "ALTER TABLE IF EXISTS alert ADD COLUMN IF NOT EXISTS "
+            "unix_millis_resolved_time BIGINT NULL;"
+            # Backfill: pre-v2 acknowledge deleted the live row and kept a
+            # permanent ack-clone (acknowledged_by set) as history. Under v2
+            # semantics (open == unresolved) those clones must read as
+            # RESOLVED, or every historically-acked alert reappears as a
+            # current problem after the upgrade. Idempotent via the WHERE.
+            "UPDATE alert SET "
+            "resolved_by = COALESCE(resolved_by, acknowledged_by), "
+            "unix_millis_resolved_time = COALESCE(unix_millis_resolved_time, "
+            "unix_millis_acknowledged_time) "
+            "WHERE acknowledged_by IS NOT NULL "
+            "AND unix_millis_resolved_time IS NULL;"
+        )
     # FIXME: do this outside the app as recommended by the docs
     await Tortoise.generate_schemas()
     shutdown_cbs.append(Tortoise.close_connections())
@@ -222,6 +253,9 @@ app.include_router(
     routes.favorite_tasks_router,
     prefix="/favorite_tasks",
     dependencies=[Depends(user_dep)],
+)
+app.include_router(
+    routes.zones_router, prefix="/zones", dependencies=[Depends(user_dep)]
 )
 app.include_router(
     routes.dispensers_router, prefix="/dispensers", dependencies=[Depends(user_dep)]

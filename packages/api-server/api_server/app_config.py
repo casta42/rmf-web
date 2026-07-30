@@ -29,6 +29,9 @@ class AppConfig:
     # FR-17: seconds a robot may stay stationary while executing a task before
     # a stuck alert is created.
     stuck_timeout: float = 60
+    # DR-3/FR-10: path to the site's zones.yaml served read-only at /zones
+    # for the dashboard map overlays. None disables the route (404).
+    zones_file: Optional[str] = None
 
     def __post_init__(self):
         self.public_url = urllib.parse.urlparse(cast(str, self.public_url))

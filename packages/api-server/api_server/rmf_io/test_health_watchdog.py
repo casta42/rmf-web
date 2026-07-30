@@ -14,9 +14,13 @@ class StubAlertRepository:
     def __init__(self):
         self.created: List[Tuple[str, str]] = []
 
-    async def create_alert(self, alert_id: str, category: str):
+    async def create_alert(self, alert_id: str, category: str, **_context):
+        # **_context: FR-31 structured fields (severity/fleet/robot/message)
         self.created.append((alert_id, category))
         return None
+
+    async def resolve_alerts_by_prefix(self, _prefix: str, resolved_by: str = ""):
+        return []
 
 
 class TestHealthWatchdogRobotHealth(unittest.IsolatedAsyncioTestCase):
