@@ -61,7 +61,10 @@ async def schedule_task(task: ttm.ScheduledTask, task_repo: TaskRepository):
     def do():
         logger.info(f"starting task {task.pk}")
         datetime_to_iso = datetime.now().isoformat()
-        if datetime_to_iso[:10] in task.except_dates:
+        # except_dates is None (not []) for schedules created without
+        # exceptions — `in None` raised TypeError on EVERY fire, so no
+        # scheduled task ever dispatched (F-64).
+        if task.except_dates and datetime_to_iso[:10] in task.except_dates:
             return
         asyncio.get_event_loop().create_task(run())
 
