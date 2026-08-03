@@ -4078,33 +4078,33 @@ export const AdminApiAxiosParamCreator = function (configuration?: Configuration
       // authentication OpenIdConnect required
 
       if (username !== undefined) {
-        for (const [key, value] of Object.entries(username)) {
-          localVarQueryParameter[key] = value;
-        }
+        // codegen fix: scalar query param — Object.entries() on a
+        // string/number silently drops or mangles it (F-65)
+        localVarQueryParameter['username'] = username;
       }
 
       if (isAdmin !== undefined) {
-        for (const [key, value] of Object.entries(isAdmin)) {
-          localVarQueryParameter[key] = value;
-        }
+        // codegen fix: scalar query param — Object.entries() on a
+        // string/number silently drops or mangles it (F-65)
+        localVarQueryParameter['is_admin'] = isAdmin;
       }
 
       if (limit !== undefined) {
-        for (const [key, value] of Object.entries(limit)) {
-          localVarQueryParameter[key] = value;
-        }
+        // codegen fix: scalar query param — Object.entries() on a
+        // string/number silently drops or mangles it (F-65)
+        localVarQueryParameter['limit'] = limit;
       }
 
       if (offset !== undefined) {
-        for (const [key, value] of Object.entries(offset)) {
-          localVarQueryParameter[key] = value;
-        }
+        // codegen fix: scalar query param — Object.entries() on a
+        // string/number silently drops or mangles it (F-65)
+        localVarQueryParameter['offset'] = offset;
       }
 
       if (orderBy !== undefined) {
-        for (const [key, value] of Object.entries(orderBy)) {
-          localVarQueryParameter[key] = value;
-        }
+        // codegen fix: scalar query param — Object.entries() on a
+        // string/number silently drops or mangles it (F-65)
+        localVarQueryParameter['order_by'] = orderBy;
       }
 
       setSearchParams(localVarUrlObj, localVarQueryParameter);
@@ -5370,51 +5370,51 @@ export const AlertsApiAxiosParamCreator = function (configuration?: Configuratio
       // authentication OpenIdConnect required
 
       if (status !== undefined) {
-        for (const [key, value] of Object.entries(status)) {
-          localVarQueryParameter[key] = value;
-        }
+        // codegen fix: scalar query param — Object.entries() on a
+        // string/number silently drops or mangles it (F-65)
+        localVarQueryParameter['status'] = status;
       }
 
       if (category !== undefined) {
-        for (const [key, value] of Object.entries(category)) {
-          localVarQueryParameter[key] = value;
-        }
+        // codegen fix: scalar query param — Object.entries() on a
+        // string/number silently drops or mangles it (F-65)
+        localVarQueryParameter['category'] = category;
       }
 
       if (severity !== undefined) {
-        for (const [key, value] of Object.entries(severity)) {
-          localVarQueryParameter[key] = value;
-        }
+        // codegen fix: scalar query param — Object.entries() on a
+        // string/number silently drops or mangles it (F-65)
+        localVarQueryParameter['severity'] = severity;
       }
 
       if (fleet !== undefined) {
-        for (const [key, value] of Object.entries(fleet)) {
-          localVarQueryParameter[key] = value;
-        }
+        // codegen fix: scalar query param — Object.entries() on a
+        // string/number silently drops or mangles it (F-65)
+        localVarQueryParameter['fleet'] = fleet;
       }
 
       if (robot !== undefined) {
-        for (const [key, value] of Object.entries(robot)) {
-          localVarQueryParameter[key] = value;
-        }
+        // codegen fix: scalar query param — Object.entries() on a
+        // string/number silently drops or mangles it (F-65)
+        localVarQueryParameter['robot'] = robot;
       }
 
       if (limit !== undefined) {
-        for (const [key, value] of Object.entries(limit)) {
-          localVarQueryParameter[key] = value;
-        }
+        // codegen fix: scalar query param — Object.entries() on a
+        // string/number silently drops or mangles it (F-65)
+        localVarQueryParameter['limit'] = limit;
       }
 
       if (offset !== undefined) {
-        for (const [key, value] of Object.entries(offset)) {
-          localVarQueryParameter[key] = value;
-        }
+        // codegen fix: scalar query param — Object.entries() on a
+        // string/number silently drops or mangles it (F-65)
+        localVarQueryParameter['offset'] = offset;
       }
 
       if (orderBy !== undefined) {
-        for (const [key, value] of Object.entries(orderBy)) {
-          localVarQueryParameter[key] = value;
-        }
+        // codegen fix: scalar query param — Object.entries() on a
+        // string/number silently drops or mangles it (F-65)
+        localVarQueryParameter['order_by'] = orderBy;
       }
 
       setSearchParams(localVarUrlObj, localVarQueryParameter);
@@ -8953,21 +8953,21 @@ export const TasksApiAxiosParamCreator = function (configuration?: Configuration
       }
 
       if (limit !== undefined) {
-        for (const [key, value] of Object.entries(limit)) {
-          localVarQueryParameter[key] = value;
-        }
+        // codegen fix: scalar query param — Object.entries() on a
+        // string/number silently drops or mangles it (F-65)
+        localVarQueryParameter['limit'] = limit;
       }
 
       if (offset !== undefined) {
-        for (const [key, value] of Object.entries(offset)) {
-          localVarQueryParameter[key] = value;
-        }
+        // codegen fix: scalar query param — Object.entries() on a
+        // string/number silently drops or mangles it (F-65)
+        localVarQueryParameter['offset'] = offset;
       }
 
       if (orderBy !== undefined) {
-        for (const [key, value] of Object.entries(orderBy)) {
-          localVarQueryParameter[key] = value;
-        }
+        // codegen fix: scalar query param — Object.entries() on a
+        // string/number silently drops or mangles it (F-65)
+        localVarQueryParameter['order_by'] = orderBy;
       }
 
       setSearchParams(localVarUrlObj, localVarQueryParameter);
@@ -9817,33 +9817,33 @@ export const TasksApiAxiosParamCreator = function (configuration?: Configuration
       // authentication OpenIdConnect required
 
       if (taskId !== undefined) {
-        for (const [key, value] of Object.entries(taskId)) {
-          localVarQueryParameter[key] = value;
-        }
+        // codegen fix: scalar query param — Object.entries() on a
+        // string/number silently drops or mangles it (F-65)
+        localVarQueryParameter['task_id'] = taskId;
       }
 
       if (category !== undefined) {
-        for (const [key, value] of Object.entries(category)) {
-          localVarQueryParameter[key] = value;
-        }
+        // codegen fix: scalar query param — Object.entries() on a
+        // string/number silently drops or mangles it (F-65)
+        localVarQueryParameter['category'] = category;
       }
 
       if (assignedTo !== undefined) {
-        for (const [key, value] of Object.entries(assignedTo)) {
-          localVarQueryParameter[key] = value;
-        }
+        // codegen fix: scalar query param — Object.entries() on a
+        // string/number silently drops or mangles it (F-65)
+        localVarQueryParameter['assigned_to'] = assignedTo;
       }
 
       if (status !== undefined) {
-        for (const [key, value] of Object.entries(status)) {
-          localVarQueryParameter[key] = value;
-        }
+        // codegen fix: scalar query param — Object.entries() on a
+        // string/number silently drops or mangles it (F-65)
+        localVarQueryParameter['status'] = status;
       }
 
       if (label !== undefined) {
-        for (const [key, value] of Object.entries(label)) {
-          localVarQueryParameter[key] = value;
-        }
+        // codegen fix: scalar query param — Object.entries() on a
+        // string/number silently drops or mangles it (F-65)
+        localVarQueryParameter['label'] = label;
       }
 
       if (startTimeBetween !== undefined) {
@@ -9855,21 +9855,21 @@ export const TasksApiAxiosParamCreator = function (configuration?: Configuration
       }
 
       if (limit !== undefined) {
-        for (const [key, value] of Object.entries(limit)) {
-          localVarQueryParameter[key] = value;
-        }
+        // codegen fix: scalar query param — Object.entries() on a
+        // string/number silently drops or mangles it (F-65)
+        localVarQueryParameter['limit'] = limit;
       }
 
       if (offset !== undefined) {
-        for (const [key, value] of Object.entries(offset)) {
-          localVarQueryParameter[key] = value;
-        }
+        // codegen fix: scalar query param — Object.entries() on a
+        // string/number silently drops or mangles it (F-65)
+        localVarQueryParameter['offset'] = offset;
       }
 
       if (orderBy !== undefined) {
-        for (const [key, value] of Object.entries(orderBy)) {
-          localVarQueryParameter[key] = value;
-        }
+        // codegen fix: scalar query param — Object.entries() on a
+        // string/number silently drops or mangles it (F-65)
+        localVarQueryParameter['order_by'] = orderBy;
       }
 
       setSearchParams(localVarUrlObj, localVarQueryParameter);
@@ -9926,9 +9926,9 @@ export const TasksApiAxiosParamCreator = function (configuration?: Configuration
       // authentication OpenIdConnect required
 
       if (exceptDate !== undefined) {
-        for (const [key, value] of Object.entries(exceptDate)) {
-          localVarQueryParameter[key] = value;
-        }
+        // codegen fix: scalar query param — Object.entries() on a
+        // string/number silently drops or mangles it (F-65)
+        localVarQueryParameter['except_date'] = exceptDate;
       }
 
       localVarHeaderParameter['Content-Type'] = 'application/json';
