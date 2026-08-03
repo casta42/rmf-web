@@ -59,14 +59,21 @@ def parked_robot_near(
     x: float,
     y: float,
     tolerance: float = OCCUPIED_TOLERANCE,
+    exclude: Optional[str] = None,
 ) -> Optional[str]:
     """`fleet/robot` id of a parked robot within tolerance of (x, y), or
     None. A robot counts as parked when it reports a parked status and no
-    active task — robots mid-mission will vacate the spot on their own."""
+    active task — robots mid-mission will vacate the spot on their own.
+    `exclude` skips one `fleet/robot` id: for a direct robot task the
+    target robot may already be parked at its own destination (e.g.
+    send-to-charger while sitting near the charger, F-62) — it is not in
+    its own way."""
     for fleet in fleet_states:
         if fleet.name is None or not fleet.robots:
             continue
         for robot_name, robot in fleet.robots.items():
+            if f"{fleet.name}/{robot_name}" == exclude:
+                continue
             if robot.location is None or not _is_parked(robot):
                 continue
             if math.hypot(robot.location.x - x, robot.location.y - y) <= tolerance:

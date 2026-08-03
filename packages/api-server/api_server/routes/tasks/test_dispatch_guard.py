@@ -124,3 +124,18 @@ class TestParkedRobotNear(unittest.TestCase):
         fleet = make_fleet(0, 0)
         fleet.robots["test_robot"].location = None
         self.assertIsNone(parked_robot_near([fleet], 26.1, 1.5))
+
+    def test_excluded_robot_does_not_occupy(self):
+        # F-62: a direct robot task may target the robot's own parking
+        # spot (send-to-charger from the charger) — exclude the target
+        fleets = [make_fleet(26.1, 1.5)]
+        self.assertIsNone(
+            parked_robot_near(fleets, 26.1, 1.5, exclude="test_fleet/test_robot")
+        )
+
+    def test_exclude_other_robot_still_occupies(self):
+        fleets = [make_fleet(26.1, 1.5)]
+        self.assertEqual(
+            parked_robot_near(fleets, 26.1, 1.5, exclude="test_fleet/other_robot"),
+            "test_fleet/test_robot",
+        )

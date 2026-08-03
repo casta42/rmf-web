@@ -137,6 +137,35 @@ async def post_cancel_task(
     )
 
 
+# F-34 dispatch guard: reject a patrol whose final destination is
+# already occupied by a parked robot (collision course on hardware
+# with finishing_request "nothing"; fails open on missing data).
+async def guard_patrol_destination(
+    request: mdl.TaskRequest,
+    task_repo: TaskRepository,
+    exclude: Optional[str] = None,
+):
+    place = dispatch_guard.patrol_final_place(request)
+    if place is None:
+        return
+    ttm_map = await ttm.BuildingMap.first()
+    if ttm_map is None:
+        return
+    vertex = dispatch_guard.find_vertex(BuildingMap.from_tortoise(ttm_map), place)
+    if vertex is None:
+        return
+    fleets = await FleetRepository(task_repo.user).get_all_fleets()
+    occupier = dispatch_guard.parked_robot_near(fleets, *vertex, exclude=exclude)
+    if occupier is not None:
+        raise HTTPException(
+            409,
+            detail=(
+                f"destination [{place}] is occupied by parked "
+                f"robot [{occupier}] (F-34); dispatch rejected"
+            ),
+        )
+
+
 @router.post(
     "/dispatch_task",
     response_model=mdl.TaskDispatchResponse,
@@ -146,27 +175,7 @@ async def post_dispatch_task(
     request: mdl.DispatchTaskRequest = Body(...),
     task_repo: TaskRepository = Depends(task_repo_dep),
 ):
-    # F-34 dispatch guard: reject a patrol whose final destination is
-    # already occupied by a parked robot (collision course on hardware
-    # with finishing_request "nothing"; fails open on missing data).
-    place = dispatch_guard.patrol_final_place(request.request)
-    if place is not None:
-        ttm_map = await ttm.BuildingMap.first()
-        if ttm_map is not None:
-            vertex = dispatch_guard.find_vertex(
-                BuildingMap.from_tortoise(ttm_map), place
-            )
-            if vertex is not None:
-                fleets = await FleetRepository(task_repo.user).get_all_fleets()
-                occupier = dispatch_guard.parked_robot_near(fleets, *vertex)
-                if occupier is not None:
-                    raise HTTPException(
-                        409,
-                        detail=(
-                            f"destination [{place}] is occupied by parked "
-                            f"robot [{occupier}] (F-34); dispatch rejected"
-                        ),
-                    )
+    await guard_patrol_destination(request.request, task_repo)
     resp = mdl.TaskDispatchResponse.model_validate_json(
         await tasks_service().call(request.model_dump_json(exclude_none=True))
     )
@@ -187,6 +196,12 @@ async def post_robot_task(
     request: mdl.RobotTaskRequest = Body(...),
     task_repo: TaskRepository = Depends(task_repo_dep),
 ):
+    # Same F-34 guard as dispatch_task, minus the target robot itself —
+    # a robot already parked at its destination (send-to-charger from the
+    # charger, F-62) is not in its own way.
+    await guard_patrol_destination(
+        request.request, task_repo, exclude=f"{request.fleet}/{request.robot}"
+    )
     resp = mdl.RobotTaskResponse.model_validate_json(
         await tasks_service().call(request.model_dump_json(exclude_none=True))
     )
