@@ -15,8 +15,10 @@ from api_server.dependencies import (
 from api_server.fast_io import FastIORouter, SubscriptionRequest
 from api_server.models import tortoise_models as ttm
 from api_server.models.building_map import BuildingMap
+from api_server.models.rmf_api.task_state import Cancellation
 from api_server.repositories import FleetRepository, TaskRepository, task_repo_dep
 from api_server.response import RawJSONResponse
+from api_server.rmf_io import cancellation as task_cancellation
 from api_server.rmf_io import task_events, tasks_service
 from api_server.routes.tasks import dispatch_guard
 
@@ -132,6 +134,16 @@ async def post_activity_discovery(
 async def post_cancel_task(
     request: mdl.CancelTaskRequest = Body(...),
 ):
+    # F-71(2): record the cancellation at REQUEST time — whether the
+    # fleet core ends the task `canceled` or (dead-robot race) wipes it
+    # to `completed`, displays keep the truth of how it ended (F-67)
+    task_cancellation.latch(
+        request.task_id,
+        Cancellation(
+            unix_millis_request_time=round(datetime.now().timestamp() * 1e3),
+            labels=list(request.labels or []),
+        ),
+    )
     return RawJSONResponse(
         await tasks_service().call(request.model_dump_json(exclude_none=True))
     )

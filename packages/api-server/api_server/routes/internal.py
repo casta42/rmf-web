@@ -12,7 +12,9 @@ from api_server.logger import logger as base_logger
 from api_server.models import tortoise_models as ttm
 from api_server.models.rmf_api.robot_state import Status as RobotStatus
 from api_server.repositories import AlertRepository, FleetRepository, TaskRepository
-from api_server.rmf_io import alert_events, fleet_events, rmf_events, task_events
+from api_server.rmf_io import alert_events
+from api_server.rmf_io import cancellation as task_cancellation
+from api_server.rmf_io import fleet_events, rmf_events, task_events
 
 router = APIRouter(tags=["_internal"])
 logger = base_logger.getChild("RmfGatewayApp")
@@ -408,6 +410,10 @@ async def process_msg(msg: Dict[str, Any], fleet_repo: FleetRepository) -> None:
 
     if payload_type == "task_state_update":
         task_state = mdl.TaskState(**msg["data"])
+        # F-71(2): latch/stamp cancellation provenance BEFORE persisting so
+        # stored rows and broadcasts agree (the canceled-vs-completed race
+        # on the dead-robot path can wipe RMF's own field)
+        task_cancellation.apply(task_state)
         await task_repo.save_task_state(task_state)
         task_events.task_states.on_next(task_state)
 
