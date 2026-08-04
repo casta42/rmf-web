@@ -292,8 +292,9 @@ async def process_robot_alerts(fleet_state: mdl.FleetState) -> None:
                 fleet=fleet_state.name,
                 robot=robot_name,
                 message=(
-                    f"Robot fault: {faults_text} — excluded from missions "
-                    "until it recovers"
+                    f"Robot fault: {faults_text} — its missions were "
+                    "canceled and it gets no new ones until it recovers. "
+                    "Check the robot on site."
                 ),
             )
             if alert is not None:
