@@ -177,6 +177,10 @@ class Phase(BaseModel):
 
 class TaskState(BaseModel):
     booking: Booking
+    # Fork field (F-37/FR-18): wall-clock time this database first
+    # recorded the task — the only recency field immune to the sim
+    # clock. Filled by the repository on reads; never sent by RMF.
+    recorded_at_millis: Optional[int] = None
     category: Optional[Category] = None
     detail: Optional[Detail] = None
     unix_millis_start_time: Optional[int] = None

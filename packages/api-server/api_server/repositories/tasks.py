@@ -122,6 +122,7 @@ class TaskRepository:
         assigned_to: list[str] | None = None,
         start_time_between: tuple[datetime, datetime] | None = None,
         finish_time_between: tuple[datetime, datetime] | None = None,
+        recorded_between: tuple[datetime, datetime] | None = None,
         status: list[str] | None = None,
         label: Labels | None = None,
         pagination: Optional[Pagination] = None,
@@ -129,6 +130,11 @@ class TaskRepository:
         filters = {}
         if task_id is not None:
             filters["id___in"] = task_id
+        if recorded_between is not None:
+            # F-37: created_at is DB wall clock — the only time filter that
+            # survives sim restarts (start/finish times ride the sim clock)
+            filters["created_at__gte"] = recorded_between[0]
+            filters["created_at__lte"] = recorded_between[1]
         if category is not None:
             filters["category__in"] = category
         if assigned_to is not None:
@@ -196,8 +202,15 @@ class TaskRepository:
 
         try:
             # TODO: enforce with authz
-            results = await query.values_list("data")
-            return [TaskState(**r[0]) for r in results]
+            results = await query.values_list("data", "created_at")
+            states = []
+            for data, created_at in results:
+                state = TaskState(**data)
+                if created_at is not None:
+                    # F-37 provenance for FR-18 History
+                    state.recorded_at_millis = round(created_at.timestamp() * 1e3)
+                states.append(state)
+            return states
         except FieldError as e:
             raise HTTPException(422, str(e)) from e
 

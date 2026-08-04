@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional, Tuple, cast
 
 from fastapi import Body, Depends, HTTPException, Path, Query
@@ -59,18 +59,99 @@ async def query_task_states(
         None,
         description="comma separated list of labels, each item must be in the form <key>=<value>, multiple items will filter tasks with all the labels",
     ),
+    recorded_between: Optional[str] = Query(
+        None,
+        description=(
+            "Fork (F-37/FR-18): 'X,Y' unix millis filtering on the wall-clock "
+            "time this database RECORDED the task — survives sim restarts, "
+            "unlike the sim-clocked start/finish filters"
+        ),
+    ),
     pagination: mdl.Pagination = Depends(pagination_query),
 ):
+    recorded_range = None
+    if recorded_between is not None:
+        try:
+            lo, hi = (int(p) for p in recorded_between.split(","))
+            recorded_range = (
+                datetime.fromtimestamp(lo / 1e3),
+                datetime.fromtimestamp(hi / 1e3),
+            )
+        except ValueError as e:
+            raise HTTPException(
+                422, "recorded_between must be 'X,Y' in unix millis"
+            ) from e
     return await task_repo.query_task_states(
         task_id=task_id.split(",") if task_id else None,
         category=category.split(",") if category else None,
         assigned_to=assigned_to.split(",") if assigned_to else None,
         start_time_between=start_time_between,
         finish_time_between=finish_time_between,
+        recorded_between=recorded_range,
         status=status.split(",") if status else None,
         label=mdl.Labels.from_strings(label.split(",")) if label else None,
         pagination=pagination,
     )
+
+
+@router.get("/kpis")
+async def get_task_kpis(
+    task_repo: TaskRepository = Depends(task_repo_dep),
+    days: int = Query(7, ge=1, le=90, description="window size in days"),
+):
+    """FR-18 KPI aggregates (P11; distance deferred per OD-5/F-52).
+
+    Computed over the F-37 `created_at` provenance column so the window
+    survives sim restarts. Utilization uses task DURATIONS
+    (finish - start): both stamps ride the same clock, so the delta is
+    valid even where the absolute times are not. Cancellation provenance
+    (F-71) counts a completed-but-canceled task as canceled.
+    """
+    now = datetime.now()
+    cutoff = now - timedelta(days=days)
+    rows = await ttm.TaskState.filter(created_at__gte=cutoff).values_list(
+        "data", "created_at"
+    )
+    per_day: dict = {}
+    outcomes = {"completed": 0, "canceled": 0, "failed": 0}
+    active_millis = 0
+    for data, created_at in rows:
+        day = created_at.date().isoformat()
+        per_day[day] = per_day.get(day, 0) + 1
+        task_status = str(data.get("status"))
+        if task_status == "completed" and data.get("cancellation") is not None:
+            task_status = "canceled"  # F-71 provenance
+        if task_status in outcomes:
+            outcomes[task_status] += 1
+        start = data.get("unix_millis_start_time")
+        finish = data.get("unix_millis_finish_time")
+        if start is not None and finish is not None:
+            duration = finish - start
+            if 0 < duration < 24 * 3600 * 1000:
+                active_millis += duration
+    fleets = await FleetRepository(task_repo.user).get_all_fleets()
+    robot_count = sum(len(f.robots or {}) for f in fleets)
+    window_millis = days * 24 * 3600 * 1000
+    terminal = sum(outcomes.values())
+    return {
+        "window_days": days,
+        "tasks_per_day": sorted(
+            ({"date": d, "count": c} for d, c in per_day.items()),
+            key=lambda x: x["date"],
+        ),
+        "total_tasks": len(rows),
+        "outcomes": outcomes,
+        "completion_rate": (outcomes["completed"] / terminal) if terminal else None,
+        "utilization": (
+            active_millis / (robot_count * window_millis) if robot_count else None
+        ),
+        "robot_count": robot_count,
+        "method": {
+            "window": "created_at wall clock (F-37)",
+            "utilization": "sum(task durations) / (robots x window)",
+            "cancellations": "provenance-corrected (F-71)",
+        },
+    }
 
 
 @router.get("/{task_id}/state", response_model=mdl.TaskState)
