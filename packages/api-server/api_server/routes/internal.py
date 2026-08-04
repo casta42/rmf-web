@@ -61,6 +61,13 @@ _low_battery_alerted: Dict[str, str] = {}
 _low_battery_stale_swept: set = set()
 # per `{fleet}/{robot}` stuck episode tracking (FR-17)
 _stuck_states: Dict[str, _StuckState] = {}
+
+# F-68/E6: robot fault issues (robot_offline / robot_unresponsive /
+# robot_down raised by the fleet adapter, FR-29/F-40/F-38) must reach the
+# alert center, not only the robot views. One alert per fault episode,
+# resolved when the robot's fault issues clear.
+_fault_alerted: Dict[str, str] = {}
+_fault_stale_swept: set = set()
 # per fleet, wall-clock time of the last ghost charge task reap (F-12)
 _last_charge_reap: Dict[str, float] = {}
 # robots whose stale stuck alerts from a previous server life were swept (F-29)
@@ -211,6 +218,17 @@ async def process_robot_alerts(fleet_state: mdl.FleetState) -> None:
             await alert_repo.resolve_alerts_by_prefix(
                 f"low_battery__{fleet_state.name}__{robot_name}__"
             )
+        # F-68/E6: fault issues raised by the fleet adapter (FR-29/F-40/
+        # F-38). Detected FIRST — a faulted robot's telemetry is spoofed
+        # (F-42 holds SoC at 0.0), so the low-battery alert must not fire
+        # on top of the fault alert.
+        fault_categories = sorted(
+            {
+                str(issue.category)
+                for issue in (robot.issues or [])
+                if str(issue.category or "").startswith("robot_")
+            }
+        )
         battery_new, battery_resolved = check_low_battery(robot_id, robot, now_millis)
         if battery_resolved is not None:
             resolved = await alert_repo.resolve_alert(battery_resolved)
@@ -221,9 +239,15 @@ async def process_robot_alerts(fleet_state: mdl.FleetState) -> None:
             resolved = await alert_repo.resolve_alert(stuck_resolved)
             if resolved is not None:
                 alert_events.alerts.on_next(resolved)
+        if fault_categories and battery_new is not None:
+            # drop the spurious 0 % episode so recovery re-arms cleanly
+            _low_battery_alerted.pop(robot_id, None)
+            battery_new = None
         if battery_new is not None:
             battery_pct = (
-                f"{round(robot.battery * 100)} %" if robot.battery is not None else "low"
+                f"{round(robot.battery * 100)} %"
+                if robot.battery is not None
+                else "low"
             )
             alert = await alert_repo.create_alert(
                 battery_new,
@@ -249,6 +273,36 @@ async def process_robot_alerts(fleet_state: mdl.FleetState) -> None:
             )
             if alert is not None:
                 alert_events.alerts.on_next(alert)
+
+        # F-68/E6: fault -> critical alert (one per episode)
+        if robot_id not in _fault_stale_swept:
+            _fault_stale_swept.add(robot_id)
+            await alert_repo.resolve_alerts_by_prefix(
+                f"robot_fault__{fleet_state.name}__{robot_name}__"
+            )
+        fault_alert_id = _fault_alerted.get(robot_id)
+        if fault_categories and fault_alert_id is None:
+            new_id = f"robot_fault__{fleet_state.name}__{robot_name}__{now_millis}"
+            _fault_alerted[robot_id] = new_id
+            faults_text = ", ".join(c.removeprefix("robot_") for c in fault_categories)
+            alert = await alert_repo.create_alert(
+                new_id,
+                "robot",
+                severity=ttm.Alert.Severity.Critical,
+                fleet=fleet_state.name,
+                robot=robot_name,
+                message=(
+                    f"Robot fault: {faults_text} — excluded from missions "
+                    "until it recovers"
+                ),
+            )
+            if alert is not None:
+                alert_events.alerts.on_next(alert)
+        elif not fault_categories and fault_alert_id is not None:
+            _fault_alerted.pop(robot_id, None)
+            resolved = await alert_repo.resolve_alert(fault_alert_id)
+            if resolved is not None:
+                alert_events.alerts.on_next(resolved)
 
 
 def classify_charge_ghost(robot: mdl.RobotState, task_id: str) -> Optional[str]:
