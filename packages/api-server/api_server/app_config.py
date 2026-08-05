@@ -37,6 +37,9 @@ class AppConfig:
     # secret authenticating this proxy to it. None disables the routes (404).
     site_config_url: Optional[str] = None
     site_config_token_file: Optional[str] = None
+    # F-77: seconds without a state update before a non-terminal task is
+    # failed over as orphaned (rmf-core restart ghosts). 0 disables.
+    stale_task_timeout: float = 1800
 
     def __post_init__(self):
         self.public_url = urllib.parse.urlparse(cast(str, self.public_url))

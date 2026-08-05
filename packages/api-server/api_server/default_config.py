@@ -44,4 +44,7 @@ config = {
     # proxy, and the shared-secret file authenticating to it (None disables).
     "site_config_url": None,
     "site_config_token_file": None,
+    # seconds without a state update before a non-terminal task is failed
+    # over as orphaned (0 disables the janitor).
+    "stale_task_timeout": 1800,
 }

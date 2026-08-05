@@ -169,6 +169,11 @@ async def lifespan(_app: FastIO):
 
     logger.info("starting scheduler")
     asyncio.create_task(_spin_scheduler())
+    if app_config.stale_task_timeout > 0:
+        # F-77 (E5 review round 1): fail over tasks orphaned non-terminal
+        # by an rmf-core restart, so the D-17 mission guard and every
+        # other consumer of "running missions" stops seeing ghosts.
+        asyncio.create_task(_spin_stale_task_janitor())
     scheduled_tasks = await ttm.ScheduledTask.all()
     scheduled = 0
     for t in scheduled_tasks:
@@ -308,6 +313,20 @@ async def _spin_scheduler():
     while True:
         schedule.run_pending()
         await asyncio.sleep(1)
+
+
+async def _spin_stale_task_janitor():
+    from .stale_tasks import fail_over_stale_tasks
+
+    janitor_logger = logger.getChild("StaleTasks")
+    while True:
+        try:
+            await fail_over_stale_tasks(
+                app_config.stale_task_timeout, janitor_logger
+            )
+        except Exception:  # pylint: disable=broad-except
+            janitor_logger.exception("stale-task sweep failed")
+        await asyncio.sleep(60)
 
 
 async def _load_states():
