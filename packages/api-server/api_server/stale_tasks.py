@@ -46,6 +46,10 @@ async def fail_over_stale_tasks(
         status__in=NON_TERMINAL_MATCH, updated_at__lt=cutoff
     )
     for row in stale:
+        # capture BEFORE save() — auto_now rewrites updated_at on save
+        last_update = (
+            row.updated_at.isoformat() if row.updated_at else "never"
+        )
         data = row.data if isinstance(row.data, dict) else {}
         data["status"] = TaskStatus.failed.value
         row.data = data
@@ -55,6 +59,6 @@ async def fail_over_stale_tasks(
             "stale-mission janitor: task [%s] had no state update since "
             "[%s] — failed over (orphaned by an rmf-core restart, F-77)",
             row.id_,
-            row.updated_at.isoformat() if row.updated_at else "never",
+            last_update,
         )
     return len(stale)
