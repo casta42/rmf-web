@@ -27,6 +27,8 @@ setup(
         "pyjwt[crypto]~=2.8.0",
         "pydantic~=2.6.4",
         "schedule~=1.2.1",
+        # GentleFleet fork: /site_config proxy to the site-config sidecar
+        "httpx~=0.27.0",
     ],
     extras_require={
         "postgres": ["asyncpg~=0.29.0"],

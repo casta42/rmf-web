@@ -40,4 +40,8 @@ config = {
     "stuck_timeout": 60,
     # path to the site's zones.yaml served read-only at /zones (None disables).
     "zones_file": None,
+    # base URL of the site-config sidecar for the /site_config zone-editor
+    # proxy, and the shared-secret file authenticating to it (None disables).
+    "site_config_url": None,
+    "site_config_token_file": None,
 }

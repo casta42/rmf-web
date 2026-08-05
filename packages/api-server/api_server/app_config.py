@@ -32,6 +32,11 @@ class AppConfig:
     # DR-3/FR-10: path to the site's zones.yaml served read-only at /zones
     # for the dashboard map overlays. None disables the route (404).
     zones_file: Optional[str] = None
+    # DR-4/D-17 (proposed D-19): base URL of the localhost-only site-config
+    # sidecar the /site_config zone-editor routes proxy to, plus the shared
+    # secret authenticating this proxy to it. None disables the routes (404).
+    site_config_url: Optional[str] = None
+    site_config_token_file: Optional[str] = None
 
     def __post_init__(self):
         self.public_url = urllib.parse.urlparse(cast(str, self.public_url))

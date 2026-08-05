@@ -258,6 +258,11 @@ app.include_router(
     routes.zones_router, prefix="/zones", dependencies=[Depends(user_dep)]
 )
 app.include_router(
+    routes.site_config_router,
+    prefix="/site_config",
+    dependencies=[Depends(user_dep)],
+)
+app.include_router(
     routes.dispensers_router, prefix="/dispensers", dependencies=[Depends(user_dep)]
 )
 app.include_router(
