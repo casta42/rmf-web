@@ -139,6 +139,35 @@ class TestSiteConfigRoutes(AppFixture):
         _, _, kwargs = calls[0]
         self.assertEqual("admin", kwargs["json"]["applied_by"])
 
+    def test_active_missions_sees_enum_repr_statuses(self):
+        # The book keeper stores str(TaskStatus.underway) ==
+        # "Status.underway" — the guard query must match that repr, not
+        # just the plain value (the smoke test caught exactly this).
+        from api_server.models import TaskStatus
+        from api_server.models.tortoise_models import TaskState as DbTaskState
+        from api_server.routes.site_config import active_missions
+
+        portal = self.get_portal()
+        portal.call(
+            lambda: DbTaskState.update_or_create(
+                {
+                    "data": {},
+                    "status": TaskStatus.underway,
+                    "assigned_to": "gentle_bot_9",
+                },
+                id_="e5-guard-enum-repr",
+            )
+        )
+        try:
+            missions = portal.call(active_missions)
+            match = [m for m in missions if m["task_id"] == "e5-guard-enum-repr"]
+            self.assertEqual(1, len(match), missions)
+            self.assertEqual("underway", match[0]["status"])
+        finally:
+            portal.call(
+                lambda: DbTaskState.filter(id_="e5-guard-enum-repr").delete()
+            )
+
     def test_non_admin_is_403(self):
         self.client.set_user("operator1")
         try:

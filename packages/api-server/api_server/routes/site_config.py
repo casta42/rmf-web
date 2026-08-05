@@ -41,8 +41,15 @@ _TERMINAL = {
     TaskStatus.killed,
     TaskStatus.completed,
 }
-_NON_TERMINAL: List[str] = [
-    s.value for s in TaskStatus if s not in _TERMINAL
+_NON_TERMINAL = [s for s in TaskStatus if s not in _TERMINAL]
+# The book keeper str()s the pydantic enum into the status column, so
+# live rows read "Status.underway", not "underway" (upstream quirk —
+# repositories/tasks.py:154 filters with enum instances for the same
+# reason). Match BOTH representations so the guard survives an upstream
+# fix that starts storing plain values.
+_NON_TERMINAL_MATCH: List[object] = [
+    *_NON_TERMINAL,
+    *(s.value for s in _NON_TERMINAL),
 ]
 
 
@@ -114,13 +121,13 @@ async def _proxy(
 
 async def active_missions() -> List[Dict[str, Any]]:
     """Non-terminal missions, for the D-17 guard and its 409 payload."""
-    rows = await DbTaskState.filter(status__in=_NON_TERMINAL).values(
+    rows = await DbTaskState.filter(status__in=_NON_TERMINAL_MATCH).values(
         "id_", "status", "assigned_to"
     )
     return [
         {
             "task_id": row["id_"],
-            "status": row["status"],
+            "status": (row["status"] or "").removeprefix("Status."),
             "robot": row["assigned_to"],
         }
         for row in rows
