@@ -210,6 +210,136 @@ class TestSiteConfigRoutes(AppFixture):
                 lambda: FleetState.filter(name="gentle_fleet").delete()
             )
 
+    def test_validate_blocks_retiring_a_destination_a_template_uses(self):
+        # FR-32/D-22: the sidecar says what would be retired; this layer
+        # knows what still dispatches to it and turns that into a
+        # blocking violation with the template named.
+        from api_server.models.tortoise_models import TaskFavorite
+
+        portal = self.get_portal()
+        portal.call(
+            lambda: TaskFavorite.update_or_create(
+                {
+                    "name": "Morning restock",
+                    "category": "patrol",
+                    "description": {"places": ["dock_3"], "rounds": 1},
+                    "user": "admin",
+                },
+                id="e5-fav-dock3",
+            )
+        )
+        calls = []
+        fake = _fake_async_client(
+            calls,
+            _FakeResponse(
+                json_body={
+                    "ok": True,
+                    "violations": [],
+                    "retired_destinations": ["dock_3"],
+                }
+            ),
+        )
+        try:
+            with unittest.mock.patch(
+                "api_server.routes.site_config.httpx.AsyncClient", fake
+            ):
+                resp = self.client.post(
+                    "/site_config/validate",
+                    json={"base_commit": "abc", "zones": {},
+                          "destinations": []},
+                )
+            self.assertEqual(200, resp.status_code, resp.content)
+            report = resp.json()
+            self.assertFalse(report["ok"])
+            self.assertEqual(1, len(report["violations"]))
+            message = report["violations"][0]["message"]
+            self.assertIn("dock_3", message)
+            self.assertIn("Morning restock", message)
+            self.assertEqual(
+                "destination_in_use", report["violations"][0]["code"]
+            )
+        finally:
+            portal.call(lambda: TaskFavorite.filter(id="e5-fav-dock3").delete())
+
+    def test_apply_refuses_retiring_a_destination_a_schedule_uses(self):
+        # Backstop: apply must refuse even if the client never validated.
+        from api_server.models.tortoise_models import ScheduledTask
+
+        portal = self.get_portal()
+        row = portal.call(
+            lambda: ScheduledTask.create(
+                task_request={
+                    "category": "patrol",
+                    "description": {"places": ["pickup_1", "dock_3"],
+                                    "rounds": 1},
+                },
+                created_by="admin",
+            )
+        )
+        calls = []
+        fake = _fake_async_client(
+            calls,
+            _FakeResponse(
+                json_body={"destinations": [{"name": "dock_3", "kind": "dropoff",
+                                             "x": 12.0, "y": 3.5}]}
+            ),
+        )
+
+        async def no_missions():
+            return []
+
+        try:
+            with unittest.mock.patch(
+                "api_server.routes.site_config.httpx.AsyncClient", fake
+            ), unittest.mock.patch(
+                "api_server.routes.site_config.active_missions", no_missions
+            ):
+                resp = self.client.post(
+                    "/site_config/apply",
+                    json={
+                        "candidate": {"base_commit": "abc", "zones": {},
+                                      "destinations": []},
+                        "acknowledge_fleet_pause": True,
+                    },
+                )
+            self.assertEqual(409, resp.status_code, resp.content)
+            detail = resp.json()["detail"]
+            self.assertEqual("destination_in_use", detail["reason"])
+            self.assertIn("pickup_1 → dock_3", detail["message"])
+            # the site-config HEAD read happened, the apply never did
+            self.assertEqual(1, len(calls))
+            self.assertTrue(calls[0][1].endswith("/site_config"))
+        finally:
+            portal.call(lambda: ScheduledTask.filter(id=row.id).delete())
+
+    def test_apply_without_destinations_key_skips_the_guard(self):
+        # An older client that does not manage destinations must not pay
+        # for a HEAD read — and must not be able to wipe them either
+        # (the sidecar keeps HEAD's when the key is absent).
+        calls = []
+        fake = _fake_async_client(
+            calls, _FakeResponse(json_body={"state": "validating"})
+        )
+
+        async def no_missions():
+            return []
+
+        with unittest.mock.patch(
+            "api_server.routes.site_config.httpx.AsyncClient", fake
+        ), unittest.mock.patch(
+            "api_server.routes.site_config.active_missions", no_missions
+        ):
+            resp = self.client.post(
+                "/site_config/apply",
+                json={
+                    "candidate": {"base_commit": "abc", "zones": {}},
+                    "acknowledge_fleet_pause": True,
+                },
+            )
+        self.assertEqual(200, resp.status_code, resp.content)
+        self.assertEqual(1, len(calls))
+        self.assertTrue(calls[0][1].endswith("/site_config/apply"))
+
     def test_non_admin_is_403(self):
         self.client.set_user("operator1")
         try:

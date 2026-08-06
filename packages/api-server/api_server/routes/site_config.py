@@ -16,7 +16,7 @@ The shared-secret header authenticates this proxy to the sidecar; it is
 read per-request so a token rotation needs no api-server restart.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
@@ -26,6 +26,8 @@ from api_server.app_config import app_config
 from api_server.authenticator import user_dep
 from api_server.models import TaskStatus, User
 from api_server.models.tortoise_models import FleetState as DbFleetState
+from api_server.models.tortoise_models import ScheduledTask as DbScheduledTask
+from api_server.models.tortoise_models import TaskFavorite as DbTaskFavorite
 from api_server.models.tortoise_models import TaskState as DbTaskState
 
 TOKEN_HEADER = "x-gf-internal-token"
@@ -93,6 +95,119 @@ async def _with_positions(candidate: Dict[str, Any]) -> Dict[str, Any]:
 
 class RestartBody(BaseModel):
     acknowledge_active_missions: bool = False
+
+
+# ----------------------------------------------------------------------
+# FR-32 / D-22 — a destination name a saved mission still dispatches to
+# cannot be retired. The site-config sidecar owns the site graph and
+# reports which names a candidate would RETIRE (removed or renamed away);
+# the task store lives here, so the cross-check does too (D-19). We
+# refuse rather than migrate: rewriting a schedule the operator authored,
+# from a different service, to a name they have not seen yet, is a worse
+# failure at 03:00 than a refusal at 14:00 that names what to fix.
+# ----------------------------------------------------------------------
+def _places_of(description: Any) -> List[str]:
+    """Waypoint names a stored task request visits (patrol/go-to shape,
+    D-15/OD-3: every dashboard mission is a `patrol` with `places`)."""
+    if not isinstance(description, dict):
+        return []
+    out: List[str] = []
+    for place in description.get("places") or []:
+        if isinstance(place, str):
+            out.append(place)
+        elif isinstance(place, dict):
+            name = place.get("waypoint") or place.get("name")
+            if isinstance(name, str):
+                out.append(name)
+    return out
+
+
+def _schedule_label(request: Any) -> str:
+    places = _places_of((request or {}).get("description")
+                        if isinstance(request, dict) else None)
+    return " → ".join(places) if places else "scheduled mission"
+
+
+async def destination_references(
+    names: Iterable[str],
+) -> Dict[str, List[Dict[str, str]]]:
+    """{destination name: [{kind, label}]} for saved templates (FR-4) and
+    schedules that still dispatch to it."""
+    wanted = {str(name) for name in names}
+    found: Dict[str, List[Dict[str, str]]] = {name: [] for name in wanted}
+    if not wanted:
+        return found
+    for row in await DbTaskFavorite.all():
+        for place in _places_of(row.description):
+            if place in wanted:
+                entry = {"kind": "template", "label": str(row.name)}
+                if entry not in found[place]:
+                    found[place].append(entry)
+    for row in await DbScheduledTask.all():
+        label = _schedule_label(row.task_request)
+        request = row.task_request if isinstance(row.task_request, dict) else {}
+        for place in _places_of(request.get("description")):
+            if place in wanted:
+                entry = {"kind": "schedule", "label": label}
+                if entry not in found[place]:
+                    found[place].append(entry)
+    return found
+
+
+def _in_use_violations(
+    references: Dict[str, List[Dict[str, str]]],
+) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    for name in sorted(references):
+        users = references[name]
+        if not users:
+            continue
+        listed = ", ".join(
+            f'{u["kind"]} “{u["label"]}”' for u in users[:6]
+        )
+        if len(users) > 6:
+            listed += f", +{len(users) - 6} more"
+        out.append(
+            {
+                "code": "destination_in_use",
+                "message": (
+                    f"[{name}] is still used by {listed}. Renaming or "
+                    "removing it would leave those missions pointing at a "
+                    "place that no longer exists — update or delete them "
+                    "first."
+                ),
+                "waypoint": name,
+            }
+        )
+    return out
+
+
+async def _head_destination_names() -> List[str]:
+    site = await _proxy("GET", "/site_config")
+    return [
+        str(d.get("name"))
+        for d in (site or {}).get("destinations") or []
+        if d.get("name")
+    ]
+
+
+async def _guard_retired_destinations(retired: Sequence[str]) -> None:
+    """Backstop for the apply path — validate already blocks the same
+    case with a violation, but apply must never depend on the client
+    having asked."""
+    if not retired:
+        return
+    references = await destination_references(retired)
+    violations = _in_use_violations(references)
+    if violations:
+        raise HTTPException(
+            409,
+            {
+                "reason": "destination_in_use",
+                "message": violations[0]["message"],
+                "violations": violations,
+            },
+        )
 
 
 def _sidecar() -> tuple[str, str]:
@@ -180,15 +295,38 @@ async def get_site_config() -> Any:
     return await _proxy("GET", "/site_config")
 
 
+@router.post("/preview")
+async def preview(candidate: Dict[str, Any]) -> Any:
+    """FR-32: geometry-only preview — where a destination pin lands and
+    what road would be generated to reach it. No regen, so the editor can
+    call it while the admin is still placing."""
+    return await _proxy(
+        "POST", "/site_config/preview", json=candidate, timeout=30.0
+    )
+
+
 @router.post("/validate")
 async def validate(candidate: Dict[str, Any]) -> Any:
     # validate runs a scratch nav-graph regen when the graph changes
-    return await _proxy(
+    report = await _proxy(
         "POST",
         "/site_config/validate",
         json=await _with_positions(candidate),
         timeout=120.0,
     )
+    # FR-32/D-22: the sidecar knows which destination names would be
+    # retired; only this service knows what still dispatches to them.
+    if isinstance(report, dict):
+        violations = _in_use_violations(
+            await destination_references(
+                report.get("retired_destinations") or []
+            )
+        )
+        if violations:
+            report["violations"] = list(report.get("violations") or [])
+            report["violations"].extend(violations)
+            report["ok"] = False
+    return report
 
 
 @router.post("/apply")
@@ -196,6 +334,20 @@ async def apply(
     body: ApplyBody, user: User = Depends(user_dep)
 ) -> Any:
     await _guard_missions(body.acknowledge_active_missions)
+    # A candidate without a `destinations` key does not manage them at
+    # all (the sidecar keeps HEAD's), so nothing can be retired and there
+    # is nothing to fetch.
+    submitted = body.candidate.get("destinations")
+    if submitted is not None:
+        candidate_names = {
+            str(d.get("name"))
+            for d in submitted
+            if isinstance(d, dict) and d.get("name")
+        }
+        await _guard_retired_destinations(
+            [name for name in await _head_destination_names()
+             if name not in candidate_names]
+        )
     return await _proxy(
         "POST",
         "/site_config/apply",
