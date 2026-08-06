@@ -168,6 +168,48 @@ class TestSiteConfigRoutes(AppFixture):
                 lambda: DbTaskState.filter(id_="e5-guard-enum-repr").delete()
             )
 
+    def test_validate_injects_live_robot_positions(self):
+        # D-20: the sidecar refuses a no-go over a robot; the proxy must
+        # supply where the robots are
+        from api_server.models.tortoise_models import FleetState
+
+        portal = self.get_portal()
+        portal.call(
+            lambda: FleetState.update_or_create(
+                {
+                    "data": {
+                        "name": "gentle_fleet",
+                        "robots": {
+                            "gentle_bot_2": {
+                                "location": {"x": 9.0, "y": 3.5}
+                            }
+                        },
+                    }
+                },
+                name="gentle_fleet",
+            )
+        )
+        calls = []
+        fake = _fake_async_client(calls, _FakeResponse(json_body={"ok": True}))
+        try:
+            with unittest.mock.patch(
+                "api_server.routes.site_config.httpx.AsyncClient", fake
+            ):
+                resp = self.client.post(
+                    "/site_config/validate",
+                    json={"base_commit": "abc", "zones": {}},
+                )
+            self.assertEqual(200, resp.status_code, resp.content)
+            _, _, kwargs = calls[0]
+            positions = kwargs["json"]["robot_positions"]
+            self.assertEqual(
+                [{"name": "gentle_bot_2", "x": 9.0, "y": 3.5}], positions
+            )
+        finally:
+            portal.call(
+                lambda: FleetState.filter(name="gentle_fleet").delete()
+            )
+
     def test_non_admin_is_403(self):
         self.client.set_user("operator1")
         try:

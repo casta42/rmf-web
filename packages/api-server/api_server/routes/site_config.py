@@ -25,6 +25,7 @@ from pydantic import BaseModel
 from api_server.app_config import app_config
 from api_server.authenticator import user_dep
 from api_server.models import TaskStatus, User
+from api_server.models.tortoise_models import FleetState as DbFleetState
 from api_server.models.tortoise_models import TaskState as DbTaskState
 
 TOKEN_HEADER = "x-gf-internal-token"
@@ -65,6 +66,29 @@ class ApplyBody(BaseModel):
     candidate: Dict[str, Any]
     acknowledge_fleet_pause: bool = False
     acknowledge_active_missions: bool = False
+    # D-20: hard-confirm for closures that make destinations unreachable
+    acknowledge_reachability: bool = False
+
+
+async def robot_positions() -> List[Dict[str, Any]]:
+    """Live robot positions from the fleet states, injected into every
+    candidate so the sidecar can refuse a no-go drawn over a robot
+    (D-20 robot-orphan rule)."""
+    out: List[Dict[str, Any]] = []
+    for row in await DbFleetState.all():
+        state = row.data if isinstance(row.data, dict) else {}
+        for name, robot in (state.get("robots") or {}).items():
+            location = (robot or {}).get("location") or {}
+            x = location.get("x")
+            y = location.get("y")
+            if x is None or y is None:
+                continue
+            out.append({"name": str(name), "x": float(x), "y": float(y)})
+    return out
+
+
+async def _with_positions(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    return {**candidate, "robot_positions": await robot_positions()}
 
 
 class RestartBody(BaseModel):
@@ -158,9 +182,12 @@ async def get_site_config() -> Any:
 
 @router.post("/validate")
 async def validate(candidate: Dict[str, Any]) -> Any:
-    # validate runs a scratch nav-graph regen when building.yaml changed
+    # validate runs a scratch nav-graph regen when the graph changes
     return await _proxy(
-        "POST", "/site_config/validate", json=candidate, timeout=120.0
+        "POST",
+        "/site_config/validate",
+        json=await _with_positions(candidate),
+        timeout=120.0,
     )
 
 
@@ -173,10 +200,11 @@ async def apply(
         "POST",
         "/site_config/apply",
         json={
-            "candidate": body.candidate,
+            "candidate": await _with_positions(body.candidate),
             # server-side identity — the body cannot impersonate (NFR-4)
             "applied_by": user.username,
             "acknowledge_fleet_pause": body.acknowledge_fleet_pause,
+            "acknowledge_reachability": body.acknowledge_reachability,
         },
         timeout=60.0,
     )
