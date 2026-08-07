@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 
 from api_server import models as mdl
 from api_server.app_config import app_config
@@ -484,3 +484,43 @@ async def rmf_gateway(websocket: WebSocket):
             await process_msg(msg, fleet_repo)
     except WebSocketDisconnect:
         pass
+
+
+# ----------------------------------------------------------------------
+# F-86 / D-23 — the D-17 mission guard, re-checkable at the RESTART
+# BOUNDARY. The request-time guard in routes/site_config.py runs seconds
+# before the sidecar actually restarts rmf-core (validate + regen +
+# commit sit in between); a task dispatched in that window — routinely an
+# auto-issued ChargeBattery — would be interrupted without the
+# acknowledgment D-17 promises. The sidecar calls this endpoint
+# immediately before `docker restart` and aborts the job if
+# unacknowledged missions appeared.
+#
+# Auth: the /_internal mount carries no user auth (it is the fleet
+# adapter's gateway), so this endpoint checks the SAME shared-secret
+# token file the api-server uses to authenticate itself to the sidecar —
+# symmetric localhost defense-in-depth, the D-19 posture. No token file
+# configured -> 404, never an open endpoint by accident.
+# ----------------------------------------------------------------------
+
+
+@router.get("/active_missions")
+async def internal_active_missions(request: Request) -> list:
+    # imported here so the dependency stays one-directional at import
+    # time (site_config never imports internal, so no cycle either way)
+    import secrets as _secrets
+
+    from api_server.routes.site_config import TOKEN_HEADER, active_missions
+
+    token_file = app_config.site_config_token_file
+    if not token_file:
+        raise HTTPException(404, "no site-config token configured")
+    try:
+        with open(token_file, "r", encoding="utf8") as f:
+            expected = f.read().strip()
+    except OSError as e:
+        raise HTTPException(503, f"token file unreadable: {e}") from e
+    provided = request.headers.get(TOKEN_HEADER, "")
+    if not expected or not _secrets.compare_digest(provided, expected):
+        raise HTTPException(403, "missing or wrong internal token")
+    return await active_missions()

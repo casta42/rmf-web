@@ -11,6 +11,11 @@ responsibilities — everything user-facing about authority and safety:
 - D-17 mission guard: apply (and the recovery restart) REFUSES with 409
   and the list of non-terminal missions unless the caller re-sends with
   acknowledge_active_missions=true (the dashboard's hard-confirm flow).
+  F-86/D-23: this request-time check alone left a seconds-wide window
+  (validate + regen + commit run in the sidecar before the restart), so
+  the acknowledgment flag is FORWARDED to the sidecar, which re-verifies
+  at the actual restart boundary via GET /_internal/active_missions
+  (token-authenticated; see routes/internal.py).
 
 The shared-secret header authenticates this proxy to the sidecar; it is
 read per-request so a token rotation needs no api-server restart.
@@ -122,10 +127,17 @@ def _places_of(description: Any) -> List[str]:
     return out
 
 
-def _schedule_label(request: Any) -> str:
+def _schedule_label(request: Any, created_by: Any = None) -> str:
+    """How the admin will recognise this schedule in Missions →
+    Schedules, which lists them by route and creator (they have no
+    name). Both parts matter: a single-stop schedule's route IS the
+    destination name, so "schedule “dock_4”" alone reads as a typo and
+    points at nothing findable."""
     places = _places_of((request or {}).get("description")
                         if isinstance(request, dict) else None)
-    return " → ".join(places) if places else "scheduled mission"
+    route = " → ".join(places) if places else "scheduled mission"
+    who = str(created_by).strip() if created_by else ""
+    return f"{route} (created by {who})" if who else route
 
 
 async def destination_references(
@@ -144,7 +156,7 @@ async def destination_references(
                 if entry not in found[place]:
                     found[place].append(entry)
     for row in await DbScheduledTask.all():
-        label = _schedule_label(row.task_request)
+        label = _schedule_label(row.task_request, row.created_by)
         request = row.task_request if isinstance(row.task_request, dict) else {}
         for place in _places_of(request.get("description")):
             if place in wanted:
@@ -357,6 +369,9 @@ async def apply(
             "applied_by": user.username,
             "acknowledge_fleet_pause": body.acknowledge_fleet_pause,
             "acknowledge_reachability": body.acknowledge_reachability,
+            # F-86/D-23: the sidecar re-verifies at the restart boundary;
+            # it must know whether interruption was already accepted.
+            "acknowledge_active_missions": body.acknowledge_active_missions,
         },
         timeout=60.0,
     )
@@ -376,6 +391,12 @@ async def restart(
                 headers={
                     TOKEN_HEADER: token,
                     "x-gf-applied-by": user.username,
+                },
+                json={
+                    "requested_by": user.username,
+                    # F-86/D-23: boundary re-check needs the ack too
+                    "acknowledge_active_missions":
+                        body.acknowledge_active_missions,
                 },
                 timeout=60.0,
             )

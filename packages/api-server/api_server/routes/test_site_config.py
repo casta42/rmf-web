@@ -306,6 +306,9 @@ class TestSiteConfigRoutes(AppFixture):
             detail = resp.json()["detail"]
             self.assertEqual("destination_in_use", detail["reason"])
             self.assertIn("pickup_1 → dock_3", detail["message"])
+            # a schedule has no name, so the admin finds it in Missions →
+            # Schedules by route AND creator — both must be in the message
+            self.assertIn("created by admin", detail["message"])
             # the site-config HEAD read happened, the apply never did
             self.assertEqual(1, len(calls))
             self.assertTrue(calls[0][1].endswith("/site_config"))
@@ -339,6 +342,48 @@ class TestSiteConfigRoutes(AppFixture):
         self.assertEqual(200, resp.status_code, resp.content)
         self.assertEqual(1, len(calls))
         self.assertTrue(calls[0][1].endswith("/site_config/apply"))
+
+    def test_internal_active_missions_needs_the_shared_token(self):
+        # F-86/D-23: the boundary-check callback — token-authenticated,
+        # never open (the /_internal mount carries no user auth).
+        resp = self.client.get("/_internal/active_missions")
+        self.assertEqual(403, resp.status_code)
+        resp = self.client.get(
+            "/_internal/active_missions",
+            headers={"x-gf-internal-token": "wrong"},
+        )
+        self.assertEqual(403, resp.status_code)
+
+    def test_internal_active_missions_lists_non_terminal_tasks(self):
+        from api_server.models import TaskStatus
+        from api_server.models.tortoise_models import TaskState as DbTaskState
+
+        portal = self.get_portal()
+        portal.call(
+            lambda: DbTaskState.update_or_create(
+                {
+                    "data": {},
+                    "status": TaskStatus.underway,
+                    "assigned_to": "gentle_bot_7",
+                },
+                id_="f86-boundary-row",
+            )
+        )
+        try:
+            resp = self.client.get(
+                "/_internal/active_missions",
+                headers={"x-gf-internal-token": "test-token"},
+            )
+            self.assertEqual(200, resp.status_code, resp.content)
+            match = [
+                m for m in resp.json() if m["task_id"] == "f86-boundary-row"
+            ]
+            self.assertEqual(1, len(match), resp.json())
+            self.assertEqual("gentle_bot_7", match[0]["robot"])
+        finally:
+            portal.call(
+                lambda: DbTaskState.filter(id_="f86-boundary-row").delete()
+            )
 
     def test_non_admin_is_403(self):
         self.client.set_user("operator1")
