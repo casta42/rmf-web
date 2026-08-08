@@ -44,3 +44,72 @@ async def get_zones() -> Dict[str, Any]:
     """The site's zone data: no_go_zones, speed_zones, mutex_zones
     (coordinates in RMF building-map meters)."""
     return _load_zones()
+
+
+# ----------------------------------------------------------------------
+# D-24: the DERIVED nav graph — the exact graph the fleet drives (base
+# lanes minus zone closures, plus generated detours and destination
+# splits/stubs), read from the config repo file rmf-core loads. The
+# dashboard renders THIS graph, uniformly: closed lanes are simply not
+# in it, generated lanes are ordinary lanes whose params carry
+# provenance (gf_generated / gf_destination) for hover (DR-3). It also
+# outlives an rmf-core restart, unlike building_map_server.
+# ----------------------------------------------------------------------
+_graph_cache: Dict[str, Any] = {}
+_graph_mtime: Optional[float] = None
+
+
+def _normalize_nav_graph(data: Dict[str, Any]) -> Dict[str, Any]:
+    levels = data.get("levels") or {}
+    if not levels:
+        raise HTTPException(500, "nav graph has no levels")
+    level_name = next(iter(levels))
+    level = levels[level_name] or {}
+    vertices = []
+    for vertex in level.get("vertices") or []:
+        params = dict(vertex[2]) if len(vertex) > 2 and vertex[2] else {}
+        name = str(params.pop("name", "") or "")
+        vertices.append(
+            {"x": float(vertex[0]), "y": float(vertex[1]), "name": name, "params": params}
+        )
+    # The file stores directed entries (a bidirectional lane is two);
+    # rendering wants undirected lanes with a direction flag.
+    lanes: Dict[Any, Dict[str, Any]] = {}
+    for lane in level.get("lanes") or []:
+        u, v = int(lane[0]), int(lane[1])
+        params = dict(lane[2]) if len(lane) > 2 and lane[2] else {}
+        key = (u, v) if u <= v else (v, u)
+        entry = lanes.get(key)
+        if entry is None:
+            lanes[key] = {"a": u, "b": v, "bidirectional": False, "params": params}
+        else:
+            entry["bidirectional"] = True
+    return {
+        "level": level_name,
+        "vertices": vertices,
+        "lanes": list(lanes.values()),
+    }
+
+
+@router.get("/nav_graph")
+async def get_nav_graph() -> Dict[str, Any]:
+    """The derived nav graph in service (D-24): vertices with names and
+    params, undirected lanes with a bidirectional flag and provenance
+    params (gf_generated, gf_destination, speed_limit)."""
+    global _graph_cache, _graph_mtime  # pylint: disable=global-statement
+    zones_file = app_config.zones_file
+    if not zones_file:
+        raise HTTPException(404, "no zones file configured for this site (zones_file)")
+    graph_file = os.path.join(os.path.dirname(zones_file), "nav_graphs", "0.yaml")
+    try:
+        mtime = os.path.getmtime(graph_file)
+    except OSError as e:
+        raise HTTPException(404, f"nav graph unreadable: {e}") from e
+    if _graph_mtime != mtime:
+        with open(graph_file, "r", encoding="utf8") as f:
+            data = yaml.safe_load(f)
+        if not isinstance(data, dict):
+            raise HTTPException(500, "nav graph file is not a mapping")
+        _graph_cache = _normalize_nav_graph(data)
+        _graph_mtime = mtime
+    return _graph_cache

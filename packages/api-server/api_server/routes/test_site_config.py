@@ -203,7 +203,10 @@ class TestSiteConfigRoutes(AppFixture):
             _, _, kwargs = calls[0]
             positions = kwargs["json"]["robot_positions"]
             self.assertEqual(
-                [{"name": "gentle_bot_2", "x": 9.0, "y": 3.5}], positions
+                # D-24 §5: parked=True — no mission rows exist in this
+                # fixture, so the robot counts as parked (evacuable)
+                [{"name": "gentle_bot_2", "x": 9.0, "y": 3.5, "parked": True}],
+                positions,
             )
         finally:
             portal.call(

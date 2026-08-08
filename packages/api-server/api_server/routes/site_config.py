@@ -78,9 +78,21 @@ class ApplyBody(BaseModel):
 
 
 async def robot_positions() -> List[Dict[str, Any]]:
-    """Live robot positions from the fleet states, injected into every
-    candidate so the sidecar can refuse a no-go drawn over a robot
-    (D-20 robot-orphan rule)."""
+    """Live robot positions, plus whether each robot is PARKED (no
+    non-terminal mission assigned). Injected into every candidate so
+    the sidecar can plan D-24 §5 evacuations — for parked robots only.
+    A robot mid-mission is the D-17 mission guard's business: it can
+    neither be "moved first" nor be assumed to still be where this
+    snapshot put it (caught live in the D-24 walk: the snapshot grabbed
+    a robot TRANSITING the draft zone and planned an evacuation it
+    could never complete)."""
+    busy = {
+        str(row["assigned_to"])
+        for row in await DbTaskState.filter(
+            status__in=_NON_TERMINAL_MATCH
+        ).values("assigned_to")
+        if row["assigned_to"]
+    }
     out: List[Dict[str, Any]] = []
     for row in await DbFleetState.all():
         state = row.data if isinstance(row.data, dict) else {}
@@ -90,7 +102,14 @@ async def robot_positions() -> List[Dict[str, Any]]:
             y = location.get("y")
             if x is None or y is None:
                 continue
-            out.append({"name": str(name), "x": float(x), "y": float(y)})
+            out.append(
+                {
+                    "name": str(name),
+                    "x": float(x),
+                    "y": float(y),
+                    "parked": str(name) not in busy,
+                }
+            )
     return out
 
 

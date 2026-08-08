@@ -504,13 +504,12 @@ async def rmf_gateway(websocket: WebSocket):
 # ----------------------------------------------------------------------
 
 
-@router.get("/active_missions")
-async def internal_active_missions(request: Request) -> list:
+def _require_internal_token(request: Request) -> None:
     # imported here so the dependency stays one-directional at import
     # time (site_config never imports internal, so no cycle either way)
     import secrets as _secrets
 
-    from api_server.routes.site_config import TOKEN_HEADER, active_missions
+    from api_server.routes.site_config import TOKEN_HEADER
 
     token_file = app_config.site_config_token_file
     if not token_file:
@@ -523,4 +522,138 @@ async def internal_active_missions(request: Request) -> list:
     provided = request.headers.get(TOKEN_HEADER, "")
     if not expected or not _secrets.compare_digest(provided, expected):
         raise HTTPException(403, "missing or wrong internal token")
+
+
+@router.get("/active_missions")
+async def internal_active_missions(request: Request) -> list:
+    from api_server.routes.site_config import active_missions
+
+    _require_internal_token(request)
     return await active_missions()
+
+
+# ----------------------------------------------------------------------
+# D-24 §5 — evacuation. The sidecar plans WHERE a displaced robot goes
+# (only it sees the post-apply graph); the fleet adapter's settle-to-
+# graph machinery executes the move. This is the bridge: the sidecar
+# POSTs the plan here, we publish it to the adapter, and the sidecar
+# polls /robot_positions until the robot stands on its target. Same
+# token posture as /active_missions (D-19/D-23: symmetric localhost
+# defense-in-depth; no new privilege moves — a robot repositioning
+# primitive already exists as the adapter's own settle behavior).
+# ----------------------------------------------------------------------
+_evacuate_pub = None
+
+
+@router.get("/robot_positions")
+async def internal_robot_positions(request: Request) -> list:
+    from api_server.routes.site_config import robot_positions
+
+    _require_internal_token(request)
+    return await robot_positions()
+
+
+@router.post("/cancel_missions")
+async def internal_cancel_missions(request: Request) -> list:
+    """D-24 §6 / D-17 honesty: a hard-confirmed apply is about to
+    restart rmf-core over these missions. Cancel them PROPERLY — RMF
+    cancellation plus a provenance label — instead of letting the
+    restart orphan them into the stale-task janitor as anonymous
+    failures. The sidecar calls this immediately before the restart, so
+    a job that failed validation or evacuation never cancels anything.
+    Best-effort per task: the restart interrupts the mission either way;
+    what this adds is the honest record."""
+    from datetime import datetime as _datetime
+
+    from api_server import models as _mdl
+    from api_server.models.rmf_api.task_state import Cancellation
+    from api_server.rmf_io import cancellation as _task_cancellation
+    from api_server.rmf_io import tasks_service
+    from api_server.routes.site_config import active_missions
+
+    _require_internal_token(request)
+    body = await request.json()
+    applied_by = str(body.get("applied_by") or "admin")
+    label = (
+        "Interrupted by a site configuration change "
+        f"(applied by {applied_by})"
+    )
+    missions = await active_missions()
+    for mission in missions:
+        task_id = str(mission.get("task_id") or "")
+        if not task_id:
+            continue
+        _task_cancellation.latch(
+            task_id,
+            Cancellation(
+                unix_millis_request_time=round(
+                    _datetime.now().timestamp() * 1e3
+                ),
+                labels=[label],
+            ),
+        )
+        try:
+            await tasks_service().call(
+                _mdl.CancelTaskRequest(
+                    type="cancel_task_request", task_id=task_id, labels=[label]
+                ).model_dump_json(exclude_none=True)
+            )
+        except Exception as e:  # noqa: BLE001 — per-task best effort
+            logger.warning(
+                "cancel_missions: RMF cancel of [%s] failed (%s) — the "
+                "restart will interrupt it anyway; provenance stays "
+                "latched",
+                task_id,
+                e,
+            )
+    logger.info(
+        "D-24: %d mission(s) canceled ahead of a site-change restart "
+        "(applied by %s)",
+        len(missions),
+        applied_by,
+    )
+    return missions
+
+
+@router.post("/evacuate")
+async def internal_evacuate(request: Request) -> dict:
+    import json as _json
+
+    import rclpy.qos
+    from std_msgs.msg import String as StringMsg
+
+    from api_server import ros
+
+    _require_internal_token(request)
+    body = await request.json()
+    for key in ("robot", "waypoint", "x", "y"):
+        if key not in body:
+            raise HTTPException(422, f"evacuate body is missing '{key}'")
+    global _evacuate_pub  # pylint: disable=global-statement
+    if _evacuate_pub is None:
+        _evacuate_pub = ros.ros_node().create_publisher(
+            StringMsg,
+            "gf_evacuate",
+            rclpy.qos.QoSProfile(
+                depth=10,
+                history=rclpy.qos.HistoryPolicy.KEEP_LAST,
+                reliability=rclpy.qos.ReliabilityPolicy.RELIABLE,
+                durability=rclpy.qos.DurabilityPolicy.VOLATILE,
+            ),
+        )
+    _evacuate_pub.publish(
+        StringMsg(
+            data=_json.dumps(
+                {
+                    "robot": str(body["robot"]),
+                    "waypoint": str(body["waypoint"]),
+                    "x": float(body["x"]),
+                    "y": float(body["y"]),
+                }
+            )
+        )
+    )
+    logger.info(
+        "D-24 evacuation commanded: %s -> %s", body["robot"], body["waypoint"]
+    )
+    return {"ok": True}
