@@ -8,6 +8,7 @@ from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisco
 
 from api_server import models as mdl
 from api_server.app_config import app_config
+from api_server.dispatch_reason import dispatch_failure_reason
 from api_server.logger import logger as base_logger
 from api_server.models import tortoise_models as ttm
 from api_server.models.rmf_api.robot_state import Status as RobotStatus
@@ -429,6 +430,17 @@ async def process_msg(msg: Dict[str, Any], fleet_repo: FleetRepository) -> None:
         ):
             if not await alert_repo.alert_exists(task_state.booking.id):
                 assigned = task_state.assigned_to
+                # F-95: carry the WHY when the dispatcher knows it. A task
+                # refused at dispatch time has the adapter's structured
+                # errors in dispatch.errors; execution failures do not.
+                reason = (
+                    dispatch_failure_reason(task_state.dispatch.errors)
+                    if task_state.dispatch is not None
+                    else None
+                )
+                message = f"Task {task_state.booking.id} {task_state.status.value}"
+                if task_state.status == mdl.TaskStatus.failed and reason:
+                    message = f"{message}: {reason}"
                 alert = await alert_repo.create_alert(
                     task_state.booking.id,
                     "task",
@@ -439,7 +451,7 @@ async def process_msg(msg: Dict[str, Any], fleet_repo: FleetRepository) -> None:
                     ),
                     fleet=assigned.group if assigned is not None else None,
                     robot=assigned.name if assigned is not None else None,
-                    message=f"Task {task_state.booking.id} {task_state.status.value}",
+                    message=message,
                 )
                 if alert is not None:
                     alert_events.alerts.on_next(alert)
@@ -574,10 +586,7 @@ async def internal_cancel_missions(request: Request) -> list:
     _require_internal_token(request)
     body = await request.json()
     applied_by = str(body.get("applied_by") or "admin")
-    label = (
-        "Interrupted by a site configuration change "
-        f"(applied by {applied_by})"
-    )
+    label = "Interrupted by a site configuration change " f"(applied by {applied_by})"
     missions = await active_missions()
     for mission in missions:
         task_id = str(mission.get("task_id") or "")
@@ -586,9 +595,7 @@ async def internal_cancel_missions(request: Request) -> list:
         _task_cancellation.latch(
             task_id,
             Cancellation(
-                unix_millis_request_time=round(
-                    _datetime.now().timestamp() * 1e3
-                ),
+                unix_millis_request_time=round(_datetime.now().timestamp() * 1e3),
                 labels=[label],
             ),
         )
@@ -653,7 +660,5 @@ async def internal_evacuate(request: Request) -> dict:
             )
         )
     )
-    logger.info(
-        "D-24 evacuation commanded: %s -> %s", body["robot"], body["waypoint"]
-    )
+    logger.info("D-24 evacuation commanded: %s -> %s", body["robot"], body["waypoint"])
     return {"ok": True}
