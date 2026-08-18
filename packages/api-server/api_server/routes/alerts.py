@@ -54,11 +54,27 @@ async def get_alert(alert_id: str, repo: AlertRepository = Depends(alert_repo_de
 
 @router.post("", status_code=201, response_model=ttm.AlertPydantic)
 async def create_alert(
-    alert_id: str, category: str, repo: AlertRepository = Depends(alert_repo_dep)
+    alert_id: str,
+    category: str,
+    severity: str = ttm.Alert.Severity.Warning,
+    fleet: Optional[str] = None,
+    robot: Optional[str] = None,
+    message: Optional[str] = None,
+    repo: AlertRepository = Depends(alert_repo_dep),
 ):
-    alert = await repo.create_alert(alert_id, category)
+    """FR-31/FR-17: external creators (e.g. the co-location sentinel)
+    pass the structured context the repository already stores — severity,
+    fleet, robot and a human sentence — so the alert center never has to
+    fall back to rendering a machine ID. The create path also pushes the
+    alert event so a critical alert toasts live (F-93), exactly like the
+    acknowledge/resolve paths already do."""
+    alert = await repo.create_alert(
+        alert_id, category, severity=severity, fleet=fleet, robot=robot,
+        message=message
+    )
     if alert is None:
         raise HTTPException(404, f"Could not create alert with ID {alert_id}")
+    alert_events.alerts.on_next(alert)
     return alert
 
 
