@@ -17,6 +17,14 @@ from api_server.rmf_io import alert_events
 from api_server.rmf_io import cancellation as task_cancellation
 from api_server.rmf_io import fleet_events, rmf_events, task_events
 
+# Fault issue categories the fleet adapter raises (RobotCommandHandle
+# `_faults`): these mean the robot is out of service and its tasks were
+# failed per FR-29. Traffic-condition issues (blocked_by_no_go,
+# waiting_on_occupied_waypoint) are deliberately excluded.
+ROBOT_FAULT_CATEGORIES = frozenset(
+    {"robot_offline", "robot_unresponsive", "robot_down"}
+)
+
 router = APIRouter(tags=["_internal"])
 logger = base_logger.getChild("RmfGatewayApp")
 user: mdl.User = mdl.User(username="__rmf_internal__", is_admin=True)
@@ -225,11 +233,20 @@ async def process_robot_alerts(fleet_state: mdl.FleetState) -> None:
         # F-38). Detected FIRST — a faulted robot's telemetry is spoofed
         # (F-42 holds SoC at 0.0), so the low-battery alert must not fire
         # on top of the fault alert.
+        # The prefix is NOT the test: the adapter also raises
+        # `robot_blocked_by_no_go` and `robot_waiting_on_occupied_waypoint`,
+        # which are Warning-tier traffic conditions, not faults. Treating
+        # them as faults told the operator a queueing robot was faulted and
+        # that "its missions were canceled" (both false), and suppressed
+        # that robot's low-battery alert — a draining robot stuck in a
+        # queue lost its battery warning, one ingredient of the F-112
+        # cascade. Only the adapter's real fault keys count (F-38/F-40/
+        # FR-29): robot_offline, robot_unresponsive, robot_down.
         fault_categories = sorted(
             {
                 str(issue.category)
                 for issue in (robot.issues or [])
-                if str(issue.category or "").startswith("robot_")
+                if str(issue.category or "") in ROBOT_FAULT_CATEGORIES
             }
         )
         battery_new, battery_resolved = check_low_battery(robot_id, robot, now_millis)
