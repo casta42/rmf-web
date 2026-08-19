@@ -9,7 +9,9 @@ from api_server.models.rmf_api.robot_state import Status as RobotStatus
 from .dispatch_guard import (
     OCCUPIED_TOLERANCE,
     find_vertex,
+    isolated_place,
     parked_robot_near,
+    patrol_places,
     patrol_final_place,
 )
 
@@ -139,3 +141,43 @@ class TestParkedRobotNear(unittest.TestCase):
             parked_robot_near(fleets, 26.1, 1.5, exclude="test_fleet/other_robot"),
             "test_fleet/test_robot",
         )
+
+
+# ----------------------------------------------------------------------
+# F-111: a waypoint a zone has isolated must never reach the planner
+# ----------------------------------------------------------------------
+def _graph_with(vertices, lanes):
+    """Derived-nav-graph stand-in, in the /zones/nav_graph shape."""
+    return {
+        "vertices": [{"name": n, "x": 0.0, "y": 0.0} for n in vertices],
+        "lanes": [{"a": a, "b": b} for a, b in lanes],
+    }
+
+
+def test_isolated_place_is_found_by_name():
+    # j_e1 (index 1) has no edges: a zone closed every lane to it.
+    nav_graph = _graph_with(["j_w1", "j_e1", "j_s2"], [(0, 2)])
+    assert isolated_place(nav_graph, ["j_e1"]) == "j_e1"
+    assert isolated_place(nav_graph, ["j_w1"]) is None
+    # order preserved: the first stranded place is the one reported
+    assert (
+        isolated_place(nav_graph, ["j_w1", "j_e1"]) == "j_e1"
+    )
+
+
+def test_unknown_place_is_left_to_the_fleet():
+    nav_graph = _graph_with(["j_w1"], [(0, 0)])
+    assert isolated_place(nav_graph, ["elsewhere"]) is None
+
+
+def test_patrol_places_reads_every_stop_and_fails_open():
+    request = TaskRequest(
+        category="patrol", description={"places": ["a", "b"], "rounds": 1}
+    )
+    assert patrol_places(request) == ["a", "b"]
+    assert patrol_places(
+        TaskRequest(category="compose", description={})
+    ) == []
+    assert patrol_places(
+        TaskRequest(category="patrol", description="nonsense")
+    ) == []

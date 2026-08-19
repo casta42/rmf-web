@@ -79,3 +79,50 @@ def parked_robot_near(
             if math.hypot(robot.location.x - x, robot.location.y - y) <= tolerance:
                 return f"{fleet.name}/{robot_name}"
     return None
+
+
+# F-111: a waypoint every one of whose lanes a no-go zone closed is
+# ISOLATED — it still exists in the nav graph, with no way in or out.
+# Dispatching a patrol that starts at such a place SEGFAULTS the fleet
+# adapter (rmf_traffic planner, exit -11, reproduced deterministically);
+# the adapter does not respawn, so the whole fleet silently stops bidding
+# on every task until someone restarts fleet coordination. The layer we
+# own refuses the dispatch instead, naming the place — an operator error
+# must never be able to take the fleet down.
+#
+# Same fail-open posture as the F-34 guard: unknown place, no building
+# map, or anything unparsed means "no objection".
+def patrol_places(request: mdl.TaskRequest) -> List[str]:
+    """Every place name of a patrol request, in order."""
+    if request.category != "patrol" or not isinstance(request.description, dict):
+        return []
+    places = request.description.get("places")
+    if not isinstance(places, list):
+        return []
+    return [p for p in places if isinstance(p, str)]
+
+
+def isolated_place(nav_graph: dict, places: List[str]) -> Optional[str]:
+    """First place that exists in the DERIVED nav graph but has no lane
+    attached to it, or None. The derived graph (not the building map) is
+    the only source that reflects zone closures — the building map keeps
+    the authored lanes and would report every waypoint as reachable.
+    A place the graph does not know at all is left to the fleet to
+    reject (it may belong to another map)."""
+    vertices = nav_graph.get("vertices") or []
+    lanes = nav_graph.get("lanes") or []
+    for place in places:
+        index = next(
+            (i for i, vertex in enumerate(vertices)
+             if vertex.get("name") == place),
+            None,
+        )
+        if index is None:
+            continue
+        attached = any(
+            lane.get("a") == index or lane.get("b") == index
+            for lane in lanes
+        )
+        if not attached:
+            return place
+    return None

@@ -20,6 +20,7 @@ from api_server.repositories import FleetRepository, TaskRepository, task_repo_d
 from api_server.response import RawJSONResponse
 from api_server.rmf_io import cancellation as task_cancellation
 from api_server.rmf_io import task_events, tasks_service
+from api_server.routes import zones as zones_routes
 from api_server.routes.tasks import dispatch_guard
 
 router = FastIORouter(tags=["Tasks"])
@@ -244,7 +245,30 @@ async def guard_patrol_destination(
     ttm_map = await ttm.BuildingMap.first()
     if ttm_map is None:
         return
-    vertex = dispatch_guard.find_vertex(BuildingMap.from_tortoise(ttm_map), place)
+    building_map = BuildingMap.from_tortoise(ttm_map)
+    # F-111: refuse before the planner sees it — a place a zone has
+    # isolated crashes the fleet adapter and takes the whole fleet's
+    # bidding down with it. Checked against the DERIVED graph: the
+    # building map still carries the lanes the zone closed.
+    nav_graph = zones_routes.derived_nav_graph()
+    stranded = (
+        dispatch_guard.isolated_place(
+            nav_graph, dispatch_guard.patrol_places(request)
+        )
+        if nav_graph
+        else None
+    )
+    if stranded is not None:
+        raise HTTPException(
+            409,
+            detail=(
+                f"[{stranded}] has no lanes to it right now — a no-go "
+                "zone has closed every route to that waypoint (F-111). "
+                "Remove or redraw the zone, or send the mission "
+                "somewhere else."
+            ),
+        )
+    vertex = dispatch_guard.find_vertex(building_map, place)
     if vertex is None:
         return
     fleets = await FleetRepository(task_repo.user).get_all_fleets()

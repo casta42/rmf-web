@@ -91,25 +91,37 @@ def _normalize_nav_graph(data: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def derived_nav_graph() -> Optional[Dict[str, Any]]:
+    """The derived nav graph in service, or None when it is not readable.
+    Shared by the /zones/nav_graph route and the F-111 dispatch guard —
+    the DERIVED graph is the only honest answer to "can the fleet reach
+    this waypoint right now", since the building map still carries the
+    authored lanes a zone has closed."""
+    global _graph_cache, _graph_mtime  # pylint: disable=global-statement
+    zones_file = app_config.zones_file
+    if not zones_file:
+        return None
+    graph_file = os.path.join(os.path.dirname(zones_file), "nav_graphs", "0.yaml")
+    try:
+        mtime = os.path.getmtime(graph_file)
+    except OSError:
+        return None
+    if _graph_mtime != mtime:
+        with open(graph_file, "r", encoding="utf8") as f:
+            data = yaml.safe_load(f)
+        if not isinstance(data, dict):
+            return None
+        _graph_cache = _normalize_nav_graph(data)
+        _graph_mtime = mtime
+    return _graph_cache
+
+
 @router.get("/nav_graph")
 async def get_nav_graph() -> Dict[str, Any]:
     """The derived nav graph in service (D-24): vertices with names and
     params, undirected lanes with a bidirectional flag and provenance
     params (gf_generated, gf_destination, speed_limit)."""
-    global _graph_cache, _graph_mtime  # pylint: disable=global-statement
-    zones_file = app_config.zones_file
-    if not zones_file:
-        raise HTTPException(404, "no zones file configured for this site (zones_file)")
-    graph_file = os.path.join(os.path.dirname(zones_file), "nav_graphs", "0.yaml")
-    try:
-        mtime = os.path.getmtime(graph_file)
-    except OSError as e:
-        raise HTTPException(404, f"nav graph unreadable: {e}") from e
-    if _graph_mtime != mtime:
-        with open(graph_file, "r", encoding="utf8") as f:
-            data = yaml.safe_load(f)
-        if not isinstance(data, dict):
-            raise HTTPException(500, "nav graph file is not a mapping")
-        _graph_cache = _normalize_nav_graph(data)
-        _graph_mtime = mtime
-    return _graph_cache
+    graph = derived_nav_graph()
+    if graph is None:
+        raise HTTPException(404, "nav graph unreadable for this site")
+    return graph
