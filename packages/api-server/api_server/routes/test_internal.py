@@ -321,3 +321,141 @@ class TestChargeGhostStaleCutoff(unittest.TestCase):
         self.assertIsNone(
             charge_ghost_stale_cutoff(self.make_fleet_state(None), self.NOW)
         )
+
+
+class _FakeAlertRepo:
+    """FR-36 fold tests: capture repo traffic without a database."""
+
+    def __init__(self):
+        self.created = []  # (id, category, severity, message)
+        self.resolved = []
+        self.swept_prefixes = []
+
+    async def create_alert(self, alert_id, category, severity, fleet, robot, message):
+        self.created.append((alert_id, category, severity, message))
+        return None  # alert_events push is exercised elsewhere
+
+    async def resolve_alert(self, alert_id):
+        self.resolved.append(alert_id)
+        return None
+
+    async def resolve_alerts_by_prefix(self, prefix, resolved_by="x"):
+        self.swept_prefixes.append(prefix)
+        return []
+
+
+def _fr36_fleet_state(issues_by_robot):
+    from api_server.models.rmf_api.robot_state import Issue
+
+    robots = {}
+    for name, issues in issues_by_robot.items():
+        robots[name] = RobotState(
+            name=name,
+            status=RobotStatus.working,
+            task_id="",
+            location=Location2D(map="L1", x=0, y=0, yaw=0),
+            issues=[Issue(category=c, detail=d) for c, d in issues],
+        )
+    return FleetState(name="gentle_fleet", robots=robots)
+
+
+class TestProcessFr36Conditions(unittest.IsolatedAsyncioTestCase):
+    """FR-36/D-30: one operator alert per proved condition episode —
+    never F-125's four unrelated rows for one deadlock."""
+
+    def setUp(self):
+        from . import internal
+
+        self.internal = internal
+        internal._fr36_alerted.clear()
+        internal._fr36_actions.clear()
+        internal._fr36_stale_swept.clear()
+        self.repo = _FakeAlertRepo()
+        self._real_repo = internal.alert_repo
+        internal.alert_repo = self.repo
+
+    def tearDown(self):
+        self.internal.alert_repo = self._real_repo
+
+    DEADLOCK = (
+        "fleet_deadlock",
+        {
+            "episode": "cycle-b1-b3",
+            "cycle": ["b1", "b3"],
+            "tasks": ["t1", "t3"],
+            "status": "resolving",
+        },
+    )
+
+    async def test_one_deadlock_is_one_critical_alert(self):
+        state = _fr36_fleet_state({"b1": [self.DEADLOCK], "b3": [self.DEADLOCK]})
+        await self.internal.process_fr36_conditions(state, 1000)
+        await self.internal.process_fr36_conditions(state, 2000)
+        condition_rows = [c for c in self.repo.created if "action" not in c[0]]
+        self.assertEqual(len(condition_rows), 1)
+        alert_id, category, severity, message = condition_rows[0]
+        self.assertTrue(alert_id.startswith("fr36__gentle_fleet__"))
+        self.assertEqual(severity, self.internal.ttm.Alert.Severity.Critical)
+        self.assertIn("b1 -> b3 -> b1", message)
+        self.assertIn("t1, t3", message)
+
+    async def test_action_lands_as_one_info_row(self):
+        with_action = (
+            self.DEADLOCK[0],
+            {**self.DEADLOCK[1], "action": "b1 moved off its waypoint"},
+        )
+        state = _fr36_fleet_state({"b1": [with_action]})
+        await self.internal.process_fr36_conditions(state, 1000)
+        await self.internal.process_fr36_conditions(state, 2000)
+        actions = [c for c in self.repo.created if "action" in c[0]]
+        self.assertEqual(len(actions), 1)
+        self.assertIn("Traffic recovery: b1 moved off", actions[0][3])
+
+    async def test_cleared_episode_resolves_the_alert(self):
+        state = _fr36_fleet_state({"b1": [self.DEADLOCK]})
+        await self.internal.process_fr36_conditions(state, 1000)
+        created_id = self.repo.created[0][0]
+        empty = _fr36_fleet_state({"b1": []})
+        await self.internal.process_fr36_conditions(empty, 2000)
+        self.assertIn(created_id, self.repo.resolved)
+
+    async def test_escalation_supersedes_the_condition_row(self):
+        state = _fr36_fleet_state({"b1": [self.DEADLOCK]})
+        await self.internal.process_fr36_conditions(state, 1000)
+        first_id = self.repo.created[0][0]
+        escalated = (
+            "fleet_blocked_escalation",
+            {
+                "episode": "cycle-b1-b3",
+                "blocker": "b3",
+                "where": "at (21.5, 11.6)",
+                "reason": "[b3] is faulted and cannot move",
+                "waiting": ["b1"],
+                "tasks": ["t1"],
+            },
+        )
+        state2 = _fr36_fleet_state({"b1": [self.DEADLOCK, escalated]})
+        await self.internal.process_fr36_conditions(state2, 2000)
+        self.assertIn(first_id, self.repo.resolved)
+        latest = self.repo.created[-1]
+        self.assertEqual(latest[2], self.internal.ttm.Alert.Severity.Critical)
+        self.assertIn("needs an operator", latest[3])
+        self.assertIn("b3", latest[3])
+        self.assertIn("(21.5, 11.6)", latest[3])
+
+    async def test_idle_blocker_chain_is_a_warning_naming_the_blocker(self):
+        chain = (
+            "fleet_blocked",
+            {
+                "episode": "chain-b2",
+                "blocker": "b2",
+                "waiting": ["b3", "b4"],
+                "tasks": ["t3"],
+            },
+        )
+        state = _fr36_fleet_state({"b3": [chain]})
+        await self.internal.process_fr36_conditions(state, 1000)
+        row = self.repo.created[0]
+        self.assertEqual(row[2], self.internal.ttm.Alert.Severity.Warning)
+        self.assertIn("b2 is idle", row[3])
+        self.assertIn("b3, b4", row[3])

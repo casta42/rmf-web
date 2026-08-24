@@ -79,6 +79,17 @@ _stuck_states: Dict[str, _StuckState] = {}
 # resolved when the robot's fault issues clear.
 _fault_alerted: Dict[str, str] = {}
 _fault_stale_swept: set = set()
+
+# FR-36/D-30 layers 2-4: the fleet adapter proves a deadlock (wait-for
+# cycle) or a blocked chain and raises ONE issue ticket per condition
+# episode; this module folds it into ONE operator alert — the anti-shape
+# is F-125's four unrelated "has not moved" rows for a single deadlock.
+FR36_CATEGORIES = frozenset(
+    {"fleet_deadlock", "fleet_blocked", "fleet_blocked_escalation"}
+)
+_fr36_alerted: Dict[str, Tuple[str, str]] = {}  # episode -> (alert_id, cat)
+_fr36_actions: Dict[str, str] = {}  # episode -> last announced action
+_fr36_stale_swept: set = set()  # fleet names swept on first sighting
 # per fleet, wall-clock time of the last ghost charge task reap (F-12)
 _last_charge_reap: Dict[str, float] = {}
 # robots whose stale stuck alerts from a previous server life were swept (F-29)
@@ -324,6 +335,114 @@ async def process_robot_alerts(fleet_state: mdl.FleetState) -> None:
             resolved = await alert_repo.resolve_alert(fault_alert_id)
             if resolved is not None:
                 alert_events.alerts.on_next(resolved)
+
+    await process_fr36_conditions(fleet_state, now_millis)
+
+
+def _fr36_message(category: str, detail: dict) -> str:
+    tasks = detail.get("tasks") or []
+    missions = (
+        f" Missions affected: {', '.join(tasks)}." if tasks else ""
+    )
+    if category == "fleet_deadlock":
+        cycle = detail.get("cycle") or []
+        arrows = " -> ".join(cycle + cycle[:1])
+        return (
+            f"Deadlock detected: {arrows} — each robot is waiting for "
+            f"space held by the next; no yield can resolve it. "
+            f"Resolving automatically.{missions}"
+        )
+    if category == "fleet_blocked":
+        waiting = ", ".join(detail.get("waiting") or [])
+        return (
+            f"{detail.get('blocker')} is idle on a waypoint that "
+            f"{waiting} need{'s' if ',' not in waiting else ''} — moving "
+            f"it to a clear waypoint.{missions}"
+        )
+    where = detail.get("where") or ""
+    waiting = ", ".join(detail.get("waiting") or [])
+    return (
+        f"Blocked route needs an operator: {detail.get('reason')}. "
+        f"Blocker: {detail.get('blocker')} {where}. Waiting: {waiting}."
+        f"{missions}"
+    )
+
+
+async def process_fr36_conditions(
+    fleet_state: mdl.FleetState, now_millis: int
+) -> None:
+    """One alert per FR-36 condition episode, resolved when the episode
+    clears; each resolution ACTION additionally lands as one info row so
+    the operator sees what the fleet did on their behalf."""
+    fleet = fleet_state.name
+    if fleet not in _fr36_stale_swept:
+        _fr36_stale_swept.add(fleet)
+        await alert_repo.resolve_alerts_by_prefix(f"fr36__{fleet}__")
+    live: Dict[str, Tuple[str, dict, str]] = {}
+    for robot_name, robot in (fleet_state.robots or {}).items():
+        for issue in robot.issues or []:
+            category = str(issue.category or "")
+            if category not in FR36_CATEGORIES:
+                continue
+            detail = issue.detail if isinstance(issue.detail, dict) else {}
+            episode = str(detail.get("episode") or "")
+            if not episode:
+                continue
+            previous = live.get(episode)
+            # escalation supersedes the condition row it grew out of
+            if previous is None or category == "fleet_blocked_escalation":
+                live[episode] = (category, detail, robot_name)
+    # alert ids become URL path segments ("/alerts/{id}/resolve") — a
+    # slash inside the episode key breaks the route, leaving the row
+    # unresolvable (found live: three action rows stuck open).
+    live = {f"{fleet}--{episode}".replace("/", "-"): value
+            for episode, value in live.items()}
+    for episode, (category, detail, robot_name) in live.items():
+        action = str(detail.get("action") or "")
+        if action and _fr36_actions.get(episode) != action:
+            _fr36_actions[episode] = action
+            alert = await alert_repo.create_alert(
+                f"fr36__{fleet}__{episode}__action_{now_millis}",
+                "fleet",
+                severity=ttm.Alert.Severity.Info,
+                fleet=fleet,
+                robot=robot_name,
+                message=f"Traffic recovery: {action}.",
+            )
+            if alert is not None:
+                alert_events.alerts.on_next(alert)
+        alerted = _fr36_alerted.get(episode)
+        if alerted is not None and alerted[1] == category:
+            continue
+        if alerted is not None:  # category changed (escalation)
+            resolved = await alert_repo.resolve_alert(alerted[0])
+            if resolved is not None:
+                alert_events.alerts.on_next(resolved)
+        alert_id = f"fr36__{fleet}__{episode}__{now_millis}"
+        _fr36_alerted[episode] = (alert_id, category)
+        severity = (
+            ttm.Alert.Severity.Warning
+            if category == "fleet_blocked"
+            else ttm.Alert.Severity.Critical
+        )
+        alert = await alert_repo.create_alert(
+            alert_id,
+            "fleet",
+            severity=severity,
+            fleet=fleet,
+            robot=robot_name,
+            message=_fr36_message(category, detail),
+        )
+        if alert is not None:
+            alert_events.alerts.on_next(alert)
+    for episode in list(_fr36_alerted):
+        if episode in live or not episode.startswith(f"{fleet}--"):
+            continue
+        alert_id, _ = _fr36_alerted.pop(episode)
+        _fr36_actions.pop(episode, None)
+        resolved = await alert_repo.resolve_alert(alert_id)
+        if resolved is not None:
+            alert_events.alerts.on_next(resolved)
 
 
 def classify_charge_ghost(robot: mdl.RobotState, task_id: str) -> Optional[str]:
