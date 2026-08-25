@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta
 from typing import List, Optional, Tuple, cast
 
@@ -215,6 +216,7 @@ async def post_activity_discovery(
 @router.post("/cancel_task", response_model=mdl.TaskCancelResponse)
 async def post_cancel_task(
     request: mdl.CancelTaskRequest = Body(...),
+    task_repo: TaskRepository = Depends(task_repo_dep),
 ):
     # F-71(2): record the cancellation at REQUEST time — whether the
     # fleet core ends the task `canceled` or (dead-robot race) wipes it
@@ -226,9 +228,37 @@ async def post_cancel_task(
             labels=list(request.labels or []),
         ),
     )
-    return RawJSONResponse(
-        await tasks_service().call(request.model_dump_json(exclude_none=True))
-    )
+    try:
+        return RawJSONResponse(
+            await tasks_service().call(
+                request.model_dump_json(exclude_none=True))
+        )
+    except HTTPException as e:
+        # F-141 (E6 run-2 blocker 3): a cancel the core never answers is
+        # the signature of a task the restarted core does not know — the
+        # row would stay an un-cancelable 'Executing' phantom forever.
+        # If the row is non-terminal and has been silent long enough
+        # that a live task would have re-announced, close it locally
+        # with honest provenance instead of bouncing the operator.
+        if e.status_code != 500:
+            raise
+        closed = await task_repo.close_silent_task_locally(
+            request.task_id, labels=list(request.labels or []))
+        if closed is None:
+            raise
+        task_events.task_states.on_next(closed)
+        return RawJSONResponse(
+            json.dumps(
+                {
+                    "success": True,
+                    "detail": (
+                        "The fleet core no longer tracks this mission "
+                        "(it was interrupted by a coordination "
+                        "restart); it has been closed as canceled."
+                    ),
+                }
+            ).encode()
+        )
 
 
 # F-34 dispatch guard: reject a patrol whose final destination is

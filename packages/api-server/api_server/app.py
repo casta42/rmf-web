@@ -87,6 +87,16 @@ async def lifespan(_app: FastIO):
     # must not run there.
     if Tortoise.get_connection("default").capabilities.dialect == "postgres":
         await Tortoise.get_connection("default").execute_script(
+            # F-138 (E6 run-2 blocker 2) server-side backstop: any
+            # transaction orphaned by a cancelled coroutine dies in 60 s
+            # instead of holding a pool connection forever (observed: 5
+            # idle-in-transaction connections, oldest 30 h, pool
+            # starved, every DB endpoint hanging). Role-level so every
+            # pooled connection inherits it at connect time. The
+            # in-code fix is the rmf_gateway shield; this guarantees
+            # self-healing for any leak path not yet found.
+            "ALTER ROLE CURRENT_USER SET "
+            "idle_in_transaction_session_timeout = '60s';"
             "ALTER TABLE IF EXISTS taskstate ADD COLUMN IF NOT EXISTS "
             "created_at TIMESTAMPTZ NULL;"
             "ALTER TABLE IF EXISTS taskstate ADD COLUMN IF NOT EXISTS "

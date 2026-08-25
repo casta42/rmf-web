@@ -63,6 +63,16 @@ class AlertRepository:
         result = await ttm.Alert.exists(id=alert_id)
         return result
 
+    async def resolved_millis(self, alert_id: str) -> Optional[int]:
+        """F-139: unix-millis the alert was resolved at, for the episode
+        re-fire check. None while the row is still open; a MISSING row
+        returns 0 (unverifiable → long-resolved, so the episode may
+        re-raise instead of staying silenced forever)."""
+        alert = await ttm.Alert.get_or_none(id=alert_id)
+        if alert is None:
+            return 0
+        return alert.unix_millis_resolved_time
+
     async def get_alert(self, alert_id: str) -> Optional[ttm.AlertPydantic]:
         alert = await ttm.Alert.get_or_none(id=alert_id)
         if alert is None:

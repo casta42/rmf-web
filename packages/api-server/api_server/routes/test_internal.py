@@ -331,6 +331,9 @@ class _FakeAlertRepo:
         self.resolved = []
         self.swept_prefixes = []
 
+    async def resolved_millis(self, alert_id):
+        return None  # rows stay open here — F-139 re-fire never triggers
+
     async def create_alert(self, alert_id, category, severity, fleet, robot, message):
         self.created.append((alert_id, category, severity, message))
         return None  # alert_events push is exercised elsewhere

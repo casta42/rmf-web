@@ -298,6 +298,40 @@ class TaskRepository:
             if phase.events:
                 await self._saveEventLogs(db_phase, phase.events)
 
+    async def close_silent_task_locally(
+        self, task_id: str, labels: Optional[Sequence[str]] = None
+    ) -> Optional[TaskState]:
+        """F-141 (E6 run-2 blocker 3): close a task the fleet core no
+        longer answers for. Only touches a row that is BOTH non-terminal
+        AND silent for SILENT_CLOSE_MIN_AGE — a live task under load
+        re-announces every few seconds, so a cancel that merely timed
+        out on a busy core never gets its task clobbered. Returns the
+        closed state, or None when the row does not qualify."""
+        from api_server.interrupted_tasks import (
+            INTERRUPTED_LABEL, TERMINAL_STATUSES, status_tail,
+        )
+
+        row = await DbTaskState.get_or_none(id_=task_id)
+        if row is None:
+            return None
+        if status_tail(row.status) in TERMINAL_STATUSES:
+            return None
+        if row.updated_at is not None:
+            age = (
+                datetime.now(row.updated_at.tzinfo) - row.updated_at
+            ).total_seconds()
+            if age < SILENT_CLOSE_MIN_AGE:
+                return None
+        task_state = TaskState(**row.data)
+        task_state.status = TaskStatus.canceled
+        booking_labels = list(task_state.booking.labels or [])
+        for label in [INTERRUPTED_LABEL, *(labels or [])]:
+            if label and label not in booking_labels:
+                booking_labels.append(label)
+        task_state.booking.labels = booking_labels
+        await self.save_task_state(task_state)
+        return task_state
+
     async def _saveTaskLogs(
         self, db_task_log: ttm.TaskEventLog, logs: Sequence[LogEntry]
     ):
@@ -373,6 +407,9 @@ class TaskRepository:
                     await self._savePhaseLogs(db_task_log, task_log.phases)
             except IntegrityError as e:
                 logger.error(format_exception(e))
+
+
+SILENT_CLOSE_MIN_AGE = 60.0  # s a live task cannot stay unannounced
 
 
 def task_repo_dep(user: User = Depends(user_dep)):

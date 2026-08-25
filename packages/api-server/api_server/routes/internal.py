@@ -1,6 +1,8 @@
 # NOTE: This will eventually replace `gateway.py``
 import math
+import time
 from dataclasses import dataclass
+import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
 
@@ -8,6 +10,10 @@ from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisco
 
 from api_server import models as mdl
 from api_server.app_config import app_config
+from api_server.shielded import shielded
+from api_server.interrupted_tasks import (
+    INTERRUPTED_LABEL, RunBoundary, is_interrupted_row,
+)
 from api_server.dispatch_reason import dispatch_failure_reason
 from api_server.logger import logger as base_logger
 from api_server.models import tortoise_models as ttm
@@ -94,6 +100,28 @@ _fr36_stale_swept: set = set()  # fleet names swept on first sighting
 _last_charge_reap: Dict[str, float] = {}
 # robots whose stale stuck alerts from a previous server life were swept (F-29)
 _stuck_stale_swept: set = set()
+
+# F-139/E6 run-2: resolving a condition alert must not silence the CONDITION.
+# When an operator resolves a robot_stuck / low_battery / robot_fault / FR-36
+# row while the episode trackers above still see the condition, the episode
+# re-fires as a fresh alert row once the resolution is this old. Grace gives
+# the operator's on-site action time to clear the condition before we page
+# again.
+ALERT_REFIRE_GRACE_MILLIS = 60_000
+
+
+def refire_due(resolved_at_millis: Optional[int], now_millis: int) -> bool:
+    """F-139: True when a tracked episode alert was resolved (by anyone)
+    at least ALERT_REFIRE_GRACE_MILLIS ago. None means the row is still
+    open — never re-fire an open alert."""
+    return (
+        resolved_at_millis is not None
+        and now_millis - resolved_at_millis >= ALERT_REFIRE_GRACE_MILLIS
+    )
+
+
+async def _refire_due(alert_id: str, now_millis: int) -> bool:
+    return refire_due(await alert_repo.resolved_millis(alert_id), now_millis)
 
 
 def log_phase_has_error(phase: mdl.Phases) -> bool:
@@ -270,6 +298,34 @@ async def process_robot_alerts(fleet_state: mdl.FleetState) -> None:
             resolved = await alert_repo.resolve_alert(stuck_resolved)
             if resolved is not None:
                 alert_events.alerts.on_next(resolved)
+        # F-139: episode still stuck (tracker holds an alert id and did not
+        # re-arm this tick) but the row was resolved — re-raise after grace
+        stuck_state = _stuck_states.get(robot_id)
+        if (
+            stuck_new is None
+            and stuck_state is not None
+            and stuck_state.alert_id is not None
+            and await _refire_due(stuck_state.alert_id, now_millis)
+        ):
+            stuck_new = (
+                f"robot_stuck__{fleet_state.name}__{robot_name}__{now_millis}"
+            )
+            stuck_state.alert_id = stuck_new
+        # F-139: battery still below threshold but the row was resolved —
+        # re-raise after grace (skipped while faulted: F-42 spoofs SoC 0)
+        open_low = _low_battery_alerted.get(robot_id)
+        if (
+            battery_new is None
+            and open_low is not None
+            and not fault_categories
+            and robot.battery is not None
+            and robot.battery < app_config.low_battery_threshold
+            and await _refire_due(open_low, now_millis)
+        ):
+            battery_new = (
+                f"low_battery__{fleet_state.name}__{robot_name}__{now_millis}"
+            )
+            _low_battery_alerted[robot_id] = battery_new
         if fault_categories and battery_new is not None:
             # drop the spurious 0 % episode so recovery re-arms cleanly
             _low_battery_alerted.pop(robot_id, None)
@@ -312,6 +368,15 @@ async def process_robot_alerts(fleet_state: mdl.FleetState) -> None:
                 f"robot_fault__{fleet_state.name}__{robot_name}__"
             )
         fault_alert_id = _fault_alerted.get(robot_id)
+        # F-139: fault persists but the row was resolved — re-raise after
+        # grace by dropping the episode entry so the create branch runs
+        if (
+            fault_categories
+            and fault_alert_id is not None
+            and await _refire_due(fault_alert_id, now_millis)
+        ):
+            _fault_alerted.pop(robot_id, None)
+            fault_alert_id = None
         if fault_categories and fault_alert_id is None:
             new_id = f"robot_fault__{fleet_state.name}__{robot_name}__{now_millis}"
             _fault_alerted[robot_id] = new_id
@@ -413,7 +478,15 @@ async def process_fr36_conditions(
                 alert_events.alerts.on_next(alert)
         alerted = _fr36_alerted.get(episode)
         if alerted is not None and alerted[1] == category:
-            continue
+            # F-139: the condition episode is still live but its row was
+            # resolved — re-raise the same category as a fresh row after
+            # grace (an operator resolving a live escalation must not
+            # silence it while robots are still blocked)
+            if await _refire_due(alerted[0], now_millis):
+                _fr36_alerted.pop(episode, None)
+                alerted = None
+            else:
+                continue
         if alerted is not None:  # category changed (escalation)
             resolved = await alert_repo.resolve_alert(alerted[0])
             if resolved is not None:
@@ -534,6 +607,64 @@ async def reap_charge_ghosts(fleet_state: mdl.FleetState) -> None:
             )
 
 
+_run_boundary = RunBoundary()
+INTERRUPTED_CLOSE_LIMIT = 200
+
+
+async def reap_interrupted_tasks() -> None:
+    """F-141 (E6 run-2 blocker 3): after a fleet coordination restart,
+    close every task row the restarted core no longer knows — the
+    ledger keeps missions that terminate honestly, never 'Executing'
+    phantoms that nothing can cancel. Fires once per outage epoch, a
+    grace period after the fleet stream resumes (everything the core
+    still knows has re-announced by then)."""
+    now_mono = time.monotonic()
+    if not _run_boundary.due(now_mono):
+        return
+    _run_boundary.mark_reaped()
+    epoch = _run_boundary.epoch_started_wall
+    assert epoch is not None
+    rows = await ttm.TaskState.filter(
+        updated_at__lt=epoch).limit(INTERRUPTED_CLOSE_LIMIT)
+    closed = []
+    for row in rows:
+        if not is_interrupted_row(row.status, row.updated_at, epoch):
+            continue
+        try:
+            task_state = mdl.TaskState(**row.data)
+        except Exception:  # noqa: BLE001 — a corrupt row must not stop the sweep
+            logger.error(f"F-141: cannot parse task row {row.id_}")
+            continue
+        task_state.status = mdl.TaskStatus.failed
+        labels = list(task_state.booking.labels or [])
+        if INTERRUPTED_LABEL not in labels:
+            labels.append(INTERRUPTED_LABEL)
+        task_state.booking.labels = labels
+        await task_repo.save_task_state(task_state)
+        task_events.task_states.on_next(task_state)
+        closed.append(row.id_)
+        logger.warning(
+            f"F-141: closed interrupted mission {row.id_} "
+            "(fleet coordination restarted; the core no longer tracks "
+            "it)")
+    if closed:
+        shown = ", ".join(closed[:6]) + (
+            f" and {len(closed) - 6} more" if len(closed) > 6 else "")
+        alert = await alert_repo.create_alert(
+            f"interrupted__{round(datetime.now().timestamp() * 1e3)}",
+            "fleet",
+            severity=ttm.Alert.Severity.Warning,
+            message=(
+                f"{len(closed)} mission(s) running before the fleet "
+                "coordination restart did not resume and were closed "
+                f"as failed: {shown}. Re-dispatch what is still "
+                "needed."
+            ),
+        )
+        if alert is not None:
+            alert_events.alerts.on_next(alert)
+
+
 async def process_msg(msg: Dict[str, Any], fleet_repo: FleetRepository) -> None:
     if "type" not in msg:
         logger.warn(msg)
@@ -615,6 +746,9 @@ async def process_msg(msg: Dict[str, Any], fleet_repo: FleetRepository) -> None:
         rmf_events.fleet_states.on_next(fleet_state)
         await process_robot_alerts(fleet_state)
         await reap_charge_ghosts(fleet_state)
+        _run_boundary.observe(time.monotonic(),
+                              datetime.now(timezone.utc))
+        await reap_interrupted_tasks()
 
     elif payload_type == "fleet_log_update":
         fleet_log = mdl.FleetLog(**msg["data"])
@@ -629,7 +763,16 @@ async def rmf_gateway(websocket: WebSocket):
     try:
         while True:
             msg: Dict[str, Any] = await websocket.receive_json()
-            await process_msg(msg, fleet_repo)
+            # F-138 (E6 run-2 blocker 2): when rmf-core dies mid-flood,
+            # uvicorn CANCELS this handler while process_msg sits inside
+            # an open DB transaction — the rollback never runs and the
+            # connection is returned to the pool 'idle in transaction',
+            # one per restart wave, until the pool starves and every DB
+            # endpoint (alerts included) hangs silently. Shield the
+            # processing so the transaction always completes (commit or
+            # rollback) even when the socket task is cancelled; the
+            # cancellation is re-raised immediately after.
+            await shielded(process_msg(msg, fleet_repo))
     except WebSocketDisconnect:
         pass
 
