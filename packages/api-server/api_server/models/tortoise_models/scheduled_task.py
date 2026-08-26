@@ -1,6 +1,9 @@
+import logging
+import os
 from datetime import datetime
 from enum import Enum
 
+import pytz
 import schedule
 from schedule import Job
 from tortoise.fields import (
@@ -15,6 +18,42 @@ from tortoise.fields import (
     SmallIntField,
 )
 from tortoise.models import Model
+
+# F-137: the dashboard's schedule picker writes site-local wall times
+# ("every day at 00:15" means 00:15 on the warehouse floor), but this
+# process runs on the container clock (UTC) and the `schedule` library
+# evaluates bare at-strings against that clock — the stored 00:15
+# silently fired at 18:15 local during E6 run-2. Every at-string is
+# therefore evaluated in the SITE timezone (IANA name via GF_SITE_TZ,
+# set by the compose stack). Stored strings stay honest: they are, and
+# always were, the local wall time the operator read in the dialog —
+# existing rows need no migration, only this reinterpretation (each
+# job's next run is logged at (re)schedule time as the audit trail).
+# Unset/invalid GF_SITE_TZ falls back to the server clock (dev parity)
+# with a loud log line.
+
+
+def _site_tz() -> str | None:
+    name = os.environ.get("GF_SITE_TZ")
+    if not name:
+        logging.getLogger("app").warning(
+            "GF_SITE_TZ is not set — schedule at-times will be evaluated "
+            "on the server clock (F-137); set it to the site's IANA "
+            "timezone in the deployment"
+        )
+        return None
+    try:
+        pytz.timezone(name)
+        return name
+    except pytz.exceptions.UnknownTimeZoneError:
+        logging.getLogger("app").error(
+            f"GF_SITE_TZ [{name}] is not a valid IANA timezone — "
+            "falling back to the server clock (F-137)"
+        )
+        return None
+
+
+SITE_TZ = _site_tz()
 
 
 class ScheduledTask(Model):
@@ -89,6 +128,10 @@ class ScheduledTaskSchedule(Model):
         # Hashable value in order to tag the job with a unique identifier
         job.tag(self._id)
         if self.at is not None:
-            job = job.at(self.at)
+            # F-137: at-strings are site-local wall times
+            if SITE_TZ is not None:
+                job = job.at(self.at, SITE_TZ)
+            else:
+                job = job.at(self.at)
 
         return job

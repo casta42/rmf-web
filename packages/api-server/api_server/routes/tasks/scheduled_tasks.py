@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 import schedule
@@ -55,7 +55,9 @@ async def schedule_task(task: ttm.ScheduledTask, task_repo: TaskRepository):
 
     async def run():
         await post_dispatch_task(req, task_repo)
-        task.last_ran = datetime.now()
+        # F-137: aware UTC, so clients receive an offset and render the
+        # viewer's local wall time instead of mislabeling naive UTC
+        task.last_ran = datetime.now(timezone.utc)
         await task.save()
 
     def do():
@@ -70,6 +72,14 @@ async def schedule_task(task: ttm.ScheduledTask, task_repo: TaskRepository):
 
     for _, j in jobs:
         j.do(do)
+        # F-137 audit trail: the moment a schedule is (re)armed — at
+        # creation and on every api-server start — its next fire is
+        # logged on the server clock, so a timezone misinterpretation
+        # of an at-string is visible instead of silent
+        logger.info(
+            f"scheduled task [{task.pk}] next run {j.next_run} "
+            f"(server clock; site tz {ttm.scheduled_task.SITE_TZ or 'unset'})"
+        )
     logger.info(f"scheduled task [{task.pk}]")
 
 
@@ -113,6 +123,27 @@ async def post_scheduled_task(
         return ScheduledTask.model_validate(scheduled_task)
     except schedule.ScheduleError as e:
         raise HTTPException(422, str(e)) from e
+
+
+class ScheduleTimezone(BaseModel):
+    """F-137: the zone the scheduler actually evaluates at-times in."""
+
+    site_timezone: str | None
+    server_timezone: str
+
+
+@router.get("/timezone", response_model=ScheduleTimezone)
+async def get_schedule_timezone():
+    """F-137: schedule at-times are site-local wall clock. The dashboard
+    reads this so it can LABEL the picker with the zone the server will
+    actually use — a second copy of the value in the dashboard's own
+    config could drift from the scheduler's, which is the failure this
+    finding is about. site_timezone null = unset/invalid GF_SITE_TZ, so
+    at-times fall back to the server clock (dev only)."""
+    return ScheduleTimezone(
+        site_timezone=ttm.scheduled_task.SITE_TZ,
+        server_timezone=datetime.now().astimezone().tzname() or "UTC",
+    )
 
 
 @router.get("", response_model=list[ScheduledTask])
