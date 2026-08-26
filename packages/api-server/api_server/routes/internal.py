@@ -624,10 +624,50 @@ async def reap_interrupted_tasks() -> None:
     _run_boundary.mark_reaped()
     epoch = _run_boundary.epoch_started_wall
     assert epoch is not None
+    await _close_interrupted_rows(epoch)
+
+
+# F-141 addendum (Act-3 stress, 2026-08-26): a coordination restart
+# FASTER than FLEET_SILENCE_GAP leaves no detectable outage boundary
+# (the in-container drill-2 respawns in ~4 s), yet the new core still
+# knows nothing about the old rows — four missions starved as
+# un-cancelable 'underway' phantoms. Class rule: fleet states are
+# FLOWING while a non-terminal row goes untouched this long — the core
+# is talking, just not about this task.
+STALE_TASK_SWEEP_AGE = 300.0
+_stale_sweep_last = {"t": 0.0}
+
+
+async def sweep_stale_tasks() -> None:
+    """Close non-terminal rows no live core is updating (see the F-141
+    addendum note above). Same honest provenance as the boundary reap;
+    auto ChargeBattery ghosts stay the F-12 reaper's job."""
+    now_mono = time.monotonic()
+    if now_mono - _stale_sweep_last["t"] < 60.0:
+        return
+    _stale_sweep_last["t"] = now_mono
+    epoch = datetime.now(timezone.utc) - timedelta(
+        seconds=STALE_TASK_SWEEP_AGE)
+    await _close_interrupted_rows(epoch)
+
+
+async def _close_interrupted_rows(epoch) -> None:
+    # exclude terminal rows IN the query: updated_at__lt alone matches
+    # every historic row, and the unordered LIMIT then never reaches
+    # the live ghosts (found in the Act-3 stress: 4 starved rows,
+    # 200-row page full of old completed missions). The column stores
+    # the enum repr ('Status.underway'), so match both spellings.
+    terminal = [spelling
+                for s in ("completed", "failed", "canceled",
+                          "killed", "skipped")
+                for spelling in (s, f"Status.{s}")]
     rows = await ttm.TaskState.filter(
-        updated_at__lt=epoch).limit(INTERRUPTED_CLOSE_LIMIT)
+        updated_at__lt=epoch).exclude(
+        status__in=terminal).limit(INTERRUPTED_CLOSE_LIMIT)
     closed = []
     for row in rows:
+        if str(row.id_).startswith("Charge"):
+            continue  # F-12 reaper's jurisdiction
         if not is_interrupted_row(row.status, row.updated_at, epoch):
             continue
         try:
@@ -749,6 +789,7 @@ async def process_msg(msg: Dict[str, Any], fleet_repo: FleetRepository) -> None:
         _run_boundary.observe(time.monotonic(),
                               datetime.now(timezone.utc))
         await reap_interrupted_tasks()
+        await sweep_stale_tasks()
 
     elif payload_type == "fleet_log_update":
         fleet_log = mdl.FleetLog(**msg["data"])
