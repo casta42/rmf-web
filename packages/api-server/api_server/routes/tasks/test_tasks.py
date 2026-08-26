@@ -114,20 +114,26 @@ class TestTasksRoute(AppFixture):
         results = pydantic.TypeAdapter(list[TaskState]).validate_json(resp.content)
         self.assertEqual(0, len(results))
 
+    def assertStateEqualWithProvenance(self, expected: TaskState, actual: TaskState):
+        # /tasks queries stamp recorded_at_millis from the row's created_at
+        # (F-37 provenance for FR-18 History); fixtures are saved without it
+        self.assertIsNotNone(actual.recorded_at_millis)
+        self.assertEqual(expected, actual.model_copy(update={"recorded_at_millis": None}))
+
     def test_query_task_states_sort_by_label(self):
         resp = self.client.get("/tasks?order_by=-label=test_label_sort")
         self.assertEqual(200, resp.status_code)
         results = pydantic.TypeAdapter(list[TaskState]).validate_json(resp.content)
         self.assertEqual(2, len(results))
         for a, b in zip(self.task_states, results):
-            self.assertEqual(a, b)
+            self.assertStateEqualWithProvenance(a, b)
 
         resp = self.client.get("/tasks?order_by=label=test_label_sort")
         self.assertEqual(200, resp.status_code)
         results = pydantic.TypeAdapter(list[TaskState]).validate_json(resp.content)
         self.assertEqual(2, len(results))
         for a, b in zip(self.task_states[::-1], results):
-            self.assertEqual(a, b)
+            self.assertStateEqualWithProvenance(a, b)
 
         # test sorting by multiple labels
         resp = self.client.get(
@@ -137,7 +143,7 @@ class TestTasksRoute(AppFixture):
         results = pydantic.TypeAdapter(list[TaskState]).validate_json(resp.content)
         self.assertEqual(2, len(results))
         for a, b in zip(self.task_states[::-1], results):
-            self.assertEqual(a, b)
+            self.assertStateEqualWithProvenance(a, b)
 
         # test that tasks without the label are not filtered out
         # we don't test the result order because different db has different behavior
