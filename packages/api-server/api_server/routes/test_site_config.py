@@ -75,9 +75,7 @@ class TestSiteConfigRoutes(AppFixture):
         self.assertEqual(1, len(calls))
         method, url, kwargs = calls[0]
         self.assertEqual("http://127.0.0.1:8100/site_config", url)
-        self.assertEqual(
-            "test-token", kwargs["headers"]["x-gf-internal-token"]
-        )
+        self.assertEqual("test-token", kwargs["headers"]["x-gf-internal-token"])
 
     def test_apply_refused_while_missions_active_then_hard_confirm(self):
         calls = []
@@ -85,8 +83,11 @@ class TestSiteConfigRoutes(AppFixture):
             calls, _FakeResponse(json_body={"state": "validating"})
         )
         missions = [
-            {"task_id": "patrol.dispatch-1", "status": "underway",
-             "robot": "gentle_bot_2"}
+            {
+                "task_id": "patrol.dispatch-1",
+                "status": "underway",
+                "robot": "gentle_bot_2",
+            }
         ]
 
         async def fake_active():
@@ -105,15 +106,17 @@ class TestSiteConfigRoutes(AppFixture):
             self.assertEqual(409, refused.status_code, refused.content)
             detail = refused.json()["detail"]
             self.assertEqual("active_missions", detail["reason"])
-            self.assertEqual(
-                "patrol.dispatch-1", detail["missions"][0]["task_id"]
-            )
+            self.assertEqual("patrol.dispatch-1", detail["missions"][0]["task_id"])
             self.assertEqual(0, len(calls))  # sidecar never reached
 
             body["acknowledge_active_missions"] = True
             confirmed = self.client.post("/site_config/apply", json=body)
             self.assertEqual(200, confirmed.status_code, confirmed.content)
-            self.assertEqual(1, len(calls))
+            # F-186: the apply now also validates first (to learn what
+            # the derivation would retire), so what matters is that the
+            # sidecar was reached AT ALL after the hard-confirm — not
+            # that it was reached exactly once.
+            self.assertTrue([c for c in calls if c[1].endswith("/site_config/apply")])
 
     def test_apply_stamps_authenticated_user(self):
         calls = []
@@ -136,7 +139,10 @@ class TestSiteConfigRoutes(AppFixture):
             }
             resp = self.client.post("/site_config/apply", json=body)
         self.assertEqual(200, resp.status_code, resp.content)
-        _, _, kwargs = calls[0]
+        # F-186: the apply now also runs a validate first (to learn what
+        # the derivation would retire), so pick the apply call by PATH
+        # rather than trusting it to be the only one recorded.
+        _, _, kwargs = next(c for c in calls if c[1].endswith("/site_config/apply"))
         self.assertEqual("admin", kwargs["json"]["applied_by"])
 
     def test_active_missions_sees_enum_repr_statuses(self):
@@ -164,9 +170,7 @@ class TestSiteConfigRoutes(AppFixture):
             self.assertEqual(1, len(match), missions)
             self.assertEqual("underway", match[0]["status"])
         finally:
-            portal.call(
-                lambda: DbTaskState.filter(id_="e5-guard-enum-repr").delete()
-            )
+            portal.call(lambda: DbTaskState.filter(id_="e5-guard-enum-repr").delete())
 
     def test_validate_injects_live_robot_positions(self):
         # D-20: the sidecar refuses a no-go over a robot; the proxy must
@@ -179,11 +183,7 @@ class TestSiteConfigRoutes(AppFixture):
                 {
                     "data": {
                         "name": "gentle_fleet",
-                        "robots": {
-                            "gentle_bot_2": {
-                                "location": {"x": 9.0, "y": 3.5}
-                            }
-                        },
+                        "robots": {"gentle_bot_2": {"location": {"x": 9.0, "y": 3.5}}},
                     }
                 },
                 name="gentle_fleet",
@@ -209,9 +209,7 @@ class TestSiteConfigRoutes(AppFixture):
                 positions,
             )
         finally:
-            portal.call(
-                lambda: FleetState.filter(name="gentle_fleet").delete()
-            )
+            portal.call(lambda: FleetState.filter(name="gentle_fleet").delete())
 
     def test_validate_blocks_retiring_a_destination_a_template_uses(self):
         # FR-32/D-22: the sidecar says what would be retired; this layer
@@ -248,8 +246,7 @@ class TestSiteConfigRoutes(AppFixture):
             ):
                 resp = self.client.post(
                     "/site_config/validate",
-                    json={"base_commit": "abc", "zones": {},
-                          "destinations": []},
+                    json={"base_commit": "abc", "zones": {}, "destinations": []},
                 )
             self.assertEqual(200, resp.status_code, resp.content)
             report = resp.json()
@@ -258,11 +255,102 @@ class TestSiteConfigRoutes(AppFixture):
             message = report["violations"][0]["message"]
             self.assertIn("dock_3", message)
             self.assertIn("Morning restock", message)
-            self.assertEqual(
-                "destination_in_use", report["violations"][0]["code"]
-            )
+            self.assertEqual("destination_in_use", report["violations"][0]["code"])
         finally:
             portal.call(lambda: TaskFavorite.filter(id="e5-fav-dock3").delete())
+
+    def test_validate_blocks_retiring_a_waypoint_a_template_uses(self):
+        # F-186/I-7: the same rule as the destination case above, for a
+        # WAYPOINT the derivation retires. A railed corridor retires its
+        # interior junctions; a template still dispatching to one would
+        # fail at dispatch after the apply, which is exactly the failure
+        # D-22 blocks for destinations.
+        from api_server.models.tortoise_models import TaskFavorite
+
+        portal = self.get_portal()
+        portal.call(
+            lambda: TaskFavorite.update_or_create(
+                {
+                    "name": "Corner sweep",
+                    "category": "patrol",
+                    "description": {"places": ["j_e1"], "rounds": 1},
+                    "user": "admin",
+                },
+                id="f186-fav-je1",
+            )
+        )
+        calls = []
+        fake = _fake_async_client(
+            calls,
+            _FakeResponse(
+                json_body={
+                    "ok": True,
+                    "violations": [],
+                    "retired_waypoints": [
+                        {
+                            "waypoint": "j_e1",
+                            "corridor": "j_s2..j_n3",
+                            "served_by": "an offset-pair corner set",
+                        }
+                    ],
+                }
+            ),
+        )
+        try:
+            with unittest.mock.patch(
+                "api_server.routes.site_config.httpx.AsyncClient", fake
+            ):
+                resp = self.client.post(
+                    "/site_config/validate",
+                    json={"base_commit": "abc", "zones": {}},
+                )
+            self.assertEqual(200, resp.status_code, resp.content)
+            report = resp.json()
+            self.assertFalse(report["ok"])
+            self.assertEqual(1, len(report["violations"]))
+            violation = report["violations"][0]
+            self.assertEqual("waypoint_in_use", violation["code"])
+            self.assertIn("j_e1", violation["message"])
+            self.assertIn("Corner sweep", violation["message"])
+            # the wording must not claim the admin removed it — the
+            # derivation did
+            self.assertIn("RETIRES", violation["message"])
+            self.assertNotIn("Renaming or removing", violation["message"])
+        finally:
+            portal.call(lambda: TaskFavorite.filter(id="f186-fav-je1").delete())
+
+    def test_validate_allows_retiring_a_waypoint_nothing_uses(self):
+        # The block is about MISSIONS, not about retirement itself —
+        # retiring a junction no template or schedule targets is the
+        # normal case and must sail through.
+        calls = []
+        fake = _fake_async_client(
+            calls,
+            _FakeResponse(
+                json_body={
+                    "ok": True,
+                    "violations": [],
+                    "retired_waypoints": [
+                        {
+                            "waypoint": "j_n2",
+                            "corridor": "j_s2..j_n3",
+                            "served_by": "a T-pair on the rails",
+                        }
+                    ],
+                }
+            ),
+        )
+        with unittest.mock.patch(
+            "api_server.routes.site_config.httpx.AsyncClient", fake
+        ):
+            resp = self.client.post(
+                "/site_config/validate",
+                json={"base_commit": "abc", "zones": {}},
+            )
+        self.assertEqual(200, resp.status_code, resp.content)
+        report = resp.json()
+        self.assertTrue(report["ok"], report["violations"])
+        self.assertEqual([], report["violations"])
 
     def test_apply_refuses_retiring_a_destination_a_schedule_uses(self):
         # Backstop: apply must refuse even if the client never validated.
@@ -273,8 +361,7 @@ class TestSiteConfigRoutes(AppFixture):
             lambda: ScheduledTask.create(
                 task_request={
                     "category": "patrol",
-                    "description": {"places": ["pickup_1", "dock_3"],
-                                    "rounds": 1},
+                    "description": {"places": ["pickup_1", "dock_3"], "rounds": 1},
                 },
                 created_by="admin",
             )
@@ -283,8 +370,11 @@ class TestSiteConfigRoutes(AppFixture):
         fake = _fake_async_client(
             calls,
             _FakeResponse(
-                json_body={"destinations": [{"name": "dock_3", "kind": "dropoff",
-                                             "x": 12.0, "y": 3.5}]}
+                json_body={
+                    "destinations": [
+                        {"name": "dock_3", "kind": "dropoff", "x": 12.0, "y": 3.5}
+                    ]
+                }
             ),
         )
 
@@ -300,8 +390,11 @@ class TestSiteConfigRoutes(AppFixture):
                 resp = self.client.post(
                     "/site_config/apply",
                     json={
-                        "candidate": {"base_commit": "abc", "zones": {},
-                                      "destinations": []},
+                        "candidate": {
+                            "base_commit": "abc",
+                            "zones": {},
+                            "destinations": [],
+                        },
                         "acknowledge_fleet_pause": True,
                     },
                 )
@@ -322,6 +415,14 @@ class TestSiteConfigRoutes(AppFixture):
         # An older client that does not manage destinations must not pay
         # for a HEAD read — and must not be able to wipe them either
         # (the sidecar keeps HEAD's when the key is absent).
+        #
+        # F-186 note: the apply DOES now make one extra proxy call, a
+        # validate, because the retired-WAYPOINT set is not in the
+        # candidate — the admin did not choose it, the derivation did —
+        # so there is nothing to read it from. That is a deliberate
+        # cost. What this test still pins is the original guarantee:
+        # no `GET /site_config` HEAD read when destinations are not
+        # managed.
         calls = []
         fake = _fake_async_client(
             calls, _FakeResponse(json_body={"state": "validating"})
@@ -343,8 +444,12 @@ class TestSiteConfigRoutes(AppFixture):
                 },
             )
         self.assertEqual(200, resp.status_code, resp.content)
-        self.assertEqual(1, len(calls))
-        self.assertTrue(calls[0][1].endswith("/site_config/apply"))
+        # no destinations HEAD read
+        self.assertFalse(
+            [c for c in calls if c[0] == "GET" and c[1].endswith("/site_config")]
+        )
+        # and the apply itself still went through
+        self.assertTrue([c for c in calls if c[1].endswith("/site_config/apply")])
 
     def test_internal_active_missions_needs_the_shared_token(self):
         # F-86/D-23: the boundary-check callback — token-authenticated,
@@ -378,15 +483,11 @@ class TestSiteConfigRoutes(AppFixture):
                 headers={"x-gf-internal-token": "test-token"},
             )
             self.assertEqual(200, resp.status_code, resp.content)
-            match = [
-                m for m in resp.json() if m["task_id"] == "f86-boundary-row"
-            ]
+            match = [m for m in resp.json() if m["task_id"] == "f86-boundary-row"]
             self.assertEqual(1, len(match), resp.json())
             self.assertEqual("gentle_bot_7", match[0]["robot"])
         finally:
-            portal.call(
-                lambda: DbTaskState.filter(id_="f86-boundary-row").delete()
-            )
+            portal.call(lambda: DbTaskState.filter(id_="f86-boundary-row").delete())
 
     def test_non_admin_is_403(self):
         self.client.set_user("operator1")

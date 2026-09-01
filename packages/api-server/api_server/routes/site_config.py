@@ -88,9 +88,9 @@ async def robot_positions() -> List[Dict[str, Any]]:
     could never complete)."""
     busy = {
         str(row["assigned_to"])
-        for row in await DbTaskState.filter(
-            status__in=_NON_TERMINAL_MATCH
-        ).values("assigned_to")
+        for row in await DbTaskState.filter(status__in=_NON_TERMINAL_MATCH).values(
+            "assigned_to"
+        )
         if row["assigned_to"]
     }
     out: List[Dict[str, Any]] = []
@@ -152,8 +152,9 @@ def _schedule_label(request: Any, created_by: Any = None) -> str:
     name). Both parts matter: a single-stop schedule's route IS the
     destination name, so "schedule “dock_4”" alone reads as a typo and
     points at nothing findable."""
-    places = _places_of((request or {}).get("description")
-                        if isinstance(request, dict) else None)
+    places = _places_of(
+        (request or {}).get("description") if isinstance(request, dict) else None
+    )
     route = " → ".join(places) if places else "scheduled mission"
     who = str(created_by).strip() if created_by else ""
     return f"{route} (created by {who})" if who else route
@@ -187,26 +188,38 @@ async def destination_references(
 
 def _in_use_violations(
     references: Dict[str, List[Dict[str, str]]],
+    kind: str = "destination",
 ) -> List[Dict[str, str]]:
     out: List[Dict[str, str]] = []
     for name in sorted(references):
         users = references[name]
         if not users:
             continue
-        listed = ", ".join(
-            f'{u["kind"]} “{u["label"]}”' for u in users[:6]
-        )
+        listed = ", ".join(f'{u["kind"]} “{u["label"]}”' for u in users[:6])
         if len(users) > 6:
             listed += f", +{len(users) - 6} more"
+        if kind == "waypoint":
+            # F-186/I-7: the admin did not remove this one — the
+            # derivation retires it — so "renaming or removing it" would
+            # be describing an action nobody took.
+            message = (
+                f"[{name}] is still used by {listed}, and this change "
+                "RETIRES it: the corridor it sits inside becomes a "
+                "directional pair and its junction stops being a "
+                "dispatch target. Those missions would have no "
+                "destination — update or delete them first."
+            )
+        else:
+            message = (
+                f"[{name}] is still used by {listed}. Renaming or "
+                "removing it would leave those missions pointing at a "
+                "place that no longer exists — update or delete them "
+                "first."
+            )
         out.append(
             {
-                "code": "destination_in_use",
-                "message": (
-                    f"[{name}] is still used by {listed}. Renaming or "
-                    "removing it would leave those missions pointing at a "
-                    "place that no longer exists — update or delete them "
-                    "first."
-                ),
+                "code": f"{kind}_in_use",
+                "message": message,
                 "waypoint": name,
             }
         )
@@ -235,6 +248,44 @@ async def _guard_retired_destinations(retired: Sequence[str]) -> None:
             409,
             {
                 "reason": "destination_in_use",
+                "message": violations[0]["message"],
+                "violations": violations,
+            },
+        )
+
+
+async def _guard_retired_waypoints(candidate: Dict[str, Any]) -> None:
+    """F-186/I-7 backstop on the apply path: refuse while a template or
+    schedule still dispatches to a waypoint this derivation retires.
+
+    The retired set is not in the candidate — the admin did not choose
+    it, the derivation did — so it is read back from a validate pass."""
+    try:
+        report = await _proxy(
+            "POST",
+            "/site_config/validate",
+            json=await _with_positions(candidate),
+            timeout=120.0,
+        )
+    except HTTPException:
+        return  # validate's own failure is reported by the apply
+    if not isinstance(report, dict):
+        return
+    retired = [
+        str(entry.get("waypoint"))
+        for entry in (report.get("retired_waypoints") or [])
+        if isinstance(entry, dict) and entry.get("waypoint")
+    ]
+    if not retired:
+        return
+    violations = _in_use_violations(
+        await destination_references(retired), kind="waypoint"
+    )
+    if violations:
+        raise HTTPException(
+            409,
+            {
+                "reason": "waypoint_in_use",
                 "message": violations[0]["message"],
                 "violations": violations,
             },
@@ -277,9 +328,7 @@ async def _proxy(
                 timeout=timeout,
             )
     except httpx.HTTPError as e:
-        raise HTTPException(
-            503, f"site-config service unreachable: {e}"
-        ) from e
+        raise HTTPException(503, f"site-config service unreachable: {e}") from e
     if resp.status_code >= 400:
         try:
             detail = resp.json().get("detail", resp.text)
@@ -331,9 +380,7 @@ async def preview(candidate: Dict[str, Any]) -> Any:
     """FR-32: geometry-only preview — where a destination pin lands and
     what road would be generated to reach it. No regen, so the editor can
     call it while the admin is still placing."""
-    return await _proxy(
-        "POST", "/site_config/preview", json=candidate, timeout=30.0
-    )
+    return await _proxy("POST", "/site_config/preview", json=candidate, timeout=30.0)
 
 
 @router.post("/validate")
@@ -347,11 +394,32 @@ async def validate(candidate: Dict[str, Any]) -> Any:
     )
     # FR-32/D-22: the sidecar knows which destination names would be
     # retired; only this service knows what still dispatches to them.
+    #
+    # F-186/I-7, same rule for RETIRED WAYPOINTS. A railed corridor
+    # retires its interior junctions, and a template or schedule that
+    # still dispatches to one fails at dispatch after the apply — the
+    # identical failure D-22 blocks for destinations, so it gets the
+    # identical answer. It is a BLOCK rather than a migrate because
+    # there is no defined successor: a destination pin re-anchors onto
+    # its near rail (FR-32), but a retired junction is replaced by a
+    # four-node corner set or a two-node T-pair and which one a mission
+    # "meant" is not recoverable — auto-picking would send a robot
+    # somewhere plausible and unintended. It is a block rather than an
+    # advisory because the review's F-169 warning does not stop a
+    # schedule firing at 03:00 into a waypoint that stopped existing.
     if isinstance(report, dict):
         violations = _in_use_violations(
+            await destination_references(report.get("retired_destinations") or [])
+        )
+        violations += _in_use_violations(
             await destination_references(
-                report.get("retired_destinations") or []
-            )
+                [
+                    str(entry.get("waypoint"))
+                    for entry in (report.get("retired_waypoints") or [])
+                    if isinstance(entry, dict) and entry.get("waypoint")
+                ]
+            ),
+            kind="waypoint",
         )
         if violations:
             report["violations"] = list(report.get("violations") or [])
@@ -361,9 +429,7 @@ async def validate(candidate: Dict[str, Any]) -> Any:
 
 
 @router.post("/apply")
-async def apply(
-    body: ApplyBody, user: User = Depends(user_dep)
-) -> Any:
+async def apply(body: ApplyBody, user: User = Depends(user_dep)) -> Any:
     await _guard_missions(body.acknowledge_active_missions)
     # A candidate without a `destinations` key does not manage them at
     # all (the sidecar keeps HEAD's), so nothing can be retired and there
@@ -376,9 +442,18 @@ async def apply(
             if isinstance(d, dict) and d.get("name")
         }
         await _guard_retired_destinations(
-            [name for name in await _head_destination_names()
-             if name not in candidate_names]
+            [
+                name
+                for name in await _head_destination_names()
+                if name not in candidate_names
+            ]
         )
+    # F-186/I-7: the same backstop for waypoints the DERIVATION retires.
+    # `validate` already blocks this, but apply must never depend on the
+    # client having asked — and unlike destinations, retirement is not
+    # something the admin typed, so there is no candidate field to read
+    # it from. Ask the sidecar what this candidate would retire.
+    await _guard_retired_waypoints(body.candidate)
     return await _proxy(
         "POST",
         "/site_config/apply",
@@ -397,9 +472,7 @@ async def apply(
 
 
 @router.post("/restart")
-async def restart(
-    body: RestartBody, user: User = Depends(user_dep)
-) -> Any:
+async def restart(body: RestartBody, user: User = Depends(user_dep)) -> Any:
     # The recovery restart pauses the fleet exactly like an apply (D-17).
     await _guard_missions(body.acknowledge_active_missions)
     base, token = _sidecar()
@@ -414,15 +487,12 @@ async def restart(
                 json={
                     "requested_by": user.username,
                     # F-86/D-23: boundary re-check needs the ack too
-                    "acknowledge_active_missions":
-                        body.acknowledge_active_missions,
+                    "acknowledge_active_missions": body.acknowledge_active_missions,
                 },
                 timeout=60.0,
             )
     except httpx.HTTPError as e:
-        raise HTTPException(
-            503, f"site-config service unreachable: {e}"
-        ) from e
+        raise HTTPException(503, f"site-config service unreachable: {e}") from e
     if resp.status_code >= 400:
         raise HTTPException(resp.status_code, resp.text)
     return resp.json()
