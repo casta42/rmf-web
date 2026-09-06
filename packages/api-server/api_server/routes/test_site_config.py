@@ -496,3 +496,40 @@ class TestSiteConfigRoutes(AppFixture):
             self.assertEqual(403, resp.status_code)
         finally:
             self.client.set_user("admin")
+
+
+class TestRememberedRetiredWaypoints(unittest.TestCase):
+    """F-243 (apply path): the review's validate tells this service what
+    a candidate retires; the apply must not pay a second derivation to
+    learn it again. Both ways: a reviewed candidate is answered from
+    memory (positions do not change the answer), a candidate never
+    reviewed — or one whose zones changed — is not."""
+
+    def setUp(self):
+        from api_server.routes import site_config as sc
+
+        self.sc = sc
+        sc._RETIRED_CACHE.clear()
+
+    def test_reviewed_candidate_is_remembered_regardless_of_positions(self):
+        sc = self.sc
+        candidate = {"base_commit": "abc", "zones": {"no_go_zones": [{"name": "z"}]},
+                     "destinations": [], "robot_positions": [{"x": 1.0}]}
+        report = {"retired_waypoints": [{"waypoint": "j_w1"}, {"waypoint": "j_e1"}]}
+        sc.remember_retired(candidate, report)
+        moved = dict(candidate, robot_positions=[{"x": 2.0}])
+        self.assertEqual(sc.recall_retired(moved), ["j_w1", "j_e1"])
+
+    def test_a_changed_or_unreviewed_candidate_is_not_answered_from_memory(self):
+        sc = self.sc
+        candidate = {"base_commit": "abc", "zones": {"no_go_zones": []}, "destinations": []}
+        self.assertIsNone(sc.recall_retired(candidate))
+        sc.remember_retired(candidate, {"retired_waypoints": []})
+        self.assertEqual(sc.recall_retired(candidate), [])
+        edited = dict(candidate, zones={"no_go_zones": [{"name": "new"}]})
+        self.assertIsNone(sc.recall_retired(edited))
+        # a report with no retired list (a refusal, a non-dict) is not remembered
+        sc.remember_retired(edited, {"ok": False})
+        self.assertIsNone(sc.recall_retired(edited))
+        sc.remember_retired(edited, "not a report")
+        self.assertIsNone(sc.recall_retired(edited))

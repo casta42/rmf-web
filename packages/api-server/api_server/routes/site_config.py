@@ -254,28 +254,88 @@ async def _guard_retired_destinations(retired: Sequence[str]) -> None:
         )
 
 
+# F-243 (item 6, 2026-09-05): the review's validate already told this
+# service which waypoints the candidate retires. Asking the sidecar again
+# inside the apply route cost a second full derivation (69 s on the
+# six-robot testsite_b with the live stack running) BEFORE the job could
+# start — past the client's timeout, so the dialog said "Apply could not
+# start" while the apply was in fact running. The answer is remembered
+# per candidate — zones, destinations and base commit; robot positions
+# are excluded because they do not change what the derivation retires —
+# so the same draft the admin just reviewed is answered from memory and
+# the apply starts at once. A candidate never reviewed still asks.
+_RETIRED_CACHE: Dict[str, tuple[float, List[str]]] = {}
+_RETIRED_CACHE_TTL_S = 20 * 60.0
+_RETIRED_CACHE_MAX = 8
+
+
+def _candidate_key(candidate: Dict[str, Any]) -> str:
+    import hashlib
+    import json as _json
+
+    essence = {
+        "base_commit": candidate.get("base_commit"),
+        "zones": candidate.get("zones"),
+        "destinations": candidate.get("destinations"),
+    }
+    return hashlib.sha256(
+        _json.dumps(essence, sort_keys=True, default=str).encode()
+    ).hexdigest()
+
+
+def _retired_names(report: Any) -> List[str]:
+    if not isinstance(report, dict):
+        return []
+    return [
+        str(entry.get("waypoint"))
+        for entry in (report.get("retired_waypoints") or [])
+        if isinstance(entry, dict) and entry.get("waypoint")
+    ]
+
+
+def remember_retired(candidate: Dict[str, Any], report: Any) -> None:
+    """Record what a validated candidate retires (called by /validate)."""
+    import time as _time
+
+    if not isinstance(report, dict) or "retired_waypoints" not in report:
+        return
+    now = _time.monotonic()
+    for key in [k for k, (t, _v) in _RETIRED_CACHE.items() if now - t > _RETIRED_CACHE_TTL_S]:
+        _RETIRED_CACHE.pop(key, None)
+    while len(_RETIRED_CACHE) >= _RETIRED_CACHE_MAX:
+        _RETIRED_CACHE.pop(next(iter(_RETIRED_CACHE)), None)
+    _RETIRED_CACHE[_candidate_key(candidate)] = (now, _retired_names(report))
+
+
+def recall_retired(candidate: Dict[str, Any]) -> Optional[List[str]]:
+    import time as _time
+
+    hit = _RETIRED_CACHE.get(_candidate_key(candidate))
+    if hit is None or _time.monotonic() - hit[0] > _RETIRED_CACHE_TTL_S:
+        return None
+    return list(hit[1])
+
+
 async def _guard_retired_waypoints(candidate: Dict[str, Any]) -> None:
     """F-186/I-7 backstop on the apply path: refuse while a template or
     schedule still dispatches to a waypoint this derivation retires.
 
     The retired set is not in the candidate — the admin did not choose
-    it, the derivation did — so it is read back from a validate pass."""
-    try:
-        report = await _proxy(
-            "POST",
-            "/site_config/validate",
-            json=await _with_positions(candidate),
-            timeout=120.0,
-        )
-    except HTTPException:
-        return  # validate's own failure is reported by the apply
-    if not isinstance(report, dict):
-        return
-    retired = [
-        str(entry.get("waypoint"))
-        for entry in (report.get("retired_waypoints") or [])
-        if isinstance(entry, dict) and entry.get("waypoint")
-    ]
+    it, the derivation did — so it is read back from the validate pass
+    the review already ran (remembered per candidate), or from a fresh
+    one when this candidate was never reviewed."""
+    retired = recall_retired(candidate)
+    if retired is None:
+        try:
+            report = await _proxy(
+                "POST",
+                "/site_config/validate",
+                json=await _with_positions(candidate),
+                timeout=240.0,
+            )
+        except HTTPException:
+            return  # validate's own failure is reported by the apply
+        retired = _retired_names(report)
     if not retired:
         return
     violations = _in_use_violations(
@@ -379,19 +439,30 @@ async def get_site_config() -> Any:
 async def preview(candidate: Dict[str, Any]) -> Any:
     """FR-32: geometry-only preview — where a destination pin lands and
     what road would be generated to reach it. No regen, so the editor can
-    call it while the admin is still placing."""
-    return await _proxy("POST", "/site_config/preview", json=candidate, timeout=30.0)
+    call it while the admin is still placing.
+
+    F-243: the timeout is a floor for ONE derivation on a large site
+    (~13 s on testsite_a) plus the one it may be queued behind — the
+    sidecar runs previews one at a time and supersedes any that a newer
+    preview has made moot, and the editor cancels the request in flight
+    on every draw change, so two is the most that can ever be queued.
+    30 s was below one preview plus a queue and produced the 503s."""
+    return await _proxy("POST", "/site_config/preview", json=candidate, timeout=90.0)
 
 
 @router.post("/validate")
 async def validate(candidate: Dict[str, Any]) -> Any:
     # validate runs a scratch nav-graph regen when the graph changes
+    # F-243: a floor for the derivation (~40 s on the six-robot testsite_b
+    # with the live stack running) plus a scratch regen and the guards,
+    # plus the one preview it may be queued behind at the sidecar.
     report = await _proxy(
         "POST",
         "/site_config/validate",
         json=await _with_positions(candidate),
-        timeout=120.0,
+        timeout=240.0,
     )
+    remember_retired(candidate, report)
     # FR-32/D-22: the sidecar knows which destination names would be
     # retired; only this service knows what still dispatches to them.
     #
