@@ -19,14 +19,40 @@ async def sub_alerts(_req: SubscriptionRequest):
     return alert_events.alerts.pipe(rxops.filter(lambda x: x is not None))
 
 
+# ----------------------------------------------------------------------
+# F-270: THE ENUM IS THE VALIDATOR.
+#
+# `category` and `severity` were plain `str` here and handed straight to
+# a tortoise CharEnumField, which raises on a value outside the enum —
+# so an unknown filter came back 500, and so did an unknown value on the
+# CREATE path, where the alert is simply LOST. Measured 2026-09-08, all
+# four: GET ?category=nonsense, GET ?severity=nonsense, POST with either.
+#
+# The trigger was not a typo. `Alert.Category.Instrument` was added for
+# the F-268 referee alerts and the sentinel posted to it for an hour
+# against a database column still sized for the older, shorter names —
+# every one of those alerts answered 500 and discarded, while the
+# sentinel logged that it was shouting.
+#
+# Typing the parameters AS the enums makes the API refuse a bad value at
+# the door, with 422 and the permitted set named, and makes the accepted
+# values a fact derived from the model rather than a list somebody has to
+# remember to update — which is exactly the maintenance the last two
+# defects were missing. `status` is not enum-backed and keeps its
+# hand-written check below.
+# ----------------------------------------------------------------------
 @router.get("", response_model=List[ttm.AlertPydantic])
 async def get_alerts(
     repo: AlertRepository = Depends(alert_repo_dep),
     status: Optional[str] = Query(
         None, description="'open' (unresolved), 'resolved' (archive), or omit for all"
     ),
-    category: Optional[str] = Query(None),
-    severity: Optional[str] = Query(None),
+    category: Optional[ttm.Alert.Category] = Query(
+        None, description="filter by alert category; omit for all"
+    ),
+    severity: Optional[ttm.Alert.Severity] = Query(
+        None, description="filter by severity; omit for all"
+    ),
     fleet: Optional[str] = Query(None),
     robot: Optional[str] = Query(None),
     pagination: Pagination = Depends(pagination_query),
@@ -55,8 +81,8 @@ async def get_alert(alert_id: str, repo: AlertRepository = Depends(alert_repo_de
 @router.post("", status_code=201, response_model=ttm.AlertPydantic)
 async def create_alert(
     alert_id: str,
-    category: str,
-    severity: str = ttm.Alert.Severity.Warning,
+    category: ttm.Alert.Category,
+    severity: ttm.Alert.Severity = ttm.Alert.Severity.Warning,
     fleet: Optional[str] = None,
     robot: Optional[str] = None,
     message: Optional[str] = None,
