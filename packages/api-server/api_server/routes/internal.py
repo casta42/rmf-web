@@ -213,6 +213,19 @@ def check_robot_stuck(
     """
     if robot.location is None:
         return None, None
+    # F-268: a robot whose position feed has frozen has not moved less
+    # than STUCK_MOVE_EPSILON — it has not been SEEN. Judging it stuck
+    # would page an operator about an instrument fault dressed as a robot
+    # fault; the sentinel and the map already say what is really wrong.
+    # The episode is dropped, not paused: when the feed resumes the robot
+    # is wherever it actually is, and the clock starts from there.
+    from api_server.routes.fleets import position_is_stale  # noqa: PLC0415
+
+    fleet_name, _, robot_name = robot_id.partition("/")
+    if position_is_stale(fleet_name, robot_name):
+        state = _stuck_states.pop(robot_id, None)
+        resolved = state.alert_id if state is not None else None
+        return None, resolved
     state = _stuck_states.get(robot_id)
     if state is None:
         _stuck_states[robot_id] = _StuckState(

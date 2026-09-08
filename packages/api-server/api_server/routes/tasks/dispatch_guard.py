@@ -68,6 +68,13 @@ def parked_robot_near(
     target robot may already be parked at its own destination (e.g.
     send-to-charger while sitting near the charger, F-62) — it is not in
     its own way."""
+    # F-268: the guard may only object on a pose it can vouch for. A robot
+    # whose feed has frozen is not KNOWN to be parked here — it is known to
+    # have been here once — and refusing every dispatch to this waypoint
+    # on that basis would block a site on a ghost. Same fail-open posture
+    # as the rest of this file: no evidence, no objection.
+    from api_server.routes.fleets import position_is_stale  # noqa: PLC0415
+
     for fleet in fleet_states:
         if fleet.name is None or not fleet.robots:
             continue
@@ -75,6 +82,8 @@ def parked_robot_near(
             if f"{fleet.name}/{robot_name}" == exclude:
                 continue
             if robot.location is None or not _is_parked(robot):
+                continue
+            if position_is_stale(str(fleet.name), robot_name):
                 continue
             if math.hypot(robot.location.x - x, robot.location.y - y) <= tolerance:
                 return f"{fleet.name}/{robot_name}"

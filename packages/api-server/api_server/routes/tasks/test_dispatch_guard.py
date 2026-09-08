@@ -181,3 +181,42 @@ def test_patrol_places_reads_every_stop_and_fails_open():
     assert patrol_places(
         TaskRequest(category="patrol", description="nonsense")
     ) == []
+
+
+# ----------------------------------------------------------------------
+# F-268 / D-64: a frozen position feed is not a parked robot.
+# ----------------------------------------------------------------------
+class TestOccupancyIgnoresFrozenFeeds(unittest.TestCase):
+    def tearDown(self):
+        from api_server.routes import fleets as fleets_route
+
+        fleets_route._reset_freshness_for_test()
+
+    def test_a_robot_whose_feed_froze_does_not_block_the_waypoint(self):
+        """KNOWN BAD: the fleet state says a parked robot sits on j_s3,
+        but that pose stopped being accepted 30 s ago. The guard has no
+        evidence it is there and must not refuse the dispatch on it."""
+        from api_server.routes.test_internal import _freeze_robot
+
+        _freeze_robot("test_fleet", "test_robot")
+        fleets = [make_fleet(26.1, 1.5)]
+        self.assertIsNone(parked_robot_near(fleets, 26.1, 1.5))
+
+    def test_a_parked_robot_with_a_live_feed_still_blocks(self):
+        """KNOWN GOOD: same fleet state, current feed -> occupied."""
+        from api_server.routes import fleets as fleets_route
+        from api_server.routes.test_internal import _Msg
+
+        fleets_route._reset_freshness_for_test()
+        for k in range(900):
+            stamps = {"test_robot": 500.0 + k * 0.1, "other_a": 500.0 + k * 0.1}
+            fleets_route.on_fleet_positions(_Msg("test_fleet", stamps), now=1000.0 + k * 0.1)
+        fleets = [make_fleet(26.1, 1.5)]
+        self.assertEqual(parked_robot_near(fleets, 26.1, 1.5), "test_fleet/test_robot")
+
+    def test_with_no_freshness_report_the_guard_behaves_as_before(self):
+        from api_server.routes import fleets as fleets_route
+
+        fleets_route._reset_freshness_for_test()
+        fleets = [make_fleet(26.1, 1.5)]
+        self.assertEqual(parked_robot_near(fleets, 26.1, 1.5), "test_fleet/test_robot")

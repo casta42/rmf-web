@@ -19,6 +19,7 @@ from rmf_dispenser_msgs.msg import DispenserState as RmfDispenserState
 from rmf_door_msgs.msg import DoorMode as RmfDoorMode
 from rmf_door_msgs.msg import DoorRequest as RmfDoorRequest
 from rmf_door_msgs.msg import DoorState as RmfDoorState
+from rmf_fleet_msgs.msg import FleetState as RmfFleetState
 from rmf_ingestor_msgs.msg import IngestorState as RmfIngestorState
 from rmf_lift_msgs.msg import LiftRequest as RmfLiftRequest
 from rmf_lift_msgs.msg import LiftState as RmfLiftState
@@ -179,6 +180,26 @@ class RmfGateway:
             ),
         )
         self._subscriptions.append(zone_states_sub)
+
+        # F-268: the per-robot position CLOCK. `location.t` exists only
+        # on the ROS message — the RMF API fleet state carries a single
+        # fleet-wide `unix_millis_time`, identical for every robot, which
+        # cannot tell a current pose from one RMF stopped accepting
+        # updates for. BEST_EFFORT to match the publisher; this feed is
+        # ~10 Hz and a dropped sample costs nothing.
+        from api_server.routes.fleets import on_fleet_positions  # noqa: PLC0415
+
+        fleet_positions_sub = ros_node().create_subscription(
+            RmfFleetState,
+            "fleet_states",
+            lambda msg: on_fleet_positions(cast(RmfFleetState, msg)),
+            rclpy.qos.QoSProfile(
+                history=rclpy.qos.HistoryPolicy.KEEP_LAST,
+                depth=10,
+                reliability=rclpy.qos.ReliabilityPolicy.BEST_EFFORT,
+            ),
+        )
+        self._subscriptions.append(fleet_positions_sub)
 
     @staticmethod
     def now() -> Optional[RosTime]:

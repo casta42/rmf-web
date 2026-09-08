@@ -107,6 +107,14 @@ async def lifespan(_app: FastIO):
             # new columns must be added here.
             "ALTER TABLE IF EXISTS alert ADD COLUMN IF NOT EXISTS "
             "severity VARCHAR(8) NOT NULL DEFAULT 'warning';"
+            # F-268 / D-64: the `instrument` alert category. Tortoise sized
+            # this column from the longest value at creation (VARCHAR(7),
+            # 'default'), so an existing database REFUSES the new value
+            # with a 500 and the sentinel's "loud" instrument fault is
+            # lost — measured for an hour on 2026-09-08 before anyone
+            # looked. Widening is idempotent and lossless.
+            "ALTER TABLE IF EXISTS alert ALTER COLUMN category "
+            "TYPE VARCHAR(16);"
             "ALTER TABLE IF EXISTS alert ADD COLUMN IF NOT EXISTS "
             "fleet VARCHAR(255) NULL;"
             "ALTER TABLE IF EXISTS alert ADD COLUMN IF NOT EXISTS "

@@ -462,3 +462,113 @@ class TestProcessFr36Conditions(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row[2], self.internal.ttm.Alert.Severity.Warning)
         self.assertIn("b2 is idle", row[3])
         self.assertIn("b3, b4", row[3])
+
+
+# ----------------------------------------------------------------------
+# F-268 / D-64: a frozen position feed is not a stuck robot.
+# ----------------------------------------------------------------------
+class _T:
+    def __init__(self, t):
+        self.sec = int(t)
+        self.nanosec = int((t - int(t)) * 1e9)
+
+
+class _Loc:
+    def __init__(self, t, x=0.0, y=0.0):
+        self.t = _T(t)
+        self.x, self.y, self.yaw, self.level_name = x, y, 0.0, "L1"
+
+
+class _Robot:
+    def __init__(self, name, t):
+        self.name = name
+        self.location = _Loc(t)
+
+
+class _Msg:
+    def __init__(self, fleet, stamps):
+        self.name = fleet
+        self.robots = [_Robot(n, t) for n, t in stamps.items()]
+
+
+def _freeze_robot(fleet, robot, others=("other_a", "other_b")):
+    """Drive the api-server's freshness watch until `robot` is confirmed
+    stale while `others` keep reporting — the F-268 shape."""
+    from api_server.routes import fleets as fleets_route
+
+    fleets_route._reset_freshness_for_test()
+    wall, stamp = 1000.0, 500.0
+    for k in range(600):                       # 60 s healthy history
+        stamps = {robot: stamp + k * 0.1, **{o: stamp + k * 0.1 for o in others}}
+        fleets_route.on_fleet_positions(_Msg(fleet, stamps), now=wall + k * 0.1)
+    frozen = stamp + 60.0
+    for k in range(600, 900):                  # 30 s with `robot` frozen
+        stamps = {robot: frozen, **{o: stamp + k * 0.1 for o in others}}
+        fleets_route.on_fleet_positions(_Msg(fleet, stamps), now=wall + k * 0.1)
+    assert fleets_route.position_is_stale(fleet, robot)
+    for o in others:
+        assert not fleets_route.position_is_stale(fleet, o)
+
+
+class TestStuckDetectorIgnoresFrozenFeeds(unittest.TestCase):
+    def setUp(self):
+        _stuck_states.clear()
+        self.timeout_millis = round(app_config.stuck_timeout * 1000)
+
+    def tearDown(self):
+        from api_server.routes import fleets as fleets_route
+
+        fleets_route._reset_freshness_for_test()
+
+    def test_a_frozen_feed_never_pages_as_stuck(self):
+        """KNOWN BAD: the robot's pose has not changed for the whole
+        stuck timeout — because its feed froze, not because it stopped.
+        No alert, and the episode is not even started."""
+        _freeze_robot("test_fleet", "test_robot")
+        self.assertEqual(check_robot_stuck(ROBOT_ID, make_robot_state(), 0), (None, None))
+        self.assertEqual(
+            check_robot_stuck(ROBOT_ID, make_robot_state(), self.timeout_millis * 3),
+            (None, None),
+        )
+        self.assertNotIn(ROBOT_ID, _stuck_states)
+
+    def test_an_open_stuck_alert_is_resolved_when_the_feed_freezes(self):
+        """A robot that WAS stuck and whose feed then froze is no longer
+        evidence of anything — the page is withdrawn, not kept."""
+        from api_server.routes import fleets as fleets_route
+
+        fleets_route._reset_freshness_for_test()
+        check_robot_stuck(ROBOT_ID, make_robot_state(), 0)
+        new_id, _ = check_robot_stuck(ROBOT_ID, make_robot_state(), self.timeout_millis)
+        self.assertIsNotNone(new_id)
+        _freeze_robot("test_fleet", "test_robot")
+        _, resolved = check_robot_stuck(
+            ROBOT_ID, make_robot_state(), self.timeout_millis + 1000
+        )
+        self.assertEqual(resolved, new_id)
+
+    def test_a_genuinely_stuck_robot_with_a_live_feed_still_pages(self):
+        """KNOWN GOOD (the other way): a live, current feed showing no
+        motion for the timeout is exactly what this detector is for."""
+        from api_server.routes import fleets as fleets_route
+
+        fleets_route._reset_freshness_for_test()
+        wall, stamp = 1000.0, 500.0
+        for k in range(900):
+            stamps = {"test_robot": stamp + k * 0.1, "other_a": stamp + k * 0.1}
+            fleets_route.on_fleet_positions(_Msg("test_fleet", stamps), now=wall + k * 0.1)
+        self.assertFalse(fleets_route.position_is_stale("test_fleet", "test_robot"))
+        check_robot_stuck(ROBOT_ID, make_robot_state(), 0)
+        new_id, _ = check_robot_stuck(ROBOT_ID, make_robot_state(), self.timeout_millis)
+        self.assertIsNotNone(new_id)
+
+    def test_with_no_freshness_report_at_all_the_detector_behaves_as_before(self):
+        """No fleet state seen -> freshness unknown -> not stale (F-191:
+        no answer is not a wrong answer). Legacy behaviour, unchanged."""
+        from api_server.routes import fleets as fleets_route
+
+        fleets_route._reset_freshness_for_test()
+        self.assertFalse(fleets_route.position_is_stale("test_fleet", "test_robot"))
+        check_robot_stuck(ROBOT_ID, make_robot_state(), 0)
+        new_id, _ = check_robot_stuck(ROBOT_ID, make_robot_state(), self.timeout_millis)
+        self.assertIsNotNone(new_id)

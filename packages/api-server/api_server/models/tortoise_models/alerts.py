@@ -22,6 +22,15 @@ class Alert(Model):
         Task = "task"
         Fleet = "fleet"
         Robot = "robot"
+        # F-268 / D-64: the referee reporting on ITSELF — a frozen
+        # position feed, a stale pose — must never read as a fleet or
+        # robot event. An operator seeing a red line has to know whether
+        # the robots did something or the instrument went blind, and a
+        # class shared with robot faults cannot say which. The sentinel
+        # posted this category for an hour before anyone noticed the
+        # enum refused it (HTTP 500, alert lost): a "loud" alert that
+        # never lands is the silence F-268 was about.
+        Instrument = "instrument"
 
     class Severity(str, Enum):
         Info = "info"
