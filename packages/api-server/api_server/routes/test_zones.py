@@ -117,3 +117,166 @@ class TestZonesRoute(AppFixture):
         finally:
             app_config.zones_file = old
             os.unlink(path)
+
+
+class TestMutexStateRoute(AppFixture):
+    """FR-9d / D-58 (F-259) — the aisle's holder, and the guarded release.
+
+    Proven both ways at this layer: the read path serves what the adapter
+    reported and REFUSES to answer from a stale report; the release is
+    admin-only, needs a reason, refuses over a body naming it, refuses an
+    already-free zone, and refuses when the evidence is missing. A
+    control that acts without evidence is the F-191 class.
+    """
+
+    def setUp(self):
+        super().setUp()
+        from api_server.routes import zones as zones_route
+
+        self.zones_route = zones_route
+        zones_route._zone_states = {}
+        zones_route._zone_states_at = None
+        self.published = []
+        zones_route._release_pub = _FakePub(self.published)
+
+    def tearDown(self):
+        self.zones_route._release_pub = None
+        self.zones_route._zone_states = {}
+        self.zones_route._zone_states_at = None
+        super().tearDown()
+
+    def _report(self, zone):
+        import json
+        import time
+
+        self.zones_route.on_zone_states(
+            json.dumps({"fleet": "gentle_fleet", "zones": [zone]})
+        )
+        self.zones_route._zone_states_at = time.monotonic()
+
+    HELD = {
+        "name": "narrow_aisle_de",
+        "holder": "gentle_bot_3",
+        "holder_entered": True,
+        "held_s": 42.0,
+        "waiters": [{"robot": "gentle_bot_5", "waiting_s": 12.0}],
+        "bodies_inside": [],
+    }
+
+    # -- read path -----------------------------------------------------
+    def test_serves_the_holder_and_the_queue(self):
+        self._report(self.HELD)
+        resp = self.client.get("/zones/mutex_state")
+        self.assertEqual(200, resp.status_code, resp.content)
+        zone = resp.json()["zones"][0]
+        self.assertEqual("gentle_bot_3", zone["holder"])
+        self.assertEqual("gentle_bot_5", zone["waiters"][0]["robot"])
+
+    def test_503_before_the_adapter_has_ever_reported(self):
+        resp = self.client.get("/zones/mutex_state")
+        self.assertEqual(503, resp.status_code)
+        self.assertIn("unknown", resp.json()["detail"])
+
+    def test_503_when_the_report_is_stale(self):
+        import time
+
+        self._report(self.HELD)
+        self.zones_route._zone_states_at = time.monotonic() - 60.0
+        resp = self.client.get("/zones/mutex_state")
+        self.assertEqual(503, resp.status_code)
+        self.assertIn("stale", resp.json()["detail"])
+
+    def test_undecodable_report_is_ignored_not_believed(self):
+        self.zones_route.on_zone_states("{not json")
+        self.assertEqual(503, self.client.get("/zones/mutex_state").status_code)
+
+    # -- the release ---------------------------------------------------
+    def test_release_publishes_the_command_with_actor_and_reason(self):
+        import json
+
+        self._report(self.HELD)
+        resp = self.client.post(
+            "/zones/mutex/narrow_aisle_de/release",
+            json={"reason": "bot_3 wedged, recovering by hand"},
+        )
+        self.assertEqual(200, resp.status_code, resp.content)
+        self.assertEqual("gentle_bot_3", resp.json()["released_from"])
+        sent = json.loads(self.published[0])
+        self.assertEqual("narrow_aisle_de", sent["zone"])
+        self.assertEqual("admin", sent["actor"])
+        self.assertEqual("bot_3 wedged, recovering by hand", sent["reason"])
+
+    def test_release_is_refused_while_a_body_is_inside_naming_it(self):
+        held = dict(self.HELD)
+        held["bodies_inside"] = ["gentle_bot_3"]
+        self._report(held)
+        resp = self.client.post(
+            "/zones/mutex/narrow_aisle_de/release", json={"reason": "stuck"}
+        )
+        self.assertEqual(409, resp.status_code)
+        self.assertIn("gentle_bot_3", resp.json()["detail"])
+        self.assertEqual([], self.published)
+
+    def test_release_of_a_free_zone_is_refused(self):
+        free = dict(self.HELD)
+        free["holder"] = None
+        self._report(free)
+        resp = self.client.post(
+            "/zones/mutex/narrow_aisle_de/release", json={"reason": "tidy up"}
+        )
+        self.assertEqual(409, resp.status_code)
+        self.assertEqual([], self.published)
+
+    def test_release_needs_a_reason(self):
+        self._report(self.HELD)
+        resp = self.client.post(
+            "/zones/mutex/narrow_aisle_de/release", json={"reason": "   "}
+        )
+        self.assertEqual(422, resp.status_code)
+        self.assertEqual([], self.published)
+
+    def test_release_of_an_unknown_zone_is_404(self):
+        self._report(self.HELD)
+        resp = self.client.post(
+            "/zones/mutex/no_such_aisle/release", json={"reason": "x"}
+        )
+        self.assertEqual(404, resp.status_code)
+
+    def test_release_without_evidence_is_refused(self):
+        """No adapter report: the control has nothing to check the aisle
+        against, so it must not act (F-191)."""
+        resp = self.client.post(
+            "/zones/mutex/narrow_aisle_de/release", json={"reason": "x"}
+        )
+        self.assertEqual(503, resp.status_code)
+        self.assertEqual([], self.published)
+
+    def test_release_is_admin_only(self):
+        self._report(self.HELD)
+        self.client.set_user("operator1")
+        try:
+            resp = self.client.post(
+                "/zones/mutex/narrow_aisle_de/release", json={"reason": "x"}
+            )
+            self.assertEqual(403, resp.status_code)
+            self.assertEqual([], self.published)
+        finally:
+            self.client.set_user("admin")
+
+    def test_reading_the_state_is_not_admin_only(self):
+        """An operator must be able to SEE who holds the aisle — that is
+        the DR-3 defect being closed. Only acting is privileged."""
+        self._report(self.HELD)
+        self.client.set_user("operator1")
+        try:
+            self.assertEqual(200, self.client.get("/zones/mutex_state").status_code)
+        finally:
+            self.client.set_user("admin")
+
+
+class _FakePub:
+    def __init__(self, sink):
+        self.sink = sink
+
+    def publish(self, msg):
+        self.sink.append(msg.data)

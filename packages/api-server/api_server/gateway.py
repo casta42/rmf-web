@@ -25,6 +25,7 @@ from rmf_lift_msgs.msg import LiftState as RmfLiftState
 from rmf_task_msgs.srv import CancelTask as RmfCancelTask
 from rmf_task_msgs.srv import SubmitTask as RmfSubmitTask
 from rosidl_runtime_py.convert import message_to_ordereddict
+from std_msgs.msg import String as RosString
 
 from .logger import logger as base_logger
 from .models import BuildingMap, DispenserState, DoorState, IngestorState, LiftState
@@ -155,6 +156,29 @@ class RmfGateway:
             ),
         )
         self._subscriptions.append(map_sub)
+
+        # FR-9d/D-58 (F-259): live mutex-zone occupancy from the fleet
+        # adapter — holder, waiters and the bodies physically inside each
+        # polygon. JSON over std_msgs/String, the same transport the D-24
+        # evacuation control uses in the other direction; on the Humble
+        # pin rmf_fleet_msgs/RobotState carries no mutex_groups field to
+        # put it in (see ZONE_MANAGER_AUDIT.md §6.5 for the pin-bump
+        # replacement). TRANSIENT_LOCAL so a restarted api-server has the
+        # aisle state before the next publish rather than a blank map.
+        from api_server.routes.zones import on_zone_states  # noqa: PLC0415
+
+        zone_states_sub = ros_node().create_subscription(
+            RosString,
+            "gf_zone_states",
+            lambda msg: on_zone_states(cast(RosString, msg).data),
+            rclpy.qos.QoSProfile(
+                history=rclpy.qos.HistoryPolicy.KEEP_LAST,
+                depth=1,
+                reliability=rclpy.qos.ReliabilityPolicy.RELIABLE,
+                durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL,
+            ),
+        )
+        self._subscriptions.append(zone_states_sub)
 
     @staticmethod
     def now() -> Optional[RosTime]:
