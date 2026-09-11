@@ -130,12 +130,23 @@ async def lifespan(_app: FastIO):
             # semantics (open == unresolved) those clones must read as
             # RESOLVED, or every historically-acked alert reappears as a
             # current problem after the upgrade. Idempotent via the WHERE.
+            # F-278 (Phase F F1.1 fresh-host gate): guarded on the table
+            # existing — every ALTER above is IF EXISTS, but this UPDATE
+            # was not, so a FRESH database (first install, empty volume)
+            # failed startup with `relation "alert" does not exist` and
+            # the api-server crash-looped. The laptop never saw it: its
+            # database predates the statement. generate_schemas below
+            # creates the table on a fresh database; there is nothing to
+            # backfill there.
+            "DO $$ BEGIN "
+            "IF to_regclass('public.alert') IS NOT NULL THEN "
             "UPDATE alert SET "
             "resolved_by = COALESCE(resolved_by, acknowledged_by), "
             "unix_millis_resolved_time = COALESCE(unix_millis_resolved_time, "
             "unix_millis_acknowledged_time) "
             "WHERE acknowledged_by IS NOT NULL "
-            "AND unix_millis_resolved_time IS NULL;"
+            "AND unix_millis_resolved_time IS NULL; "
+            "END IF; END $$;"
         )
     # FIXME: do this outside the app as recommended by the docs
     await Tortoise.generate_schemas()
