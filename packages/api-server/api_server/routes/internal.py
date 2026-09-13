@@ -62,6 +62,23 @@ async def _load_request(task_id: str):
 redispatcher = Redispatcher(
     _redispatch_request, _load_request, logger.getChild("Redispatch"))
 
+
+async def _redispatch_later(task_state: mdl.TaskState) -> None:
+    try:
+        errors = None
+        if task_state.dispatch is not None and task_state.dispatch.errors:
+            errors = [{"code": e.code} for e in task_state.dispatch.errors]
+        await redispatcher.maybe_redispatch(
+            task_state.booking.id,
+            task_state.status,
+            task_state.cancellation.labels
+            if task_state.cancellation is not None else None,
+            booking_labels=task_state.booking.labels,
+            dispatch_errors=errors,
+        )
+    except Exception:  # pylint: disable=broad-except
+        logger.exception("re-dispatch of [%s] failed", task_state.booking.id)
+
 # FR-17 low battery alerts: a robot re-arms only after its battery rises above
 # `low_battery_threshold` plus this margin (battery is a fraction, 0.0-1.0).
 LOW_BATTERY_HYSTERESIS = 0.05
@@ -764,17 +781,10 @@ async def process_msg(msg: Dict[str, Any], fleet_repo: FleetRepository) -> None:
         task_events.task_states.on_next(task_state)
 
         # FR-12 charge governor (F-36/F-286): a mission the fleet canceled
-        # to charge its robot comes back to the floor for another robot.
-        try:
-            await redispatcher.maybe_redispatch(
-                task_state.booking.id,
-                task_state.status,
-                task_state.cancellation.labels
-                if task_state.cancellation is not None else None,
-            )
-        except Exception:  # pylint: disable=broad-except
-            logger.exception(
-                "re-dispatch of [%s] failed", task_state.booking.id)
+        # to charge its robot comes back to the floor for another robot —
+        # after a settle delay, off this handler (F-291), so the fleet
+        # feed is never held up behind a dispatch.
+        asyncio.get_running_loop().create_task(_redispatch_later(task_state))
 
         # F-22: alerts are exceptions (FR-17) - a cleanly completed task must
         # NOT leave an open alert. The upstream completed-task alert grew

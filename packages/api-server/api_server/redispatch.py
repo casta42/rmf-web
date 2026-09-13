@@ -33,12 +33,41 @@ GENERATION_LABEL = "gf:redispatch-gen="
 REASON_LABEL = "gf:redispatch-reason="
 MAX_GENERATIONS = 8
 _CANCELED = {"canceled", "killed"}
+# F-291: a child re-dispatched within a second of the fleet's cancel met
+# `[TaskPlanner] Failed to compute assignments` twice (five full robots
+# idle) and nothing else ever did. Let the fleet's queues settle first,
+# and give a child the dispatcher could not place (code 10, no bid) one
+# more try per generation.
+SETTLE_DELAY_S = 5.0
+RETRY_DELAY_S = 10.0
+NO_BID_CODE = 10
 
 
 def status_tail(status_value) -> Optional[str]:
     if status_value is None:
         return None
     return str(status_value).split(".")[-1].strip().lower()
+
+
+def wants_retry(status_value, booking_labels: Optional[Iterable[str]],
+                dispatch_errors: Optional[Iterable[dict]]) -> Optional[str]:
+    """A re-dispatched child that FAILED because no fleet bid on it
+    (dispatcher code 10) is retried once per generation; a failure with
+    any other cause, or a mission that was never ours, is left alone."""
+    if status_tail(status_value) != "failed":
+        return None
+    labels = list(booking_labels or [])
+    if origin_of(labels) is None:
+        return None
+    for err in dispatch_errors or []:
+        code = err.get("code") if isinstance(err, dict) else \
+            getattr(err, "code", None)
+        if code == NO_BID_CODE:
+            for label in labels:
+                if label.startswith(REASON_LABEL):
+                    return label[len(REASON_LABEL):]
+            return "returned to the fleet by the charge governor"
+    return None
 
 
 def wants_redispatch(status_value, cancellation_labels: Optional[Iterable[str]]
@@ -114,12 +143,22 @@ class Redispatcher:
         return True
 
     async def maybe_redispatch(self, task_id: str, status_value,
-                               cancellation_labels) -> Optional[str]:
+                               cancellation_labels, booking_labels=None,
+                               dispatch_errors=None,
+                               sleep=None) -> Optional[str]:
         reason = wants_redispatch(status_value, cancellation_labels)
+        delay = SETTLE_DELAY_S
+        if reason is None:
+            reason = wants_retry(status_value, booking_labels, dispatch_errors)
+            delay = RETRY_DELAY_S
         if reason is None:
             return None
         if not self._mark(task_id):
             return None
+        if sleep is None:
+            import asyncio
+            sleep = asyncio.sleep
+        await sleep(delay)
         request = await self._load_request(task_id)
         if request is None:
             self._logger.warning(

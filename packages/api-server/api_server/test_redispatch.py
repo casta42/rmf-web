@@ -16,9 +16,9 @@ from typing import List, Optional
 from pydantic import BaseModel
 
 from api_server.redispatch import (
-    GENERATION_LABEL, MAX_GENERATIONS, ORIGIN_LABEL, REASON_LABEL,
-    REDISPATCH_LABEL, Redispatcher, generation_of, next_labels, origin_of,
-    wants_redispatch,
+    GENERATION_LABEL, MAX_GENERATIONS, NO_BID_CODE, ORIGIN_LABEL,
+    REASON_LABEL, REDISPATCH_LABEL, Redispatcher, generation_of, next_labels,
+    origin_of, wants_redispatch, wants_retry,
 )
 
 REASON = ("charge preemption (F-36): [gentle_bot_3] at SoC 0.17 cannot "
@@ -91,35 +91,69 @@ class RedispatcherTest(unittest.TestCase):
             return self.requests.get(task_id)
 
         self.rd = Redispatcher(dispatch, load, logging.getLogger("t"))
+        self.slept = []
+
+    async def _sleep(self, seconds):
+        self.slept.append(seconds)
 
     def run_(self, coro):
         return asyncio.new_event_loop().run_until_complete(coro)
 
     def test_governor_cancel_is_redispatched_once(self):
         new_id = self.run_(self.rd.maybe_redispatch(
-            "patrol.dispatch-1", "canceled", [REDISPATCH_LABEL, REASON]))
+            "patrol.dispatch-1", "canceled", [REDISPATCH_LABEL, REASON],
+            sleep=self._sleep))
         self.assertEqual(new_id, "patrol.dispatch-101")
+        self.assertEqual(self.slept, [5.0])            # settle first (F-291)
         self.assertEqual(len(self.dispatched), 1)
         labels = self.dispatched[0].labels
         self.assertIn("x=1", labels)
         self.assertIn(f"{ORIGIN_LABEL}patrol.dispatch-1", labels)
         # the fleet re-broadcasts terminal states: acted on ONCE
         again = self.run_(self.rd.maybe_redispatch(
-            "patrol.dispatch-1", "canceled", [REDISPATCH_LABEL, REASON]))
+            "patrol.dispatch-1", "canceled", [REDISPATCH_LABEL, REASON],
+            sleep=self._sleep))
         self.assertIsNone(again)
         self.assertEqual(len(self.dispatched), 1)
         self.assertEqual(self.rd.redispatched, 1)
 
     def test_operator_cancel_and_completion_do_nothing(self):
         self.assertIsNone(self.run_(self.rd.maybe_redispatch(
-            "patrol.dispatch-1", "canceled", ["operator"])))
+            "patrol.dispatch-1", "canceled", ["operator"], sleep=self._sleep)))
         self.assertIsNone(self.run_(self.rd.maybe_redispatch(
-            "patrol.dispatch-1", "completed", [REDISPATCH_LABEL])))
+            "patrol.dispatch-1", "completed", [REDISPATCH_LABEL],
+            sleep=self._sleep)))
         self.assertEqual(self.dispatched, [])
+
+    def test_a_child_nobody_bid_on_is_retried_once_per_generation(self):
+        # F-291: the fleet planner failed the immediate child twice
+        child_labels = next_labels(["x=1"], "patrol.dispatch-1", REASON)
+        self.requests["patrol.dispatch-101"] = FakeRequest(labels=child_labels)
+        self.assertEqual(
+            wants_retry("failed", child_labels, [{"code": NO_BID_CODE}]),
+            REASON[:200])        # the reason label is capped at 200 chars
+        new_id = self.run_(self.rd.maybe_redispatch(
+            "patrol.dispatch-101", "failed", None,
+            booking_labels=child_labels,
+            dispatch_errors=[{"code": NO_BID_CODE}], sleep=self._sleep))
+        self.assertIsNotNone(new_id)
+        self.assertEqual(len(self.dispatched), 1)
+        self.assertEqual(generation_of(self.dispatched[0].labels), 2)
+        self.assertEqual(origin_of(self.dispatched[0].labels),
+                         "patrol.dispatch-101")
+        self.assertEqual(self.slept, [10.0])
+        # a failure with another cause, or a mission that is not a child,
+        # is never retried
+        self.assertIsNone(wants_retry("failed", child_labels, [{"code": 9}]))
+        self.assertIsNone(wants_retry("failed", ["x=1"],
+                                      [{"code": NO_BID_CODE}]))
+        self.assertIsNone(wants_retry("canceled", child_labels,
+                                      [{"code": NO_BID_CODE}]))
 
     def test_direct_mission_without_a_stored_request_is_left_canceled(self):
         self.assertIsNone(self.run_(self.rd.maybe_redispatch(
-            "op-send-77", "canceled", [REDISPATCH_LABEL, REASON])))
+            "op-send-77", "canceled", [REDISPATCH_LABEL, REASON],
+            sleep=self._sleep)))
         self.assertEqual(self.dispatched, [])
         self.assertEqual(self.rd.refused, 1)
 
@@ -127,7 +161,8 @@ class RedispatcherTest(unittest.TestCase):
         self.requests["deep"] = FakeRequest(
             labels=[f"{GENERATION_LABEL}{MAX_GENERATIONS}"])
         self.assertIsNone(self.run_(self.rd.maybe_redispatch(
-            "deep", "canceled", [REDISPATCH_LABEL, REASON])))
+            "deep", "canceled", [REDISPATCH_LABEL, REASON],
+            sleep=self._sleep)))
         self.assertEqual(self.dispatched, [])
         self.assertEqual(self.rd.refused, 1)
 
@@ -138,7 +173,8 @@ class RedispatcherTest(unittest.TestCase):
         rd = Redispatcher(refuse, lambda tid: self.requests_get(tid),
                           logging.getLogger("t"))
         self.assertIsNone(self.run_(rd.maybe_redispatch(
-            "patrol.dispatch-1", "canceled", [REDISPATCH_LABEL, REASON])))
+            "patrol.dispatch-1", "canceled", [REDISPATCH_LABEL, REASON],
+            sleep=self._sleep)))
         self.assertEqual(rd.refused, 1)
 
     async def requests_get(self, task_id):
