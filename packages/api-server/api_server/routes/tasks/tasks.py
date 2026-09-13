@@ -311,16 +311,34 @@ async def _cancel_at_dispatcher(task_id: str, cancellation: Cancellation,
     the response, or None when the dispatcher no longer holds the task
     (awarded meanwhile, or unknown) so the caller falls through to the
     fleet path."""
+    import asyncio
+
     from rmf_task_msgs.srv import CancelTask as RmfCancelTask
 
     from api_server.gateway import rmf_gateway
 
-    gateway = rmf_gateway()
+    client = rmf_gateway().cancel_task_client
+    if not client.service_is_ready():
+        return None
+    # An rclpy Future is not awaitable by asyncio (the gateway's own
+    # call_service raises "Task got bad yield" on it — F-285 found that
+    # too); bridge it: the rclpy spin thread completes the ROS future,
+    # the loop's future is resolved thread-safely.
+    loop = asyncio.get_running_loop()
+    done = loop.create_future()
+    ros_future = client.call_async(
+        RmfCancelTask.Request(requester="gentlefleet-api-server",
+                              task_id=task_id))
+    ros_future.add_done_callback(
+        lambda f: loop.call_soon_threadsafe(
+            lambda: done.done() or done.set_result(f)))
     try:
-        resp = await gateway.call_service(
-            gateway.cancel_task_client,
-            RmfCancelTask.Request(task_id=task_id), timeout=3)
-    except HTTPException:
+        finished = await asyncio.wait_for(done, timeout=3)
+    except asyncio.TimeoutError:
+        return None
+    try:
+        resp = finished.result()
+    except Exception:  # pylint: disable=broad-except
         return None
     if not getattr(resp, "success", False):
         return None
