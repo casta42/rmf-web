@@ -63,6 +63,24 @@ redispatcher = Redispatcher(
     _redispatch_request, _load_request, logger.getChild("Redispatch"))
 
 
+_request_labels: Dict[str, Optional[list]] = {}
+
+
+async def _preserve_booking_labels(task_state: mdl.TaskState) -> None:
+    task_id = task_state.booking.id
+    if task_state.booking.labels:
+        return
+    if task_id not in _request_labels:
+        if len(_request_labels) > 8192:
+            _request_labels.clear()
+        request = await task_repo.get_task_request(task_id)
+        _request_labels[task_id] = list(request.labels) if request and \
+            request.labels else None
+    labels = _request_labels.get(task_id)
+    if labels:
+        task_state.booking.labels = list(labels)
+
+
 _followed_through: set = set()
 _NON_TERMINAL_FOR_FOLLOW = {"queued", "standby", "underway", "delayed",
                             "blocked", "uninitialized"}
@@ -818,6 +836,13 @@ async def process_msg(msg: Dict[str, Any], fleet_repo: FleetRepository) -> None:
         # stored rows and broadcasts agree (the canceled-vs-completed race
         # on the dead-robot path can wipe RMF's own field)
         task_cancellation.apply(task_state)
+        # F-295: the fleet adapter's task_state_update carries NO booking
+        # labels on this pin (convert() never parses them), so the first
+        # fleet update after an award erased every label the request
+        # came with — FR-5 priority, the drill's markers, and the
+        # gf:redispatch-of provenance the morning-after row matches on.
+        # The stored REQUEST is the truth; stamp its labels back.
+        await _preserve_booking_labels(task_state)
         # F-292: the dispatcher AWARDS a task it canceled in flight while
         # its bidding was still open (measured: canceled 01:55:45, awarded
         # to gentle_bot_1 01:55:51), and the queued future mission then
