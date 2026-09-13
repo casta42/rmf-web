@@ -63,6 +63,47 @@ redispatcher = Redispatcher(
     _redispatch_request, _load_request, logger.getChild("Redispatch"))
 
 
+_followed_through: set = set()
+_NON_TERMINAL_FOR_FOLLOW = {"queued", "standby", "underway", "delayed",
+                            "blocked", "uninitialized"}
+
+
+async def _follow_through_cancel(task_state: mdl.TaskState) -> None:
+    task_id = task_state.booking.id
+    status = str(task_state.status).split(".")[-1].lower()
+    if status not in _NON_TERMINAL_FOR_FOLLOW:
+        return
+    if task_state.assigned_to is None:
+        return
+    if not task_cancellation.requested(task_id):
+        return
+    if task_id in _followed_through:
+        return
+    _followed_through.add(task_id)
+    if len(_followed_through) > 4096:
+        _followed_through.clear()
+    logger.warning(
+        "F-292: [%s] arrived %s on [%s] after its cancellation was "
+        "requested — the dispatcher awarded a task it had canceled in "
+        "flight; cancelling it at the fleet",
+        task_id, status, task_state.assigned_to.name)
+    from api_server.rmf_io import tasks_service
+
+    async def _send():
+        try:
+            await tasks_service().call(
+                mdl.CancelTaskRequest(
+                    type="cancel_task_request", task_id=task_id,
+                    labels=["canceled before dispatch; the dispatcher "
+                            "awarded it anyway (F-292)"],
+                ).model_dump_json(exclude_none=True), timeout=10)
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("F-292 follow-through cancel of [%s]: %s",
+                           task_id, exc)
+
+    asyncio.get_running_loop().create_task(_send())
+
+
 async def _redispatch_later(task_state: mdl.TaskState) -> None:
     try:
         errors = None
@@ -777,6 +818,13 @@ async def process_msg(msg: Dict[str, Any], fleet_repo: FleetRepository) -> None:
         # stored rows and broadcasts agree (the canceled-vs-completed race
         # on the dead-robot path can wipe RMF's own field)
         task_cancellation.apply(task_state)
+        # F-292: the dispatcher AWARDS a task it canceled in flight while
+        # its bidding was still open (measured: canceled 01:55:45, awarded
+        # to gentle_bot_1 01:55:51), and the queued future mission then
+        # made the fleet planner fail unrelated dispatches. A task whose
+        # cancel was already requested and that now arrives from the
+        # fleet NON-terminal with a robot is canceled again, at the fleet.
+        await _follow_through_cancel(task_state)
         await task_repo.save_task_state(task_state)
         task_events.task_states.on_next(task_state)
 

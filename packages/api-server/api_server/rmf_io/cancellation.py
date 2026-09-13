@@ -44,3 +44,10 @@ def apply(task_state: TaskState) -> None:
         _latched[task_id] = task_state.cancellation
     elif task_id in _latched:
         task_state.cancellation = _latched[task_id]
+
+
+def requested(task_id: str) -> bool:
+    """True when a cancellation has been latched for this task (F-292:
+    the dispatcher can award a task it already canceled in flight; the
+    fleet then needs the cancel a second time)."""
+    return task_id in _latched
