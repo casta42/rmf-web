@@ -90,6 +90,12 @@ class RmfGateway:
 
         self._subscribe_all()
 
+    @property
+    def cancel_task_client(self) -> rclpy.client.Client:
+        """F-285: the dispatcher's CancelTask service — the only door for
+        a task still in its bidding queue."""
+        return self._cancel_task_srv
+
     async def call_service(self, client: rclpy.client.Client, req, timeout=1) -> Any:
         """
         Utility to wrap a ros service call in an awaitable,

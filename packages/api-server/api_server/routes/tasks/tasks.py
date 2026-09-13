@@ -17,8 +17,17 @@ from api_server.fast_io import FastIORouter, SubscriptionRequest
 from api_server.models import tortoise_models as ttm
 from api_server.models.building_map import BuildingMap
 from api_server.models.rmf_api.task_state import Cancellation
+from api_server.models.rmf_api.task_state import Status2 as DispatchStatus
 from api_server.repositories import FleetRepository, TaskRepository, task_repo_dep
 from api_server.response import RawJSONResponse
+from api_server.cancel_route import (
+    ROUTE_ALREADY_CANCELED,
+    ROUTE_DISPATCHER,
+    ROUTE_TERMINAL,
+    ROUTE_UNKNOWN,
+    cancel_route,
+    status_tail,
+)
 from api_server.rmf_io import cancellation as task_cancellation
 from api_server.rmf_io import task_events, tasks_service
 from api_server.routes import zones as zones_routes
@@ -218,16 +227,47 @@ async def post_cancel_task(
     request: mdl.CancelTaskRequest = Body(...),
     task_repo: TaskRepository = Depends(task_repo_dep),
 ):
+    # F-285: an honest answer needs the task's shape first. A task the
+    # dispatcher still holds (scheduled for later, or not yet bid on) is
+    # answered by NOBODY on the task API topic on this pin — the fleet
+    # adapter only answers for tasks it owns — so that cancel used to
+    # time out into a 500 whether or not it took effect. Route by state:
+    # unknown -> 404; already canceled -> 200 (idempotent); completed or
+    # failed -> 409; dispatcher-held -> the dispatcher's ROS service,
+    # falling back to the fleet path if it was awarded meanwhile.
+    stored = await task_repo.get_task_state(request.task_id)
+    route = cancel_route(
+        stored.status if stored is not None else None,
+        stored.dispatch.status
+        if stored is not None and stored.dispatch is not None else None,
+        stored.assigned_to if stored is not None else None,
+    )
+    if route == ROUTE_UNKNOWN:
+        raise HTTPException(
+            404, detail=f"task [{request.task_id}] is not known to this site")
+    if route == ROUTE_ALREADY_CANCELED:
+        return RawJSONResponse(
+            json.dumps({"success": True,
+                        "detail": f"task is already {status_tail(stored.status)}"}
+                       ).encode())
+    if route == ROUTE_TERMINAL:
+        raise HTTPException(
+            409,
+            detail=(f"task [{request.task_id}] is already "
+                    f"{status_tail(stored.status)} and cannot be canceled"))
+    cancellation = Cancellation(
+        unix_millis_request_time=round(datetime.now().timestamp() * 1e3),
+        labels=list(request.labels or []),
+    )
     # F-71(2): record the cancellation at REQUEST time — whether the
     # fleet core ends the task `canceled` or (dead-robot race) wipes it
     # to `completed`, displays keep the truth of how it ended (F-67)
-    task_cancellation.latch(
-        request.task_id,
-        Cancellation(
-            unix_millis_request_time=round(datetime.now().timestamp() * 1e3),
-            labels=list(request.labels or []),
-        ),
-    )
+    task_cancellation.latch(request.task_id, cancellation)
+    if route == ROUTE_DISPATCHER:
+        closed = await _cancel_at_dispatcher(request.task_id, cancellation,
+                                             stored, task_repo)
+        if closed is not None:
+            return closed
     try:
         return RawJSONResponse(
             await tasks_service().call(
@@ -259,6 +299,43 @@ async def post_cancel_task(
                 }
             ).encode()
         )
+
+
+async def _cancel_at_dispatcher(task_id: str, cancellation: Cancellation,
+                                stored: mdl.TaskState,
+                                task_repo: TaskRepository):
+    """F-285: cancel a task the DISPATCHER still holds through its ROS
+    service (rmf_task_msgs/srv/CancelTask). On success the dispatcher
+    moves the task to canceled_in_flight and announces it; we close the
+    row here as well so the answer and the ledger agree at once. Returns
+    the response, or None when the dispatcher no longer holds the task
+    (awarded meanwhile, or unknown) so the caller falls through to the
+    fleet path."""
+    from rmf_task_msgs.srv import CancelTask as RmfCancelTask
+
+    from api_server.gateway import rmf_gateway
+
+    gateway = rmf_gateway()
+    try:
+        resp = await gateway.call_service(
+            gateway.cancel_task_client,
+            RmfCancelTask.Request(task_id=task_id), timeout=3)
+    except HTTPException:
+        return None
+    if not getattr(resp, "success", False):
+        return None
+    stored.status = mdl.TaskStatus.canceled
+    stored.cancellation = cancellation
+    if stored.dispatch is not None:
+        stored.dispatch.status = DispatchStatus.canceled_in_flight
+    await task_repo.save_task_state(stored)
+    task_events.task_states.on_next(stored)
+    return RawJSONResponse(
+        json.dumps({
+            "success": True,
+            "detail": "canceled before dispatch — the task had not been "
+                      "assigned to any robot yet (F-285)",
+        }).encode())
 
 
 # F-34 dispatch guard: reject a patrol whose final destination is

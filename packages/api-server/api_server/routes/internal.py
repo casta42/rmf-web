@@ -15,6 +15,7 @@ from api_server.interrupted_tasks import (
     INTERRUPTED_LABEL, RunBoundary, is_interrupted_row,
 )
 from api_server.dispatch_reason import dispatch_failure_reason
+from api_server.redispatch import Redispatcher
 from api_server.logger import logger as base_logger
 from api_server.models import tortoise_models as ttm
 from api_server.models.rmf_api.robot_state import Status as RobotStatus
@@ -36,6 +37,30 @@ logger = base_logger.getChild("RmfGatewayApp")
 user: mdl.User = mdl.User(username="__rmf_internal__", is_admin=True)
 task_repo = TaskRepository(user)
 alert_repo = AlertRepository(user, task_repo)
+
+
+async def _redispatch_request(request: mdl.TaskRequest) -> str:
+    """FR-12 governor: put a returned mission back on the floor through
+    the operator's own dispatch path (F-34 guard, request stored,
+    state saved). Imported lazily: routes.tasks imports this package."""
+    from api_server.routes.tasks.tasks import post_dispatch_task
+
+    resp = await post_dispatch_task(
+        mdl.DispatchTaskRequest(type="dispatch_task_request", request=request),
+        task_repo,
+    )
+    if not isinstance(resp, mdl.TaskDispatchResponse):
+        raise RuntimeError(
+            f"dispatch refused: {getattr(resp, 'body', b'')[:200]!r}")
+    return resp.root.state.booking.id  # type: ignore[union-attr]
+
+
+async def _load_request(task_id: str):
+    return await task_repo.get_task_request(task_id)
+
+
+redispatcher = Redispatcher(
+    _redispatch_request, _load_request, logger.getChild("Redispatch"))
 
 # FR-17 low battery alerts: a robot re-arms only after its battery rises above
 # `low_battery_threshold` plus this margin (battery is a fraction, 0.0-1.0).
@@ -737,6 +762,19 @@ async def process_msg(msg: Dict[str, Any], fleet_repo: FleetRepository) -> None:
         task_cancellation.apply(task_state)
         await task_repo.save_task_state(task_state)
         task_events.task_states.on_next(task_state)
+
+        # FR-12 charge governor (F-36/F-286): a mission the fleet canceled
+        # to charge its robot comes back to the floor for another robot.
+        try:
+            await redispatcher.maybe_redispatch(
+                task_state.booking.id,
+                task_state.status,
+                task_state.cancellation.labels
+                if task_state.cancellation is not None else None,
+            )
+        except Exception:  # pylint: disable=broad-except
+            logger.exception(
+                "re-dispatch of [%s] failed", task_state.booking.id)
 
         # F-22: alerts are exceptions (FR-17) - a cleanly completed task must
         # NOT leave an open alert. The upstream completed-task alert grew
