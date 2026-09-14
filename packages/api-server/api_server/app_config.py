@@ -40,6 +40,10 @@ class AppConfig:
     # F-77: seconds without a state update before a non-terminal task is
     # failed over as orphaned (rmf-core restart ghosts). 0 disables.
     stale_task_timeout: float = 1800
+    # F-293 (FR-4 amendment): a one-off dispatch starting more than this
+    # many seconds ahead is refused (one shift); one beyond the derived
+    # dispatch horizon is held and released at start - horizon.
+    dispatch_max_lead_s: float = 8 * 3600
 
     def __post_init__(self):
         self.public_url = urllib.parse.urlparse(cast(str, self.public_url))

@@ -1,7 +1,9 @@
+from . import deferred_dispatch
 from .alerts import *
 from .authorization import *
 from .beacons import *
 from .building_map import BuildingMap
+from .deferred_dispatch import DeferredDispatch
 from .dispenser_state import DispenserState
 from .door_state import DoorState
 from .fleets import FleetLog, FleetLogLog, FleetLogRobots, FleetLogRobotsLog, FleetState

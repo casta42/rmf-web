@@ -198,6 +198,8 @@ async def lifespan(_app: FastIO):
 
     logger.info("starting scheduler")
     asyncio.create_task(_spin_scheduler())
+    # F-293: missions held for their start are released on this clock
+    asyncio.create_task(_spin_deferred_dispatcher())
     if app_config.stale_task_timeout > 0:
         # F-77 (E5 review round 1): fail over tasks orphaned non-terminal
         # by an rmf-core restart, so the D-17 mission guard and every
@@ -342,6 +344,25 @@ async def _spin_scheduler():
     while True:
         schedule.run_pending()
         await asyncio.sleep(1)
+
+
+async def _spin_deferred_dispatcher():
+    from .routes.tasks.tasks import (
+        dispatch_due_deferrals,
+        recover_interrupted_deferrals,
+    )
+
+    deferred_logger = logger.getChild("DeferredDispatch")
+    try:
+        await recover_interrupted_deferrals(deferred_logger)
+    except Exception:  # pylint: disable=broad-except
+        deferred_logger.exception("recovering interrupted deferrals failed")
+    while True:
+        try:
+            await dispatch_due_deferrals(deferred_logger)
+        except Exception:  # pylint: disable=broad-except
+            deferred_logger.exception("deferred-dispatch sweep failed")
+        await asyncio.sleep(5)
 
 
 async def _spin_stale_task_janitor():

@@ -47,4 +47,7 @@ config = {
     # seconds without a state update before a non-terminal task is failed
     # over as orphaned (0 disables the janitor).
     "stale_task_timeout": 1800,
+    # F-293: one-off dispatches starting more than this far ahead are
+    # refused (one shift); see api_server/dispatch_horizon.py.
+    "dispatch_max_lead_s": 8 * 3600,
 }

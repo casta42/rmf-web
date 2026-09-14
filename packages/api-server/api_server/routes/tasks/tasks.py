@@ -1,11 +1,24 @@
 import json
-from datetime import datetime, timedelta
+import logging
+import time
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple, cast
 
 from fastapi import Body, Depends, HTTPException, Path, Query
+from fastapi.responses import JSONResponse
 from reactivex import operators as rxops
 
+from api_server import dispatch_horizon
 from api_server import models as mdl
+from api_server.app_config import app_config
+from api_server.cancel_route import (
+    ROUTE_ALREADY_CANCELED,
+    ROUTE_DISPATCHER,
+    ROUTE_TERMINAL,
+    ROUTE_UNKNOWN,
+    cancel_route,
+    status_tail,
+)
 from api_server.dependencies import (
     between_query,
     finish_time_between_query,
@@ -20,20 +33,13 @@ from api_server.models.rmf_api.task_state import Cancellation
 from api_server.models.rmf_api.task_state import Status2 as DispatchStatus
 from api_server.repositories import FleetRepository, TaskRepository, task_repo_dep
 from api_server.response import RawJSONResponse
-from api_server.cancel_route import (
-    ROUTE_ALREADY_CANCELED,
-    ROUTE_DISPATCHER,
-    ROUTE_TERMINAL,
-    ROUTE_UNKNOWN,
-    cancel_route,
-    status_tail,
-)
 from api_server.rmf_io import cancellation as task_cancellation
 from api_server.rmf_io import task_events, tasks_service
 from api_server.routes import zones as zones_routes
 from api_server.routes.tasks import dispatch_guard
 
 router = FastIORouter(tags=["Tasks"])
+logger = logging.getLogger("api_server.tasks")
 
 
 @router.get("/{task_id}/request", response_model=mdl.TaskRequest)
@@ -227,6 +233,11 @@ async def post_cancel_task(
     request: mdl.CancelTaskRequest = Body(...),
     task_repo: TaskRepository = Depends(task_repo_dep),
 ):
+    # F-293: a mission the api-server is still holding for its start was
+    # never sent to the fleet — its cancel is ours alone.
+    if request.task_id.startswith(DEFERRED_PREFIX):
+        return await _cancel_deferred(request.task_id,
+                                      list(request.labels or []))
     # F-285: an honest answer needs the task's shape first. A task the
     # dispatcher still holds (scheduled for later, or not yet bid on) is
     # answered by NOBODY on the task API topic on this pin — the fleet
@@ -408,6 +419,118 @@ async def guard_patrol_destination(
         )
 
 
+# ----------------------------------------------------------------------
+# F-293 (FR-4 amendment): the dispatch horizon. A one-off mission that
+# starts beyond the derived horizon is held here and released at
+# start - horizon; one more than a shift ahead is refused. See
+# api_server/dispatch_horizon.py.
+# ----------------------------------------------------------------------
+
+DEFERRED_PREFIX = "deferred-"
+DEFERRED_LABEL = "gf:deferred-of"
+
+
+def _ms(moment: datetime) -> int:
+    return round(moment.timestamp() * 1000)
+
+
+def _deferral_view(row: ttm.DeferredDispatch) -> dict:
+    body = row.body if isinstance(row.body, dict) else json.loads(row.body)
+    request = body.get("request") or {}
+    return {
+        "id": row.public_id(),
+        "type": row.request_type,
+        "robot": body.get("robot"),
+        "fleet": body.get("fleet"),
+        "category": request.get("category"),
+        "labels": request.get("labels") or [],
+        "earliest_start_ms": _ms(row.earliest_start),
+        "dispatch_at_ms": _ms(row.dispatch_at),
+        "status": row.status,
+        "task_id": row.task_id,
+        "detail": row.detail,
+        "created_by": row.created_by,
+    }
+
+
+async def _horizon_gate(request_type: str, request, user) -> Optional[JSONResponse]:
+    """None to dispatch now; a 202 JSONResponse when the mission was
+    deferred; raises 422 when it starts more than a shift ahead."""
+    start_ms = request.request.unix_millis_earliest_start_time
+    now_ms = round(time.time() * 1000)
+    horizon, how = dispatch_horizon.horizon_s(zones_routes.derived_nav_graph())
+    max_lead = float(app_config.dispatch_max_lead_s)
+    verdict = dispatch_horizon.classify(start_ms, now_ms, horizon, max_lead)
+    if verdict == dispatch_horizon.NOW:
+        return None
+    lead = (int(start_ms) - now_ms) / 1000.0
+    if verdict == dispatch_horizon.REFUSE:
+        raise HTTPException(
+            422,
+            detail=(
+                f"this mission starts in {dispatch_horizon.human(lead)}, more "
+                f"than one shift ({dispatch_horizon.human(max_lead)}) ahead — "
+                "one-off missions are not held that far out (F-293); create "
+                "a schedule for it instead"
+            ),
+        )
+    dispatch_at = datetime.fromtimestamp(int(start_ms) / 1000.0 - horizon,
+                                         tz=timezone.utc)
+    row = await ttm.DeferredDispatch.create(
+        request_type=request_type,
+        body=json.loads(request.model_dump_json(exclude_none=True)),
+        earliest_start=datetime.fromtimestamp(int(start_ms) / 1000.0,
+                                              tz=timezone.utc),
+        dispatch_at=dispatch_at,
+        created_by=user.username,
+    )
+    detail = (
+        f"this mission starts in {dispatch_horizon.human(lead)}, beyond the "
+        f"{dispatch_horizon.human(horizon)} dispatch horizon ({how}); it is "
+        f"held by GentleFleet and sent to the fleet in "
+        f"{dispatch_horizon.human(lead - horizon)}, so no robot waits for "
+        f"it (F-293). Cancel it with task id {row.public_id()}."
+    )
+    logger.info("F-293: deferred %s (%s) — %s", row.public_id(),
+                request_type, detail)
+    return JSONResponse(
+        status_code=202,
+        content={"success": True, "deferred": _deferral_view(row),
+                 "horizon_s": horizon, "detail": detail},
+    )
+
+
+async def _dispatch_task_now(request: mdl.DispatchTaskRequest,
+                             task_repo: TaskRepository) -> mdl.TaskDispatchResponse:
+    await guard_patrol_destination(request.request, task_repo)
+    resp = mdl.TaskDispatchResponse.model_validate_json(
+        await tasks_service().call(request.model_dump_json(exclude_none=True))
+    )
+    if resp.root.success:
+        task_state = cast(mdl.TaskDispatchResponse1, resp.root).state
+        await task_repo.save_task_state(task_state)
+        await task_repo.save_task_request(task_state.booking.id, request.request)
+    return resp
+
+
+async def _robot_task_now(request: mdl.RobotTaskRequest,
+                          task_repo: TaskRepository) -> mdl.RobotTaskResponse:
+    # Same F-34 guard as dispatch_task, minus the target robot itself —
+    # a robot already parked at its destination (send-to-charger from the
+    # charger, F-62) is not in its own way.
+    await guard_patrol_destination(
+        request.request, task_repo, exclude=f"{request.fleet}/{request.robot}"
+    )
+    resp = mdl.RobotTaskResponse.model_validate_json(
+        await tasks_service().call(request.model_dump_json(exclude_none=True))
+    )
+    if resp.root.root.success:
+        await task_repo.save_task_state(
+            cast(mdl.TaskDispatchResponse1, resp.root.root).state
+        )
+    return resp
+
+
 @router.post(
     "/dispatch_task",
     response_model=mdl.TaskDispatchResponse,
@@ -417,15 +540,13 @@ async def post_dispatch_task(
     request: mdl.DispatchTaskRequest = Body(...),
     task_repo: TaskRepository = Depends(task_repo_dep),
 ):
-    await guard_patrol_destination(request.request, task_repo)
-    resp = mdl.TaskDispatchResponse.model_validate_json(
-        await tasks_service().call(request.model_dump_json(exclude_none=True))
-    )
+    deferred = await _horizon_gate("dispatch_task_request", request,
+                                   task_repo.user)
+    if deferred is not None:
+        return deferred
+    resp = await _dispatch_task_now(request, task_repo)
     if not resp.root.success:
         return RawJSONResponse(resp.model_dump_json(), 400)
-    task_state = cast(mdl.TaskDispatchResponse1, resp.root).state
-    await task_repo.save_task_state(task_state)
-    await task_repo.save_task_request(task_state.booking.id, request.request)
     return resp
 
 
@@ -438,21 +559,134 @@ async def post_robot_task(
     request: mdl.RobotTaskRequest = Body(...),
     task_repo: TaskRepository = Depends(task_repo_dep),
 ):
-    # Same F-34 guard as dispatch_task, minus the target robot itself —
-    # a robot already parked at its destination (send-to-charger from the
-    # charger, F-62) is not in its own way.
-    await guard_patrol_destination(
-        request.request, task_repo, exclude=f"{request.fleet}/{request.robot}"
-    )
-    resp = mdl.RobotTaskResponse.model_validate_json(
-        await tasks_service().call(request.model_dump_json(exclude_none=True))
-    )
+    deferred = await _horizon_gate("robot_task_request", request,
+                                   task_repo.user)
+    if deferred is not None:
+        return deferred
+    resp = await _robot_task_now(request, task_repo)
     if not resp.root.root.success:
         return RawJSONResponse(resp.model_dump_json(), 400)
-    await task_repo.save_task_state(
-        cast(mdl.TaskDispatchResponse1, resp.root.root).state
-    )
     return resp
+
+
+@router.get("/deferred")
+async def get_deferred_tasks(
+    status: Optional[str] = Query(
+        None, description="pending | dispatched | canceled | failed; all when omitted"),
+):
+    """F-293: missions the api-server is holding for their start, and
+    what became of the recent ones."""
+    query = ttm.DeferredDispatch.all()
+    if status:
+        query = query.filter(status=status)
+    rows = await query.order_by("dispatch_at").limit(500)
+    return [_deferral_view(row) for row in rows]
+
+
+async def _cancel_deferred(public_id: str, labels: List[str]):
+    try:
+        row_id = int(public_id[len(DEFERRED_PREFIX):])
+    except ValueError:
+        raise HTTPException(404, detail=f"task [{public_id}] is not known to this site")
+    claimed = await ttm.DeferredDispatch.filter(
+        id=row_id, status=ttm.deferred_dispatch.PENDING).update(
+        status=ttm.deferred_dispatch.CANCELED,
+        detail="canceled before dispatch: " + ("; ".join(labels) or "no reason given"))
+    row = await ttm.DeferredDispatch.get_or_none(id=row_id)
+    if row is None:
+        raise HTTPException(404, detail=f"task [{public_id}] is not known to this site")
+    if claimed:
+        logger.info("F-293: deferred %s canceled before dispatch", public_id)
+        return RawJSONResponse(json.dumps({
+            "success": True,
+            "detail": "canceled before dispatch — the mission was held by "
+                      "GentleFleet and was never sent to the fleet (F-293)",
+        }).encode())
+    if row.status == ttm.deferred_dispatch.CANCELED:
+        return RawJSONResponse(json.dumps(
+            {"success": True, "detail": "task is already canceled"}).encode())
+    if row.status == ttm.deferred_dispatch.DISPATCHED and row.task_id:
+        raise HTTPException(
+            409, detail=(f"[{public_id}] has already been sent to the fleet as "
+                         f"[{row.task_id}] — cancel that task"))
+    raise HTTPException(
+        409, detail=f"[{public_id}] is {row.status} and cannot be canceled")
+
+
+async def dispatch_due_deferrals(log: logging.Logger,
+                                 now: Optional[datetime] = None) -> int:
+    """Send every deferred mission whose release time has come. The gate
+    is bypassed (a released mission is by construction inside the
+    horizon; re-deriving it against a changed graph must never defer it
+    twice). Returns how many were released."""
+    from api_server.models import User
+
+    now = now or datetime.now(timezone.utc)
+    due = await ttm.DeferredDispatch.filter(
+        status=ttm.deferred_dispatch.PENDING, dispatch_at__lte=now
+    ).order_by("dispatch_at")
+    released = 0
+    for row in due:
+        claimed = await ttm.DeferredDispatch.filter(
+            id=row.id, status=ttm.deferred_dispatch.PENDING
+        ).update(status=ttm.deferred_dispatch.DISPATCHING)
+        if not claimed:
+            continue            # canceled or taken meanwhile
+        body = row.body if isinstance(row.body, dict) else json.loads(row.body)
+        body = json.loads(json.dumps(body))
+        request_body = body.setdefault("request", {})
+        labels = list(request_body.get("labels") or [])
+        labels.append(f"{DEFERRED_LABEL}={row.public_id()}")
+        request_body["labels"] = labels
+        user = await User.load_from_db(row.created_by)
+        status, task_id, detail = ttm.deferred_dispatch.FAILED, None, None
+        if user is None:
+            detail = f"user [{row.created_by}] no longer exists"
+        else:
+            repo = TaskRepository(user)
+            try:
+                if row.request_type == "robot_task_request":
+                    resp = await _robot_task_now(
+                        mdl.RobotTaskRequest(**body), repo)
+                    root = resp.root.root
+                else:
+                    resp = await _dispatch_task_now(
+                        mdl.DispatchTaskRequest(**body), repo)
+                    root = resp.root
+                if root.success:
+                    status = ttm.deferred_dispatch.DISPATCHED
+                    task_id = cast(mdl.TaskDispatchResponse1, root).state.booking.id
+                else:
+                    detail = "the fleet refused it: " + json.dumps(
+                        json.loads(resp.model_dump_json()).get("errors"))
+            except HTTPException as exc:
+                detail = f"refused at dispatch time: {exc.detail}"
+            except Exception as exc:  # pylint: disable=broad-except
+                detail = f"dispatch failed: {exc}"
+        await ttm.DeferredDispatch.filter(id=row.id).update(
+            status=status, task_id=task_id, detail=detail)
+        if status == ttm.deferred_dispatch.DISPATCHED:
+            released += 1
+            log.info("F-293: released %s as [%s]", row.public_id(), task_id)
+        else:
+            log.warning("F-293: deferred %s was NOT dispatched — %s",
+                        row.public_id(), detail)
+    return released
+
+
+async def recover_interrupted_deferrals(log: logging.Logger) -> None:
+    """A row caught mid-dispatch by a restart cannot be known to have
+    reached the fleet: it is marked failed with that said, never silently
+    re-sent (a duplicate mission) or silently dropped."""
+    interrupted = await ttm.DeferredDispatch.filter(
+        status=ttm.deferred_dispatch.DISPATCHING)
+    for row in interrupted:
+        await ttm.DeferredDispatch.filter(id=row.id).update(
+            status=ttm.deferred_dispatch.FAILED,
+            detail="the api-server restarted while dispatching it; check the "
+                   f"task ledger for label {DEFERRED_LABEL}={row.public_id()}")
+        log.warning("F-293: deferred %s was interrupted mid-dispatch by a "
+                    "restart — marked failed", row.public_id())
 
 
 @router.post("/interrupt_task", response_model=mdl.TaskInterruptionResponse)
