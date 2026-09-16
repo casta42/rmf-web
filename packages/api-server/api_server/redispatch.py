@@ -12,16 +12,36 @@ request again, labelled with its origin and generation, through the very
 same /tasks/dispatch_task path an operator uses (F-34 guard included).
 
 Bounded by construction: a re-dispatched mission carries its generation
-and the chain stops at MAX_GENERATIONS (the held robot is a
-non-candidate the instant it is idle, so a second hop is already rare;
-eight is a defect signal, logged as such). Terminal states are
-re-broadcast by the fleet, so each origin id is acted on once.
+and the chain stops at MAX_GENERATIONS — eight hand-backs means a robot
+keeps winning a mission it cannot run, which is a defect signal and is
+logged as one.
+
+EXCEPT for a charge hold, which is not a defect (F-319, 2026-09-16).
+That distinction was learned the hard way. The paragraph above used to
+read "the held robot is a non-candidate the instant it is idle, so a
+second hop is already rare" — true while the governor only intercepted
+the rare awarded-while-busy mission. Since D-75 the fleet also refuses
+an award to a held robot AT AWARD, and when every healthy robot is busy
+the planner picks the held one again the moment the mission is back on
+the floor: same robot, same refusal, eight hops in about two minutes,
+mission dead. The drill killed four missions that way.
+
+A charge hold is a WAIT, not a defect: the robot IS charging and WILL
+resume, and the only thing the mission needs is for that to happen. So
+a charge-hold hand-back backs off progressively instead of retrying
+straight away, and is bounded by WALL CLOCK from the first hand-back
+rather than by a hop count — CHARGE_HOLD_MAX_WAIT_S comfortably exceeds
+a full 0.19 -> 0.98 charge (~630 s on the compressed pack). Past that
+bound it IS a defect — a robot that has kept a mission off the floor
+for a quarter of an hour without resuming is wrong — and it stops with
+the same signal. Every other reason keeps the eight-hop cap untouched.
 
 Pure helpers first (unit-tested without a server); the async hook at the
 bottom is what routes/internal.py calls after persisting a task state.
 """
 
 import logging
+import time
 from typing import Iterable, List, Optional
 
 # The marker the fleet adapter puts FIRST in the cancellation labels of
@@ -32,6 +52,22 @@ ORIGIN_LABEL = "gf:redispatch-of="
 GENERATION_LABEL = "gf:redispatch-gen="
 REASON_LABEL = "gf:redispatch-reason="
 MAX_GENERATIONS = 8
+# F-319: the reason prefixes the governor uses when it hands a mission
+# back because a robot is HELD FOR CHARGING — the refusal at award and
+# the first-tick cancel of a stale award. Byte-identical to
+# charge_governor.hold_reason / fleet_adapter._refuse_award.
+CHARGE_HOLD_MARKERS = ("charge hold (F-319)", "charge hold (F-36)")
+WAITING_LABEL = "gf:redispatch-waiting-since="
+# A charge-hold hand-back backs off by this much per hop, capped — long
+# enough for the fleet's state to actually change between attempts (a
+# retry 5 s later meets the same held robot and the same auction).
+CHARGE_HOLD_BACKOFF_STEP_S = 15.0
+CHARGE_HOLD_MAX_BACKOFF_S = 60.0
+# ...and keeps being handed back for at most this long in total. A full
+# charge from the retreat line to the 0.98 resume is ~630 s on the
+# compressed pack, so 15 min outlasts the condition it is waiting on
+# without letting a mission bounce forever.
+CHARGE_HOLD_MAX_WAIT_S = 900.0
 _CANCELED = {"canceled", "killed"}
 # F-291: a child re-dispatched within a second of the fleet's cancel met
 # `[TaskPlanner] Failed to compute assignments` twice (five full robots
@@ -86,6 +122,33 @@ def wants_redispatch(status_value, cancellation_labels: Optional[Iterable[str]]
     return "returned to the fleet by the charge governor"
 
 
+def is_charge_hold(reason: Optional[str]) -> bool:
+    """Is this hand-back a robot waiting to charge, rather than a defect?
+    Matched on the governor's own reason text, which both sides own."""
+    if not reason:
+        return False
+    return any(marker in reason for marker in CHARGE_HOLD_MARKERS)
+
+
+def charge_hold_backoff(generation: int) -> float:
+    """Wait this long before putting a charge-held mission back on the
+    floor. Grows with the hop count so a fleet that is briefly all-held
+    is not re-auctioned every few seconds, and is capped so a mission
+    still gets several attempts inside CHARGE_HOLD_MAX_WAIT_S."""
+    step = CHARGE_HOLD_BACKOFF_STEP_S * max(1, generation)
+    return min(CHARGE_HOLD_MAX_BACKOFF_S, step)
+
+
+def waiting_since_of(labels: Optional[Iterable[str]]) -> Optional[float]:
+    for label in labels or []:
+        if label.startswith(WAITING_LABEL):
+            try:
+                return float(label[len(WAITING_LABEL):])
+            except ValueError:
+                return None
+    return None
+
+
 def generation_of(labels: Optional[Iterable[str]]) -> int:
     for label in labels or []:
         if label.startswith(GENERATION_LABEL):
@@ -104,15 +167,33 @@ def origin_of(labels: Optional[Iterable[str]]) -> Optional[str]:
 
 
 def next_labels(original_labels: Optional[Iterable[str]], origin_id: str,
-                reason: str) -> Optional[List[str]]:
+                reason: str, now_s: Optional[float] = None
+                ) -> Optional[List[str]]:
     """Labels for the re-dispatched request: the operator's own labels
     kept, our bookkeeping labels replaced, generation bumped. None when
-    the chain has reached MAX_GENERATIONS."""
+    the chain has run out.
+
+    Two different bounds, because there are two different situations
+    (F-319). An ordinary hand-back runs out after MAX_GENERATIONS hops:
+    a robot winning a mission it cannot run, eight times, is a defect.
+    A CHARGE HOLD runs out on the clock instead — the robot is charging
+    and will resume, so hops are the wrong unit and counting them kills
+    a mission that only needed to wait."""
     kept = [lab for lab in (original_labels or [])
             if not lab.startswith((ORIGIN_LABEL, GENERATION_LABEL,
-                                   REASON_LABEL))]
+                                   REASON_LABEL, WAITING_LABEL))]
     gen = generation_of(original_labels) + 1
-    if gen > MAX_GENERATIONS:
+    if is_charge_hold(reason):
+        if now_s is None:
+            now_s = time.time()
+        # the clock starts at the FIRST hand-back of this chain
+        since = waiting_since_of(original_labels)
+        if since is None:
+            since = now_s
+        if now_s - since > CHARGE_HOLD_MAX_WAIT_S:
+            return None
+        kept.append(f"{WAITING_LABEL}{since:.0f}")
+    elif gen > MAX_GENERATIONS:
         return None
     kept.append(f"{ORIGIN_LABEL}{origin_id}")
     kept.append(f"{GENERATION_LABEL}{gen}")
@@ -155,6 +236,11 @@ class Redispatcher:
             return None
         if not self._mark(task_id):
             return None
+        if is_charge_hold(reason):
+            # F-319: give the fleet time to stop being all-held. Retrying
+            # after SETTLE_DELAY_S meets the same robot and the same
+            # auction, which is how four missions died in the drill.
+            delay = charge_hold_backoff(generation_of(booking_labels))
         if sleep is None:
             import asyncio
             sleep = asyncio.sleep
@@ -169,10 +255,18 @@ class Redispatcher:
             return None
         labels = next_labels(request.labels, task_id, reason)
         if labels is None:
-            self._logger.error(
-                "re-dispatch: [%s] has been handed back %d times — chain "
-                "stopped (a robot keeps winning a mission it cannot run: "
-                "F-36 governor defect signal)", task_id, MAX_GENERATIONS)
+            if is_charge_hold(reason):
+                self._logger.error(
+                    "re-dispatch: [%s] has been waiting on a charge hold "
+                    "for more than %.0f s — chain stopped. A robot that "
+                    "holds a mission off the floor for this long without "
+                    "resuming is a defect signal (F-319), not a wait",
+                    task_id, CHARGE_HOLD_MAX_WAIT_S)
+            else:
+                self._logger.error(
+                    "re-dispatch: [%s] has been handed back %d times — chain "
+                    "stopped (a robot keeps winning a mission it cannot run: "
+                    "F-36 governor defect signal)", task_id, MAX_GENERATIONS)
             self.refused += 1
             return None
         request = request.model_copy(update={"labels": labels})

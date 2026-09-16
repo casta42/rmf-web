@@ -16,10 +16,21 @@ from typing import List, Optional
 from pydantic import BaseModel
 
 from api_server.redispatch import (
-    GENERATION_LABEL, MAX_GENERATIONS, NO_BID_CODE, ORIGIN_LABEL,
-    REASON_LABEL, REDISPATCH_LABEL, Redispatcher, generation_of, next_labels,
-    origin_of, wants_redispatch, wants_retry,
+    CHARGE_HOLD_MAX_BACKOFF_S, CHARGE_HOLD_MAX_WAIT_S, GENERATION_LABEL,
+    MAX_GENERATIONS, NO_BID_CODE, ORIGIN_LABEL, REASON_LABEL,
+    REDISPATCH_LABEL, Redispatcher, WAITING_LABEL, charge_hold_backoff,
+    generation_of, is_charge_hold, next_labels, origin_of, waiting_since_of,
+    wants_redispatch, wants_retry,
 )
+
+# F-319: the two reasons that mean "a robot is charging", byte-identical
+# to what the fleet adapter writes.
+HOLD_AT_AWARD = ("charge hold (F-319): [gentle_bot_4] is held for charging "
+                 "at award — a held robot is awarded no mission until it "
+                 "resumes; returned to the fleet for re-dispatch")
+HOLD_FIRST_TICK = ("charge hold (F-36): [gentle_bot_6] at SoC 0.31 is below "
+                   "the 0.35 retreat threshold and is held for charging "
+                   "until 0.98; this mission was awarded while it was busy")
 
 REASON = ("charge preemption (F-36): [gentle_bot_3] at SoC 0.17 cannot "
           "finish this mission and still reach [gentle_bot_3_charger] "
@@ -179,6 +190,80 @@ class RedispatcherTest(unittest.TestCase):
 
     async def requests_get(self, task_id):
         return self.requests.get(task_id)
+
+
+class ChargeHoldWaitTest(unittest.TestCase):
+    """F-319: a charge hold is a WAIT, not a defect.
+
+    KNOWN BAD, must not recur: with every healthy robot busy, the planner
+    picks the held robot again the moment the mission is back on the
+    floor. Same robot, same refusal — the old hop cap burned all eight in
+    about two minutes and killed the mission. The drill lost four that
+    way before this existed.
+
+    KNOWN GOOD, must stay untouched: every OTHER reason keeps the
+    eight-hop cap, because eight hand-backs for any other cause really is
+    a robot winning a mission it cannot run.
+    """
+
+    def test_the_charge_hold_reasons_are_recognised(self):
+        self.assertTrue(is_charge_hold(HOLD_AT_AWARD))
+        self.assertTrue(is_charge_hold(HOLD_FIRST_TICK))
+
+    def test_nothing_else_is_mistaken_for_a_charge_hold(self):
+        # the rescue preemption is a real hand-back but NOT a wait: the
+        # robot is going home now, and another robot should take this.
+        self.assertFalse(is_charge_hold(REASON))
+        self.assertFalse(is_charge_hold("robot fault (F-299): [b2] is faulted"))
+        self.assertFalse(is_charge_hold(None))
+        self.assertFalse(is_charge_hold(""))
+
+    def test_a_charge_hold_outlives_the_hop_cap(self):
+        """The defect this fixes: a mission that only needed to wait."""
+        labels = [f"{GENERATION_LABEL}{MAX_GENERATIONS + 4}",
+                  f"{WAITING_LABEL}1000"]
+        out = next_labels(labels, "origin-1", HOLD_AT_AWARD, now_s=1100.0)
+        self.assertIsNotNone(out, "a charge hold must not die on hop count")
+        self.assertEqual(generation_of(out), MAX_GENERATIONS + 5)
+        self.assertEqual(waiting_since_of(out), 1000.0,
+                         "the clock must start at the FIRST hand-back")
+
+    def test_a_charge_hold_still_stops_on_the_clock(self):
+        labels = [f"{WAITING_LABEL}1000"]
+        self.assertIsNone(
+            next_labels(labels, "origin-1", HOLD_AT_AWARD,
+                        now_s=1000.0 + CHARGE_HOLD_MAX_WAIT_S + 1),
+            "a robot that never resumes IS a defect")
+
+    def test_the_clock_starts_on_the_first_hand_back(self):
+        out = next_labels([], "origin-1", HOLD_AT_AWARD, now_s=500.0)
+        self.assertEqual(waiting_since_of(out), 500.0)
+        # ...and is carried down the chain unchanged
+        out2 = next_labels(out, "origin-2", HOLD_AT_AWARD, now_s=800.0)
+        self.assertEqual(waiting_since_of(out2), 500.0)
+
+    def test_every_other_reason_keeps_the_eight_hop_cap(self):
+        """The boring half: this change must not loosen anything else."""
+        capped = [f"{GENERATION_LABEL}{MAX_GENERATIONS}"]
+        self.assertIsNone(next_labels(capped, "origin-1", REASON),
+                          "the rescue-preemption cap must be untouched")
+        self.assertIsNotNone(
+            next_labels([f"{GENERATION_LABEL}{MAX_GENERATIONS - 1}"],
+                        "origin-1", REASON))
+
+    def test_the_wait_outlasts_a_full_charge(self):
+        """0.19 -> 0.98 is ~630 s on the compressed pack; the bound has
+        to comfortably exceed that or the fix does not fix anything."""
+        self.assertGreater(CHARGE_HOLD_MAX_WAIT_S, 630.0)
+
+    def test_the_backoff_grows_and_is_capped(self):
+        first = charge_hold_backoff(0)
+        self.assertGreater(first, 0.0)
+        self.assertGreaterEqual(charge_hold_backoff(2), charge_hold_backoff(1))
+        self.assertEqual(charge_hold_backoff(99), CHARGE_HOLD_MAX_BACKOFF_S)
+        # and several attempts still fit inside the wall-clock bound
+        self.assertGreater(CHARGE_HOLD_MAX_WAIT_S / CHARGE_HOLD_MAX_BACKOFF_S,
+                           4.0)
 
 
 if __name__ == "__main__":
