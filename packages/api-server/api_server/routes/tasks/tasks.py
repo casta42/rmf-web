@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 from reactivex import operators as rxops
 
 from api_server import dispatch_horizon
+from api_server import cordon
 from api_server import models as mdl
 from api_server.app_config import app_config
 from api_server.cancel_route import (
@@ -500,9 +501,35 @@ async def _horizon_gate(request_type: str, request, user) -> Optional[JSONRespon
     )
 
 
+async def guard_cordon(request: mdl.TaskRequest, fleet: Optional[str] = None):
+    """F-332: refuse a mission into an operator's cordon BEFORE queueing it.
+
+    RMF does not refuse it. For a direct task request it estimates the
+    finish state, fails, logs "Unable to estimate final state for direct
+    task request ... still added", and queues it anyway — the operator
+    sees a mission accepted and a robot that never arrives. A failed
+    estimate through a cordon is a refusal, with the reason named.
+
+    `fleet` narrows the check to one fleet (a direct robot task); without
+    it every fleet's cordon is consulted, and a place a fleet's graph does
+    not contain is that fleet's business, not ours. Fail-open like the
+    rest of this module.
+    """
+    places = dispatch_guard.patrol_places(request)
+    if not places:
+        return
+    fleets = [fleet] if fleet else list(cordon.known_fleets())
+    for name in fleets:
+        why = cordon.cordon_refusal(name, places)
+        if why is not None:
+            logger.info("F-332: refusing dispatch into a cordon — %s", why)
+            raise HTTPException(409, detail=why)
+
+
 async def _dispatch_task_now(request: mdl.DispatchTaskRequest,
                              task_repo: TaskRepository) -> mdl.TaskDispatchResponse:
     await guard_patrol_destination(request.request, task_repo)
+    await guard_cordon(request.request)
     resp = mdl.TaskDispatchResponse.model_validate_json(
         await tasks_service().call(request.model_dump_json(exclude_none=True))
     )
@@ -521,6 +548,7 @@ async def _robot_task_now(request: mdl.RobotTaskRequest,
     await guard_patrol_destination(
         request.request, task_repo, exclude=f"{request.fleet}/{request.robot}"
     )
+    await guard_cordon(request.request, fleet=request.fleet)
     resp = mdl.RobotTaskResponse.model_validate_json(
         await tasks_service().call(request.model_dump_json(exclude_none=True))
     )

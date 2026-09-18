@@ -14,11 +14,13 @@ from fastapi import HTTPException
 from rclpy.subscription import Subscription
 from rmf_building_map_msgs.msg import AffineImage as RmfAffineImage
 from rmf_building_map_msgs.msg import BuildingMap as RmfBuildingMap
+from rmf_building_map_msgs.msg import Graph as RmfNavGraph
 from rmf_building_map_msgs.msg import Level as RmfLevel
 from rmf_dispenser_msgs.msg import DispenserState as RmfDispenserState
 from rmf_door_msgs.msg import DoorMode as RmfDoorMode
 from rmf_door_msgs.msg import DoorRequest as RmfDoorRequest
 from rmf_door_msgs.msg import DoorState as RmfDoorState
+from rmf_fleet_msgs.msg import ClosedLanes as RmfClosedLanes
 from rmf_fleet_msgs.msg import FleetState as RmfFleetState
 from rmf_ingestor_msgs.msg import IngestorState as RmfIngestorState
 from rmf_lift_msgs.msg import LiftRequest as RmfLiftRequest
@@ -28,6 +30,7 @@ from rmf_task_msgs.srv import SubmitTask as RmfSubmitTask
 from rosidl_runtime_py.convert import message_to_ordereddict
 from std_msgs.msg import String as RosString
 
+from . import cordon
 from .logger import logger as base_logger
 from .models import BuildingMap, DispenserState, DoorState, IngestorState, LiftState
 from .repositories import CachedFilesRepository, cached_files_repo
@@ -206,6 +209,44 @@ class RmfGateway:
             ),
         )
         self._subscriptions.append(fleet_positions_sub)
+
+        # F-332/F-333: the operator's cordon, so a mission into it is
+        # REFUSED before it is queued rather than accepted and silently
+        # never delivered.
+        #
+        # Both feeds are read, and they must be read together: the lane
+        # indices in `/closed_lanes` are meaningless except against the
+        # fleet's own `/nav_graphs`, which is NOT the derived graph the
+        # F-111 guard uses and NOT the authored building map (F-333 has
+        # the measurement — the same index 16 names three different
+        # pieces of map). TRANSIENT_LOCAL on both, matching the fleet
+        # adapter's publishers, so a restarted api-server knows the
+        # cordon before the next closure rather than after it.
+        nav_graph_sub = ros_node().create_subscription(
+            RmfNavGraph,
+            "nav_graphs",
+            lambda msg: cordon.on_nav_graph(cast(RmfNavGraph, msg)),
+            rclpy.qos.QoSProfile(
+                history=rclpy.qos.HistoryPolicy.KEEP_LAST,
+                depth=10,
+                reliability=rclpy.qos.ReliabilityPolicy.RELIABLE,
+                durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL,
+            ),
+        )
+        self._subscriptions.append(nav_graph_sub)
+
+        closed_lanes_sub = ros_node().create_subscription(
+            RmfClosedLanes,
+            "closed_lanes",
+            lambda msg: cordon.on_closed_lanes(cast(RmfClosedLanes, msg)),
+            rclpy.qos.QoSProfile(
+                history=rclpy.qos.HistoryPolicy.KEEP_LAST,
+                depth=10,
+                reliability=rclpy.qos.ReliabilityPolicy.RELIABLE,
+                durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL,
+            ),
+        )
+        self._subscriptions.append(closed_lanes_sub)
 
     @staticmethod
     def now() -> Optional[RosTime]:
