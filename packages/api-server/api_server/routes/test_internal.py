@@ -572,3 +572,78 @@ class TestStuckDetectorIgnoresFrozenFeeds(unittest.TestCase):
         check_robot_stuck(ROBOT_ID, make_robot_state(), 0)
         new_id, _ = check_robot_stuck(ROBOT_ID, make_robot_state(), self.timeout_millis)
         self.assertIsNotNone(new_id)
+
+
+class TestChargerMessage(unittest.TestCase):
+    """F-338 UI review (2026-09-19): the operator alert for a robot held
+    behind a cordon must name the robot, its charger, the lanes in the
+    way and — in full, every time — what the operator should do about
+    it (DR-3, FR-31).
+
+    The sentence this replaced ended "...or move it yourself" and only
+    mentioned the hold task when the issue carried a `hold_task`, which
+    the adapter could not know at the moment it raises the issue. The
+    clause therefore never appeared, and an operator who took the advice
+    met a hold task that refused them.
+    """
+
+    def _message(self, category, detail):
+        from .internal import _charger_message
+
+        return _charger_message(category, detail)
+
+    UNREACHABLE = {
+        "robot": "gentle_bot_3",
+        "charger": "gentle_bot_3_charger",
+        "lanes": [16, 17],
+        "minutes_to_floor": 5.18,
+        "hold_task": "",
+    }
+
+    def test_it_names_robot_charger_lanes_and_the_remedy(self):
+        msg = self._message("charger_unreachable", self.UNREACHABLE)
+        self.assertIn("gentle_bot_3", msg)
+        self.assertIn("[gentle_bot_3_charger]", msg)
+        self.assertIn("[16, 17]", msg)
+        self.assertIn("5 min of charge left", msg)
+        self.assertIn("Reopen the lanes", msg)
+        self.assertIn("cancel its hold task", msg)
+
+    def test_the_remedy_does_not_depend_on_a_hold_task_id(self):
+        """The known-bad that shipped: no hold_task in the detail and the
+        operator was told to move the robot with no mention of the hold."""
+        without = self._message("charger_unreachable", self.UNREACHABLE)
+        with_id = self._message(
+            "charger_unreachable", dict(self.UNREACHABLE, hold_task="f338-hold-x-1")
+        )
+        self.assertEqual(without, with_id)
+        self.assertIn("cancel its hold task", without)
+
+    def test_no_lanes_says_no_route_rather_than_empty_brackets(self):
+        msg = self._message(
+            "charger_unreachable", dict(self.UNREACHABLE, lanes=[])
+        )
+        self.assertIn("no route to it on the current graph", msg)
+        self.assertNotIn("[]", msg)
+
+    def test_unknown_minutes_omits_the_charge_clause(self):
+        detail = dict(self.UNREACHABLE)
+        detail.pop("minutes_to_floor")
+        msg = self._message("charger_unreachable", detail)
+        self.assertNotIn("charge left", msg)
+        self.assertIn("cancel its hold task", msg)
+
+    def test_the_dead_charger_message_is_untouched(self):
+        """F-337's sentence shares the function and must not move."""
+        msg = self._message(
+            "charger_dead",
+            {
+                "robot": "gentle_bot_3",
+                "charger": "gentle_bot_3_charger",
+                "soc": 0.32,
+                "minutes_to_floor": 12.0,
+            },
+        )
+        self.assertIn("is NOT charging", msg)
+        self.assertIn("Check the charger's power", msg)
+        self.assertNotIn("cancel its hold task", msg)

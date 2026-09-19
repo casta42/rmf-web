@@ -652,14 +652,19 @@ def _charger_message(category: str, detail: dict) -> str:
             if isinstance(minutes, (int, float)) and minutes >= 0 else "")
     if category == "charger_unreachable":
         lanes = detail.get("lanes") or []
-        hold = str(detail.get("hold_task") or "")
         via = (f" — lanes {list(lanes)} are closed" if lanes
                else " — no route to it on the current graph")
+        # The remedy is stated in full every time. The conditional tail
+        # this replaced ("cancel its hold task <id> first") depended on a
+        # hold_task the adapter could not yet know when the issue is
+        # raised, so in practice it never appeared and the operator was
+        # told to move a robot whose hold task would refuse them — and a
+        # raw task id was never the thing to act on anyway: the robot's
+        # own page is (F-338 UI review, 2026-09-19).
         return (
             f"{robot} cannot reach its charger [{charger}]{via}. It is holding "
-            f"where it is and taking no work.{left} Reopen the lanes, or move "
-            f"it yourself"
-            + (f" (cancel its hold task {hold} first)." if hold else ".")
+            f"where it is and taking no work.{left} Reopen the lanes, or "
+            f"cancel its hold task on the robot's page to move it yourself."
         )
     return (
         f"{robot} is on its charger [{charger}] and is NOT charging — its "
