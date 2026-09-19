@@ -501,7 +501,8 @@ async def _horizon_gate(request_type: str, request, user) -> Optional[JSONRespon
     )
 
 
-async def guard_cordon(request: mdl.TaskRequest, fleet: Optional[str] = None):
+async def guard_cordon(request: mdl.TaskRequest, fleet: Optional[str] = None,
+                       robot: Optional[str] = None):
     """F-332: refuse a mission into an operator's cordon BEFORE queueing it.
 
     RMF does not refuse it. For a direct task request it estimates the
@@ -523,6 +524,37 @@ async def guard_cordon(request: mdl.TaskRequest, fleet: Optional[str] = None):
         why = cordon.cordon_refusal(name, places)
         if why is not None:
             logger.info("F-332: refusing dispatch into a cordon — %s", why)
+            raise HTTPException(409, detail=why)
+    # F-338 (G ruling 2026-09-19): a destination whose lanes are open but
+    # whose ROUTE is cut by the cordon is refused too. On this pin a task
+    # whose next stop cannot be routed aborts the whole fleet adapter when
+    # it starts (rmf_task_sequence GoToPlace::generate_header throws), and
+    # a direct request is never bid, so nothing upstream refuses it first.
+    # The check starts from where the robot (or, for a dispatch, ANY robot)
+    # is standing; a robot not on a vertex, or a site with lifts, cannot be
+    # judged and is not.
+    if not cordon.known_fleets():
+        return
+    try:
+        # pylint: disable=import-outside-toplevel
+        from api_server.routes.site_config import robot_positions
+        positions = await robot_positions()
+    except Exception:  # noqa: BLE001 — cannot see, so cannot refuse
+        return
+    if robot is not None:
+        positions = [p for p in positions if str(p.get("name")) == robot]
+    xy = [(float(p["x"]), float(p["y"])) for p in positions]
+    has_lifts = False
+    try:
+        row = await ttm.BuildingMap.first()
+        if row is not None and isinstance(row.data, dict):
+            has_lifts = bool(row.data.get("lifts"))
+    except Exception:  # noqa: BLE001
+        has_lifts = False
+    for name in fleets:
+        why = cordon.reachability_refusal(name, places, xy, has_lifts=has_lifts)
+        if why is not None:
+            logger.info("F-338: refusing a mission the cordon cut off — %s", why)
             raise HTTPException(409, detail=why)
 
 
@@ -548,7 +580,7 @@ async def _robot_task_now(request: mdl.RobotTaskRequest,
     await guard_patrol_destination(
         request.request, task_repo, exclude=f"{request.fleet}/{request.robot}"
     )
-    await guard_cordon(request.request, fleet=request.fleet)
+    await guard_cordon(request.request, fleet=request.fleet, robot=request.robot)
     resp = mdl.RobotTaskResponse.model_validate_json(
         await tasks_service().call(request.model_dump_json(exclude_none=True))
     )

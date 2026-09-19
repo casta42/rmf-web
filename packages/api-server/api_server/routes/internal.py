@@ -516,6 +516,7 @@ async def process_robot_alerts(fleet_state: mdl.FleetState) -> None:
                 alert_events.alerts.on_next(resolved)
 
     await process_fr36_conditions(fleet_state, now_millis)
+    await process_charger_conditions(fleet_state, now_millis)
 
 
 def _fr36_message(category: str, detail: dict) -> str:
@@ -627,6 +628,96 @@ async def process_fr36_conditions(
             continue
         alert_id, _ = _fr36_alerted.pop(episode)
         _fr36_actions.pop(episode, None)
+        resolved = await alert_repo.resolve_alert(alert_id)
+        if resolved is not None:
+            alert_events.alerts.on_next(resolved)
+
+
+# F-338 / F-337 (G ruling 2026-09-19): the fleet adapter raises ONE issue
+# per episode when a robot cannot reach its charger (a cordon in the way)
+# or is on a charger that does not charge it. Each becomes ONE operator
+# alert naming the robot, the charger and what is in the way, resolved
+# when the adapter drops the issue.
+CHARGER_CATEGORIES = frozenset({"charger_unreachable", "charger_dead"})
+_charger_alerted: Dict[str, Tuple[str, str]] = {}  # episode -> (alert_id, cat)
+_charger_stale_swept: set = set()
+
+
+def _charger_message(category: str, detail: dict) -> str:
+    robot = str(detail.get("robot") or "?")
+    charger = str(detail.get("charger") or "its charger")
+    minutes = detail.get("minutes_to_floor")
+    left = (f" It has about {int(minutes)} min of charge left."
+            if isinstance(minutes, (int, float)) and minutes >= 0 else "")
+    if category == "charger_unreachable":
+        lanes = detail.get("lanes") or []
+        hold = str(detail.get("hold_task") or "")
+        via = (f" — lanes {list(lanes)} are closed" if lanes
+               else " — no route to it on the current graph")
+        return (
+            f"{robot} cannot reach its charger [{charger}]{via}. It is holding "
+            f"where it is and taking no work.{left} Reopen the lanes, or move "
+            f"it yourself"
+            + (f" (cancel its hold task {hold} first)." if hold else ".")
+        )
+    return (
+        f"{robot} is on its charger [{charger}] and is NOT charging — its "
+        f"battery has been falling while docked (SoC "
+        f"{detail.get('soc', '?')}).{left} Check the charger's power; there is "
+        f"nowhere else the fleet can send it."
+    )
+
+
+async def process_charger_conditions(
+    fleet_state: mdl.FleetState, now_millis: int
+) -> None:
+    """One alert per charger-condition episode, resolved when it clears
+    (the same shape as process_fr36_conditions, kept separate so a
+    charger alert can never be mistaken for a traffic one)."""
+    fleet = fleet_state.name
+    if fleet not in _charger_stale_swept:
+        _charger_stale_swept.add(fleet)
+        await alert_repo.resolve_alerts_by_prefix(f"charger__{fleet}__")
+    live: Dict[str, Tuple[str, dict, str]] = {}
+    for robot_name, robot in (fleet_state.robots or {}).items():
+        for issue in robot.issues or []:
+            category = str(issue.category or "")
+            if category not in CHARGER_CATEGORIES:
+                continue
+            detail = issue.detail if isinstance(issue.detail, dict) else {}
+            episode = str(detail.get("episode") or "")
+            if not episode:
+                continue
+            live[f"{fleet}--{episode}".replace("/", "-")] = (
+                category, detail, robot_name)
+    for episode, (category, detail, robot_name) in live.items():
+        alerted = _charger_alerted.get(episode)
+        if alerted is not None and alerted[1] == category:
+            if await _refire_due(alerted[0], now_millis):
+                _charger_alerted.pop(episode, None)
+                alerted = None
+            else:
+                continue
+        if alerted is not None:
+            resolved = await alert_repo.resolve_alert(alerted[0])
+            if resolved is not None:
+                alert_events.alerts.on_next(resolved)
+        alert_id = f"charger__{fleet}__{episode}__{now_millis}"
+        _charger_alerted[episode] = (alert_id, category)
+        alert = await alert_repo.create_alert(
+            alert_id,
+            "robot",
+            severity=ttm.Alert.Severity.Critical,
+            fleet=fleet,
+            robot=robot_name,
+            message=_charger_message(category, detail),
+        )
+        if alert is not None:
+            alert_events.alerts.on_next(alert)
+    for episode in list(_charger_alerted):
+        if episode in live or not episode.startswith(f"{fleet}--"):
+            continue
+        alert_id, _ = _charger_alerted.pop(episode)
         resolved = await alert_repo.resolve_alert(alert_id)
         if resolved is not None:
             alert_events.alerts.on_next(resolved)
