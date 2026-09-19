@@ -16,6 +16,7 @@ from .health import (
     RobotHealth,
 )
 from .ingestor_state import IngestorState
+from .lane_closure import LaneClosure
 from .lift_state import LiftState
 from .log import LogMixin
 from .scheduled_task import *

@@ -16,7 +16,7 @@ from fastapi.openapi.docs import (
 from fastapi.staticfiles import StaticFiles
 from tortoise import Tortoise
 
-from . import gateway, ros, routes
+from . import gateway, lane_closures, ros, routes
 from .app_config import app_config
 from .authenticator import AuthenticationError, authenticator, user_dep
 from .fast_io import FastIO
@@ -156,6 +156,9 @@ async def lifespan(_app: FastIO):
     shutdown_cbs.append(ros.shutdown)
 
     gateway.startup()
+    # F-339: the operator's cordon outlives every restart — load it before
+    # the first fleet graph can arrive, so `on_graph` publishes it at once
+    await lane_closures.load()
 
     # shutdown event is not called when the app crashes, this can cause the app to be
     # "locked up" as some dependencies like tortoise does not allow python to exit until
@@ -309,6 +312,10 @@ app.include_router(
 )
 app.include_router(
     routes.admin_router, prefix="/admin", dependencies=[Depends(user_dep)]
+)
+# F-339: durable lane closures (the operator's cordon)
+app.include_router(
+    routes.lanes_router, prefix="/lanes", dependencies=[Depends(user_dep)]
 )
 app.include_router(routes.internal_router, prefix="/_internal")
 

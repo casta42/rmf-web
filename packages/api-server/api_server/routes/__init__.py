@@ -7,6 +7,7 @@ from .doors import router as doors_router
 from .fleets import router as fleets_router
 from .ingestors import router as ingestors_router
 from .internal import router as internal_router
+from .lanes import router as lanes_router
 from .lifts import router as lifts_router
 from .main import router as main_router
 from .site_config import router as site_config_router

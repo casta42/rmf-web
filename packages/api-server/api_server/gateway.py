@@ -3,7 +3,9 @@
 import asyncio
 import base64
 import hashlib
+import json
 import logging
+import time
 from typing import Any, List, Optional, cast
 
 import rclpy
@@ -22,6 +24,7 @@ from rmf_door_msgs.msg import DoorRequest as RmfDoorRequest
 from rmf_door_msgs.msg import DoorState as RmfDoorState
 from rmf_fleet_msgs.msg import ClosedLanes as RmfClosedLanes
 from rmf_fleet_msgs.msg import FleetState as RmfFleetState
+from rmf_fleet_msgs.msg import LaneRequest as RmfLaneRequest
 from rmf_ingestor_msgs.msg import IngestorState as RmfIngestorState
 from rmf_lift_msgs.msg import LiftRequest as RmfLiftRequest
 from rmf_lift_msgs.msg import LiftState as RmfLiftState
@@ -30,7 +33,7 @@ from rmf_task_msgs.srv import SubmitTask as RmfSubmitTask
 from rosidl_runtime_py.convert import message_to_ordereddict
 from std_msgs.msg import String as RosString
 
-from . import cordon
+from . import cordon, lane_closures
 from .logger import logger as base_logger
 from .models import BuildingMap, DispenserState, DoorState, IngestorState, LiftState
 from .repositories import CachedFilesRepository, cached_files_repo
@@ -84,6 +87,13 @@ class RmfGateway:
         self._adapter_lift_req = ros_node().create_publisher(
             RmfLiftRequest, "adapter_lift_requests", transient_qos
         )
+        # F-339: the operator's cordon, LATCHED — a fleet adapter that
+        # starts after the closure was made hears it on discovery, before
+        # it admits a robot. The api-server is the only writer.
+        self._lane_req = ros_node().create_publisher(
+            RmfLaneRequest, "lane_closure_requests", transient_qos
+        )
+        lane_closures.set_publisher(self._publish_lane_request)
         self._submit_task_srv = ros_node().create_client(RmfSubmitTask, "submit_task")
         self._cancel_task_srv = ros_node().create_client(RmfCancelTask, "cancel_task")
 
@@ -222,10 +232,27 @@ class RmfGateway:
         # pieces of map). TRANSIENT_LOCAL on both, matching the fleet
         # adapter's publishers, so a restarted api-server knows the
         # cordon before the next closure rather than after it.
+        def _on_nav_graph(msg):
+            cordon.on_nav_graph(cast(RmfNavGraph, msg))
+            # F-339: a fleet that has just (re)started publishes its graph;
+            # answer with the cordon it must honour
+            lane_closures.on_graph(str(msg.name))
+
+        def _on_closed_lanes(msg):
+            cordon.on_closed_lanes(cast(RmfClosedLanes, msg))
+            # F-339: the fleet's report is the CONFIRMATION; a report that
+            # lacks an intended lane (an adapter reporting [] after a
+            # restart) is answered with the intent, re-asserted
+            lane_closures.on_fleet_confirmation(
+                str(msg.fleet_name),
+                frozenset(int(i) for i in msg.closed_lanes),
+                int(time.time() * 1000),
+            )
+
         nav_graph_sub = ros_node().create_subscription(
             RmfNavGraph,
             "nav_graphs",
-            lambda msg: cordon.on_nav_graph(cast(RmfNavGraph, msg)),
+            _on_nav_graph,
             rclpy.qos.QoSProfile(
                 history=rclpy.qos.HistoryPolicy.KEEP_LAST,
                 depth=10,
@@ -238,7 +265,7 @@ class RmfGateway:
         closed_lanes_sub = ros_node().create_subscription(
             RmfClosedLanes,
             "closed_lanes",
-            lambda msg: cordon.on_closed_lanes(cast(RmfClosedLanes, msg)),
+            _on_closed_lanes,
             rclpy.qos.QoSProfile(
                 history=rclpy.qos.HistoryPolicy.KEEP_LAST,
                 depth=10,
@@ -247,6 +274,40 @@ class RmfGateway:
             ),
         )
         self._subscriptions.append(closed_lanes_sub)
+
+        # F-338: who charges where, from the fleet adapter (the one
+        # authority on it — the api-server has no fleet config). Latched.
+        def _on_chargers(msg):
+            try:
+                payload = json.loads(msg.data)
+                cordon.on_chargers(str(payload.get("fleet") or ""),
+                                   payload.get("chargers") or {})
+            except Exception:  # a malformed message must not take us down
+                pass
+
+        chargers_sub = ros_node().create_subscription(
+            RosString,
+            "gf_chargers",
+            _on_chargers,
+            rclpy.qos.QoSProfile(
+                history=rclpy.qos.HistoryPolicy.KEEP_LAST,
+                depth=10,
+                reliability=rclpy.qos.ReliabilityPolicy.RELIABLE,
+                durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL,
+            ),
+        )
+        self._subscriptions.append(chargers_sub)
+
+    def _publish_lane_request(
+        self, fleet: str, close: List[int], open_: List[int]
+    ) -> None:
+        self._lane_req.publish(
+            RmfLaneRequest(
+                fleet_name=fleet,
+                close_lanes=[int(i) for i in close],
+                open_lanes=[int(i) for i in open_],
+            )
+        )
 
     @staticmethod
     def now() -> Optional[RosTime]:
