@@ -90,8 +90,21 @@ class RmfGateway:
         # F-339: the operator's cordon, LATCHED — a fleet adapter that
         # starts after the closure was made hears it on discovery, before
         # it admits a robot. The api-server is the only writer.
+        # ONE sample of history, deliberately: each message carries the
+        # whole intended set, and a late joiner must hear only the LATEST.
+        # With the shared depth-100 profile the adapter that restarted
+        # after a cordon was lifted replayed the old "close [16, 17]"
+        # first and admitted robots under a cordon that no longer existed
+        # (drill_cordon_persist run 2, f1-n29).
         self._lane_req = ros_node().create_publisher(
-            RmfLaneRequest, "lane_closure_requests", transient_qos
+            RmfLaneRequest,
+            "lane_closure_requests",
+            rclpy.qos.QoSProfile(
+                history=rclpy.qos.HistoryPolicy.KEEP_LAST,
+                depth=1,
+                reliability=rclpy.qos.ReliabilityPolicy.RELIABLE,
+                durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL,
+            ),
         )
         lane_closures.set_publisher(self._publish_lane_request)
         self._submit_task_srv = ros_node().create_client(RmfSubmitTask, "submit_task")
