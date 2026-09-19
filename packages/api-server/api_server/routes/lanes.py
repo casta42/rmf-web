@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from api_server import cordon, lane_closures
+from api_server import cordon, cordon_cut, lane_closures
 from api_server.authenticator import user_dep
 from api_server.models import User
 
@@ -125,6 +125,9 @@ async def post_closures(
         new, already = await lane_closures.close_lanes(
             fleet, body.close, user.username, body.reason
         )
+    cut: List[Dict[str, Any]] = []
+    if body.close:
+        cut = await cordon_cut.cancel_cut_missions(fleet, after)
     released: List[int] = []
     if body.open:
         released = await lane_closures.open_lanes(fleet, body.open, user.username)
@@ -134,4 +137,7 @@ async def post_closures(
         "already_closed": already,
         "opened_now": released,
         "strands": strands,
+        # F-343: missions whose remaining stop this closure cut off are
+        # ended `canceled` with the reason — never left to read completed
+        "cut_missions": cut,
     }

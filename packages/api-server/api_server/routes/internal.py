@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional, Tuple
 from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 
 from api_server import models as mdl
+from api_server import phantom_completion
 from api_server.app_config import app_config
 from api_server.shielded import shielded
 from api_server.interrupted_tasks import (
@@ -927,6 +928,11 @@ async def process_msg(msg: Dict[str, Any], fleet_repo: FleetRepository) -> None:
         # stored rows and broadcasts agree (the canceled-vs-completed race
         # on the dead-robot path can wipe RMF's own field)
         task_cancellation.apply(task_state)
+        # F-343: `completed` is stored only when every phase is completed —
+        # the fleet reports the ACTIVE phase's status as the task's, and a
+        # patrol whose next stop had no route read "completed" for eight
+        # minutes with that stop never begun and the robot still working.
+        phantom_completion.apply(task_state)
         # F-295: the fleet adapter's task_state_update carries NO booking
         # labels on this pin (convert() never parses them), so the first
         # fleet update after an award erased every label the request
