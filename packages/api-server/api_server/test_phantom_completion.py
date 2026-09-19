@@ -59,3 +59,53 @@ def test_apply_leaves_an_honest_completion_alone():
     assert pc.apply(st) is None and st.status == "completed"
     st = _State("canceled", 1, [1], {"1": {}, "2": {}})
     assert pc.apply(st) is None and st.status == "canceled"
+
+
+def test_apply_on_the_real_task_state_model():
+    # the f1-n32 live run skipped every update: phase ids are pydantic
+    # RootModels (`Id`), not ints — the double above was more permissive
+    # than the model, which is the F-336 lesson again
+    from api_server import models as mdl
+
+    state = mdl.TaskState(
+        booking={
+            "id": "task-real",
+            "unix_millis_earliest_start_time": 0,
+            "priority": None,
+            "labels": [],
+        },
+        category="patrol",
+        detail="",
+        status="completed",
+        active=1,
+        completed=[1],
+        phases={
+            "1": {"id": 1, "category": "Go to [place:dropoff_2]"},
+            "2": {"id": 2, "category": "Go to [place:gentle_bot_3_charger]"},
+        },
+        unix_millis_start_time=0,
+        unix_millis_finish_time=0,
+    )
+    assert pc.apply(state) is not None
+    assert str(state.status).split(".")[-1].lower() == "underway"
+    honest = mdl.TaskState(
+        booking={
+            "id": "task-real-2",
+            "unix_millis_earliest_start_time": 0,
+            "priority": None,
+            "labels": [],
+        },
+        category="patrol",
+        detail="",
+        status="completed",
+        active=2,
+        completed=[1, 2],
+        phases={
+            "1": {"id": 1, "category": "Go to [place:dropoff_2]"},
+            "2": {"id": 2, "category": "Go to [place:gentle_bot_3_charger]"},
+        },
+        unix_millis_start_time=0,
+        unix_millis_finish_time=0,
+    )
+    assert pc.apply(honest) is None
+    assert str(honest.status).split(".")[-1].lower() == "completed"

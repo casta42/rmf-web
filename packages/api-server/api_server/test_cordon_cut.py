@@ -61,3 +61,28 @@ def test_no_graph_means_no_judgement():
         )
         == []
     )
+
+
+def test_a_robot_mid_lane_is_judged_from_its_first_stop_onward():
+    # driving to dropoff_2 (nowhere near a vertex) with the charger as its
+    # second stop and the spur closed: the second hop is cut
+    tasks = [
+        {
+            "id": "midlane",
+            "robot_xy": (6.0, 7.6),
+            "places": ["dropoff_2", "gentle_bot_3_charger"],
+        }
+    ]
+    cut = cordon_cut.cut_missions(GRAPH, SPUR, tasks)
+    assert [(c["id"], c["from"], c["to"]) for c in cut] == [
+        ("midlane", "dropoff_2", "gentle_bot_3_charger")
+    ]
+    # same robot, one stop only: the hop into it cannot be judged — left alone
+    assert (
+        cordon_cut.cut_missions(
+            GRAPH,
+            SPUR,
+            [{"id": "one", "robot_xy": (6.0, 7.6), "places": ["gentle_bot_3_charger"]}],
+        )
+        == []
+    )

@@ -34,6 +34,13 @@ logger = base_logger.getChild("PhantomCompletion")
 _reported: Set[str] = set()
 
 
+def _int(value: Any) -> int:
+    """Phase ids in the rmf_api models are pydantic RootModels (`Id`),
+    not ints — the first live run of this guard skipped every update with
+    `int() argument must be ... not 'Id'` (f1-n32). Unwrap them."""
+    return int(getattr(value, "root", value))
+
+
 def honest_status(
     status: Optional[str],
     active: Optional[int],
@@ -44,12 +51,12 @@ def honest_status(
     changed. Pure."""
     if status != "completed" or not phase_ids:
         return status, None
-    done = set(int(i) for i in (completed or []))
-    missing = sorted(int(i) for i in phase_ids if int(i) not in done)
+    done = set(_int(i) for i in (completed or []))
+    missing = sorted(_int(i) for i in phase_ids if _int(i) not in done)
     if not missing:
         return status, None
     where = f"phase {missing[0]} of {len(phase_ids)}"
-    if active is not None and int(active) in done:
+    if active is not None and _int(active) in done:
         where += f" (the fleet still reports phase {active} active)"
     return "underway", (
         f"the fleet reported `completed` while {where} has not been "
@@ -64,7 +71,7 @@ def apply(task_state: Any) -> Optional[str]:
         status = getattr(task_state, "status", None)
         status = status.value if hasattr(status, "value") else status
         phases: Dict[Any, Any] = getattr(task_state, "phases", None) or {}
-        phase_ids = [int(k) for k in phases.keys()]
+        phase_ids = [_int(k) for k in phases.keys()]
         new_status, reason = honest_status(
             status,
             getattr(task_state, "active", None),

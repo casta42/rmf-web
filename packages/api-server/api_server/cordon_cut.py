@@ -58,9 +58,22 @@ def cut_missions(
         if xy is None or not places:
             continue
         start = cordon.nearest_vertex(graph, float(xy[0]), float(xy[1]))
-        if start is None:
-            continue
-        hop = cordon.unreachable_hop(graph, closed, [start], places)
+        if start is not None:
+            hop = cordon.unreachable_hop(graph, closed, [start], places)
+        else:
+            # mid-lane between vertices (the first live run, f1-n32,
+            # skipped exactly this: the robot was driving to its first
+            # stop when the lanes closed). The hop INTO the first stop
+            # cannot be judged from here; the hops after it can, from the
+            # first stop itself.
+            first = cordon._vertex_index(graph, places[0])
+            hop = (
+                cordon.unreachable_hop(graph, closed, [first], places[1:])
+                if first is not None and len(places) > 1
+                else None
+            )
+            if hop is not None:
+                hop = (places[0], hop[1])  # named for the stop, not "the robot"
         if hop is None:
             continue
         out.append({"id": task["id"], "from": hop[0], "to": hop[1]})
