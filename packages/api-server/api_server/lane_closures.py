@@ -249,13 +249,20 @@ def on_fleet_confirmation(fleet: str, closed: FrozenSet[int], now_millis: int) -
 
 def on_graph(fleet: str) -> None:
     """A (new) graph for the fleet arrived: re-resolve and publish the
-    intent so a fleet that just started hears it at once."""
-    if _intent.get(fleet):
-        sent = publish(fleet)
-        if sent is not None:
-            logger.info(
-                "F-339: graph for [%s] received — cordon published: %s", fleet, sent
-            )
+    intent so a fleet that just started hears it at once.
+
+    ALWAYS published, even when the intent is the EMPTY set: the adapter
+    waits for the first latched message before it admits a robot, and
+    "nothing is closed" is an answer it has to hear. The first f1-n28
+    boot published nothing for an empty intent, the adapter waited its
+    45 s and fell back to "no cordon authority answered" — the boring
+    case, a fresh site with nothing closed, is where the guard failed.
+    """
+    sent = publish(fleet)
+    if sent is not None:
+        logger.info(
+            "F-339: graph for [%s] received — cordon published: %s", fleet, sent
+        )
 
 
 def status(fleet: str) -> dict:

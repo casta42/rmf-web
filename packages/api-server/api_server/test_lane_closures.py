@@ -273,3 +273,14 @@ def test_without_a_graph_nothing_is_published_or_judged():
     assert lane_closures.on_fleet_confirmation("gentle_fleet", frozenset(), 1) is False
     assert pub.sent == []
     assert lane_closures.status("gentle_fleet")["graph_known"] is False
+
+
+def test_an_empty_intent_is_still_published_when_the_graph_arrives():
+    # the boring case: a fresh site with nothing closed. The adapter waits
+    # for the first latched message before admitting a robot, so "nothing
+    # is closed" must be said out loud (first f1-n28 boot: it was not)
+    pub = _Publisher()
+    lane_closures.set_publisher(pub)
+    cordon._graphs["gentle_fleet"] = GRAPH
+    lane_closures.on_graph("gentle_fleet")
+    assert pub.sent == [("gentle_fleet", [], [])]
