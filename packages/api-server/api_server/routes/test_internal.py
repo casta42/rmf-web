@@ -607,7 +607,18 @@ class TestChargerMessage(unittest.TestCase):
         self.assertIn("[16, 17]", msg)
         self.assertIn("5 min of charge left", msg)
         self.assertIn("Reopen the lanes", msg)
-        self.assertIn("cancel its hold task", msg)
+        self.assertIn("send it somewhere it can reach", msg)
+
+    def test_the_critical_message_says_it_is_past_saving_itself(self):
+        """F-345: the escalated category, same episode, one open row."""
+        msg = self._message("charger_unreachable_critical", self.UNREACHABLE)
+        self.assertTrue(msg.startswith("URGENT"))
+        self.assertIn("gentle_bot_3", msg)
+        self.assertIn("[gentle_bot_3_charger]", msg)
+        self.assertIn("[16, 17]", msg)
+        self.assertIn("will stop where it stands", msg)
+        self.assertIn("Reopen the lanes NOW", msg)
+        self.assertNotEqual(msg, self._message("charger_unreachable", self.UNREACHABLE))
 
     def test_the_remedy_does_not_depend_on_a_hold_task_id(self):
         """The known-bad that shipped: no hold_task in the detail and the
@@ -617,7 +628,8 @@ class TestChargerMessage(unittest.TestCase):
             "charger_unreachable", dict(self.UNREACHABLE, hold_task="f338-hold-x-1")
         )
         self.assertEqual(without, with_id)
-        self.assertIn("cancel its hold task", without)
+        self.assertIn("send it somewhere it can reach", without)
+        self.assertNotIn("cancel", without)
 
     def test_no_lanes_says_no_route_rather_than_empty_brackets(self):
         msg = self._message(
@@ -631,7 +643,7 @@ class TestChargerMessage(unittest.TestCase):
         detail.pop("minutes_to_floor")
         msg = self._message("charger_unreachable", detail)
         self.assertNotIn("charge left", msg)
-        self.assertIn("cancel its hold task", msg)
+        self.assertIn("send it somewhere it can reach", msg)
 
     def test_the_dead_charger_message_is_untouched(self):
         """F-337's sentence shares the function and must not move."""
@@ -646,4 +658,4 @@ class TestChargerMessage(unittest.TestCase):
         )
         self.assertIn("is NOT charging", msg)
         self.assertIn("Check the charger's power", msg)
-        self.assertNotIn("cancel its hold task", msg)
+        self.assertNotIn("send it somewhere it can reach", msg)

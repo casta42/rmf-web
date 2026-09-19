@@ -639,7 +639,9 @@ async def process_fr36_conditions(
 # or is on a charger that does not charge it. Each becomes ONE operator
 # alert naming the robot, the charger and what is in the way, resolved
 # when the adapter drops the issue.
-CHARGER_CATEGORIES = frozenset({"charger_unreachable", "charger_dead"})
+CHARGER_CATEGORIES = frozenset(
+    {"charger_unreachable", "charger_unreachable_critical", "charger_dead"}
+)
 _charger_alerted: Dict[str, Tuple[str, str]] = {}  # episode -> (alert_id, cat)
 _charger_stale_swept: set = set()
 
@@ -650,6 +652,20 @@ def _charger_message(category: str, detail: dict) -> str:
     minutes = detail.get("minutes_to_floor")
     left = (f" It has about {int(minutes)} min of charge left."
             if isinstance(minutes, (int, float)) and minutes >= 0 else "")
+    if category == "charger_unreachable_critical":
+        # F-345: the rescue line is crossed while held — the robot can no
+        # longer reach its charger above the arrival floor even with the
+        # way open. The hold stands; only the operator can still act.
+        lanes = detail.get("lanes") or []
+        via = (f" — lanes {list(lanes)} are closed" if lanes
+               else " — no route to it on the current graph")
+        return (
+            f"URGENT: {robot} is held with no route to its charger [{charger}]"
+            f"{via} and is now past the point where it could still get there"
+            f" on its own.{left} It will stop where it stands. Reopen the "
+            f"lanes NOW, or send it somewhere it can reach from the robot's "
+            f"page."
+        )
     if category == "charger_unreachable":
         lanes = detail.get("lanes") or []
         via = (f" — lanes {list(lanes)} are closed" if lanes
@@ -663,8 +679,9 @@ def _charger_message(category: str, detail: dict) -> str:
         # own page is (F-338 UI review, 2026-09-19).
         return (
             f"{robot} cannot reach its charger [{charger}]{via}. It is holding "
-            f"where it is and taking no work.{left} Reopen the lanes, or "
-            f"cancel its hold task on the robot's page to move it yourself."
+            f"where it is and taking no work.{left} Reopen the lanes, or send "
+            f"it somewhere it can reach from the robot's page — the fleet "
+            f"releases the hold for that trip."
         )
     return (
         f"{robot} is on its charger [{charger}] and is NOT charging — its "

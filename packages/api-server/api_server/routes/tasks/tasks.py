@@ -10,6 +10,7 @@ from reactivex import operators as rxops
 
 from api_server import dispatch_horizon
 from api_server import cordon
+from api_server import hold_guard
 from api_server import models as mdl
 from api_server.app_config import app_config
 from api_server.cancel_route import (
@@ -239,6 +240,12 @@ async def post_cancel_task(
     if request.task_id.startswith(DEFERRED_PREFIX):
         return await _cancel_deferred(request.task_id,
                                       list(request.labels or []))
+    # F-345: the hold that keeps a robot out of the closed lanes around
+    # its charger is not cancelled by hand — an idle robot there is the
+    # crash window. The way out (a trip it can reach) releases it itself.
+    refusal = hold_guard.cancel_refusal(request.task_id)
+    if refusal:
+        raise HTTPException(409, detail=refusal)
     # F-285: an honest answer needs the task's shape first. A task the
     # dispatcher still holds (scheduled for later, or not yet bid on) is
     # answered by NOBODY on the task API topic on this pin — the fleet
@@ -581,14 +588,44 @@ async def _robot_task_now(request: mdl.RobotTaskRequest,
         request.request, task_repo, exclude=f"{request.fleet}/{request.robot}"
     )
     await guard_cordon(request.request, fleet=request.fleet, robot=request.robot)
+    held_by = await _current_task_of(request.fleet, request.robot)
     resp = mdl.RobotTaskResponse.model_validate_json(
         await tasks_service().call(request.model_dump_json(exclude_none=True))
     )
     if resp.root.root.success:
-        await task_repo.save_task_state(
-            cast(mdl.TaskDispatchResponse1, resp.root.root).state
-        )
+        state = cast(mdl.TaskDispatchResponse1, resp.root.root).state
+        await task_repo.save_task_state(state)
+        # F-345: the robot was HELD (charger behind a cordon). The trip is
+        # now in its queue, so releasing the hold makes the trip current
+        # at once and the robot is never idle — this order, never the
+        # other. The adapter re-holds when the trip ends if the charger
+        # is still cut off.
+        release = hold_guard.hold_release(held_by, str(state.booking.id))
+        if release is not None:
+            try:
+                await tasks_service().call(json.dumps(release))
+                logger.info(
+                    "F-345: released hold [%s] on %s/%s for trip [%s]",
+                    held_by, request.fleet, request.robot, state.booking.id)
+            except Exception as e:  # noqa: BLE001 — the trip is queued either way
+                logger.warning(
+                    "F-345: hold [%s] on %s/%s could not be released for "
+                    "trip [%s]: %s — the trip waits behind it",
+                    held_by, request.fleet, request.robot, state.booking.id, e)
     return resp
+
+
+async def _current_task_of(fleet: str, robot: str) -> str:
+    """The robot's current task id as the fleet last reported it; '' when
+    unknown (never a conviction)."""
+    try:
+        row = await ttm.FleetState.get_or_none(name=fleet)
+    except Exception:  # noqa: BLE001
+        return ""
+    if row is None:
+        return ""
+    data = row.data if isinstance(row.data, dict) else {}
+    return hold_guard.current_task_of(data, robot)
 
 
 @router.post(
