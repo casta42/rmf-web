@@ -13,7 +13,7 @@ from api_server import phantom_completion
 from api_server.app_config import app_config
 from api_server.shielded import shielded
 from api_server.interrupted_tasks import (
-    INTERRUPTED_LABEL, RunBoundary, is_interrupted_row,
+    INTERRUPTED_LABEL, RunBoundary, is_interrupted_row, tasks_named_by,
 )
 from api_server.dispatch_reason import dispatch_failure_reason
 from api_server.redispatch import Redispatcher
@@ -857,6 +857,15 @@ async def sweep_stale_tasks() -> None:
     await _close_interrupted_rows(epoch)
 
 
+async def _tasks_named_by_fleet_states() -> set:
+    try:
+        rows = await ttm.FleetState.all()
+        return tasks_named_by(
+            row.data if isinstance(row.data, dict) else {} for row in rows)
+    except Exception:  # noqa: BLE001 — cannot see, so cannot exempt
+        return set()
+
+
 async def _close_interrupted_rows(epoch) -> None:
     # exclude terminal rows IN the query: updated_at__lt alone matches
     # every historic row, and the unordered LIMIT then never reaches
@@ -871,11 +880,19 @@ async def _close_interrupted_rows(epoch) -> None:
         updated_at__lt=epoch).exclude(
         status__in=terminal).limit(INTERRUPTED_CLOSE_LIMIT)
     closed = []
+    # F-343 (f1-n33): a running task whose next stop has no route goes
+    # SILENT — the fleet re-broadcasts only on change — and this sweep
+    # closed it as "fleet coordination restarted; the core no longer
+    # tracks it" while the robot's own fleet state still named it as its
+    # current task. The claim is checked before it is written.
+    tracked = await _tasks_named_by_fleet_states()
     for row in rows:
         if str(row.id_).startswith("Charge"):
             continue  # F-12 reaper's jurisdiction
         if not is_interrupted_row(row.status, row.updated_at, epoch):
             continue
+        if str(row.id_) in tracked:
+            continue  # the core DOES track it: not interrupted, just quiet
         try:
             task_state = mdl.TaskState(**row.data)
         except Exception:  # noqa: BLE001 — a corrupt row must not stop the sweep

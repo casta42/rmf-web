@@ -28,6 +28,16 @@ NON_TERMINAL = ("queued", "standby", "underway", "delayed", "blocked", "error")
 CUT_LABEL = "gf:cordon-cut"
 
 
+def status_spellings(names) -> List[str]:
+    """The ledger's status column stores the enum repr ('Status.underway')
+    as well as plain values (see F-141's sweep and site_config's
+    _NON_TERMINAL_MATCH) — the first live run of this sweep filtered on
+    the plain spelling and matched NOTHING (f1-n33). Match every spelling."""
+    return [
+        spelling for s in names for spelling in (s, f"Status.{s}", f"TaskStatus.{s}")
+    ]
+
+
 def remaining_places(task_state: Dict[str, Any]) -> List[str]:
     """Places of the phases not yet completed, in order. Pure."""
     phases = task_state.get("phases") or {}
@@ -109,7 +119,7 @@ async def cancel_cut_missions(
             str(p["name"]): (float(p["x"]), float(p["y"]))
             for p in await robot_positions()
         }
-        rows = await ttm.TaskState.filter(status__in=list(NON_TERMINAL))
+        rows = await ttm.TaskState.filter(status__in=status_spellings(NON_TERMINAL))
         tasks: List[Dict[str, Any]] = []
         for row in rows:
             data = row.data if isinstance(row.data, dict) else {}

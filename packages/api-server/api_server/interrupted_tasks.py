@@ -20,6 +20,7 @@ a running server:
     re-announced since the outage began -> the core does not know it ->
     close it as failed, with provenance.
 """
+
 from datetime import datetime
 from typing import Optional
 
@@ -30,8 +31,7 @@ FLEET_SILENCE_GAP = 30.0
 # seconds; wait this long before declaring anything orphaned.
 REANNOUNCE_GRACE = 90.0
 # Terminal states never need closing.
-TERMINAL_STATUSES = {"completed", "failed", "canceled", "killed",
-                     "skipped"}
+TERMINAL_STATUSES = {"completed", "failed", "canceled", "killed", "skipped"}
 # The booking label that carries the provenance into the stored state.
 INTERRUPTED_LABEL = "gf:interrupted=coordination-restart"
 
@@ -40,24 +40,27 @@ class RunBoundary:
     """Coordination-outage detector over the fleet-state cadence."""
 
     def __init__(self):
-        self.last_seen: Optional[float] = None          # monotonic
+        self.last_seen: Optional[float] = None  # monotonic
         self.epoch_started_mono: Optional[float] = None
         self.epoch_started_wall: Optional[datetime] = None
         self.reaped = True
 
     def observe(self, now_mono: float, now_wall: datetime) -> None:
-        if self.last_seen is not None and \
-                now_mono - self.last_seen >= FLEET_SILENCE_GAP:
+        if (
+            self.last_seen is not None
+            and now_mono - self.last_seen >= FLEET_SILENCE_GAP
+        ):
             self.epoch_started_mono = now_mono
             self.epoch_started_wall = now_wall
             self.reaped = False
         self.last_seen = now_mono
 
     def due(self, now_mono: float) -> bool:
-        return (not self.reaped
-                and self.epoch_started_mono is not None
-                and now_mono - self.epoch_started_mono
-                >= REANNOUNCE_GRACE)
+        return (
+            not self.reaped
+            and self.epoch_started_mono is not None
+            and now_mono - self.epoch_started_mono >= REANNOUNCE_GRACE
+        )
 
     def mark_reaped(self) -> None:
         self.reaped = True
@@ -70,9 +73,9 @@ def status_tail(status_value) -> Optional[str]:
     return str(status_value).split(".")[-1].strip().lower()
 
 
-def is_interrupted_row(status_value,
-                       updated_at: Optional[datetime],
-                       epoch_started_wall: datetime) -> bool:
+def is_interrupted_row(
+    status_value, updated_at: Optional[datetime], epoch_started_wall: datetime
+) -> bool:
     """Non-terminal AND silent since the outage began: the restarted
     core does not know this task; its state machine can never close."""
     tail = status_tail(status_value)
@@ -80,8 +83,20 @@ def is_interrupted_row(status_value,
         return False
     if updated_at is None:
         return True
-    if updated_at.tzinfo is None and \
-            epoch_started_wall.tzinfo is not None:
-        updated_at = updated_at.replace(
-            tzinfo=epoch_started_wall.tzinfo)
+    if updated_at.tzinfo is None and epoch_started_wall.tzinfo is not None:
+        updated_at = updated_at.replace(tzinfo=epoch_started_wall.tzinfo)
     return updated_at < epoch_started_wall
+
+
+def tasks_named_by(fleet_states) -> set:
+    """Task ids some robot's fleet state names as its CURRENT task — the
+    core is tracking those, whatever the ledger's row age says (F-343:
+    a task whose next stop has no route goes silent, not away). Pure;
+    `fleet_states` is an iterable of fleet-state dicts."""
+    out = set()
+    for state in fleet_states or []:
+        for robot in ((state or {}).get("robots") or {}).values():
+            task_id = (robot or {}).get("task_id")
+            if task_id:
+                out.add(str(task_id))
+    return out

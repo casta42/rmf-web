@@ -57,7 +57,7 @@ def honest_status(
         return status, None
     where = f"phase {missing[0]} of {len(phase_ids)}"
     if active is not None and _int(active) in done:
-        where += f" (the fleet still reports phase {active} active)"
+        where += f" (the fleet still reports phase {_int(active)} active)"
     return "underway", (
         f"the fleet reported `completed` while {where} has not been "
         f"completed — recorded as underway, not as a success (F-343)"

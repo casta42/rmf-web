@@ -86,3 +86,8 @@ def test_a_robot_mid_lane_is_judged_from_its_first_stop_onward():
         )
         == []
     )
+
+
+def test_status_spellings_cover_the_ledger_enum_repr():
+    spellings = cordon_cut.status_spellings(("underway",))
+    assert "underway" in spellings and "Status.underway" in spellings
