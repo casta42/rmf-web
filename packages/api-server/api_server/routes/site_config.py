@@ -110,6 +110,25 @@ async def robot_positions() -> List[Dict[str, Any]]:
                     "parked": str(name) not in busy,
                 }
             )
+    # FR-42 (k): the robots the fleet may NOT command are bodies too. They
+    # are not in the fleet state (not members), so they come from the
+    # adapter's commissioning feed; the sidecar refuses any apply whose
+    # evacuation or retirement handling would have to MOVE one of them.
+    from api_server import robot_releases  # noqa: PLC0415
+
+    known = {row["name"] for row in out}
+    for row in robot_releases.watch_only_positions():
+        if row["name"] in known:
+            continue
+        out.append(
+            {
+                "name": row["name"],
+                "x": row["x"],
+                "y": row["y"],
+                "parked": True,
+                "watch_only": True,
+            }
+        )
     return out
 
 

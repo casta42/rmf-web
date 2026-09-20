@@ -16,7 +16,7 @@ from fastapi.openapi.docs import (
 from fastapi.staticfiles import StaticFiles
 from tortoise import Tortoise
 
-from . import gateway, lane_closures, ros, routes
+from . import gateway, lane_closures, robot_releases, ros, routes
 from .app_config import app_config
 from .authenticator import AuthenticationError, authenticator, user_dep
 from .fast_io import FastIO
@@ -159,6 +159,15 @@ async def lifespan(_app: FastIO):
     # F-339: the operator's cordon outlives every restart — load it before
     # the first fleet graph can arrive, so `on_graph` publishes it at once
     await lane_closures.load()
+    # FR-42 (f): the release store outlives every restart — loaded before
+    # the first fleet graph can arrive, so `on_graph` answers with it at
+    # once; the maintenance loop runs migration (h), identity (j) and the
+    # instrument alert (f) on the app loop, never in a ROS callback
+    robot_releases.configure(app_config.site)
+    robot_releases.set_alert_repository(routes.internal.alert_repo)
+    await robot_releases.load()
+    release_maintenance = loop.create_task(robot_releases.maintenance_loop())
+    shutdown_cbs.append(release_maintenance.cancel)
 
     # shutdown event is not called when the app crashes, this can cause the app to be
     # "locked up" as some dependencies like tortoise does not allow python to exit until
@@ -316,6 +325,10 @@ app.include_router(
 # F-339: durable lane closures (the operator's cordon)
 app.include_router(
     routes.lanes_router, prefix="/lanes", dependencies=[Depends(user_dep)]
+)
+# FR-42: WATCH-ONLY / commissioning — status for every role, release for admins
+app.include_router(
+    routes.robots_router, prefix="/robots", dependencies=[Depends(user_dep)]
 )
 app.include_router(routes.internal_router, prefix="/_internal")
 

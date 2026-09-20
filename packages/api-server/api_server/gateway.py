@@ -33,7 +33,7 @@ from rmf_task_msgs.srv import SubmitTask as RmfSubmitTask
 from rosidl_runtime_py.convert import message_to_ordereddict
 from std_msgs.msg import String as RosString
 
-from . import cordon, lane_closures
+from . import cordon, lane_closures, robot_releases
 from .logger import logger as base_logger
 from .models import BuildingMap, DispenserState, DoorState, IngestorState, LiftState
 from .repositories import CachedFilesRepository, cached_files_repo
@@ -107,6 +107,21 @@ class RmfGateway:
             ),
         )
         lane_closures.set_publisher(self._publish_lane_request)
+        # FR-42 (f): the release store, LATCHED by its one writer — the
+        # fleet adapter reads it before it admits a robot (the F-339
+        # shape). One sample of history: each message carries the whole
+        # released set and a late joiner must hear only the latest.
+        self._robot_releases = ros_node().create_publisher(
+            RosString,
+            "gf_robot_releases",
+            rclpy.qos.QoSProfile(
+                history=rclpy.qos.HistoryPolicy.KEEP_LAST,
+                depth=1,
+                reliability=rclpy.qos.ReliabilityPolicy.RELIABLE,
+                durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL,
+            ),
+        )
+        robot_releases.set_publisher(self._publish_robot_releases)
         self._submit_task_srv = ros_node().create_client(RmfSubmitTask, "submit_task")
         self._cancel_task_srv = ros_node().create_client(RmfCancelTask, "cancel_task")
 
@@ -250,6 +265,8 @@ class RmfGateway:
             # F-339: a fleet that has just (re)started publishes its graph;
             # answer with the cordon it must honour
             lane_closures.on_graph(str(msg.name))
+            # FR-42: ...and with the released set it admits from
+            robot_releases.on_graph(str(msg.name))
 
         def _on_closed_lanes(msg):
             cordon.on_closed_lanes(cast(RmfClosedLanes, msg))
@@ -298,6 +315,23 @@ class RmfGateway:
             except Exception:  # a malformed message must not take us down
                 pass
 
+        # FR-42: the adapter's commissioning status — every configured
+        # robot's release/admission state and the live readiness facts of
+        # the ones the fleet may not command. Latched at 1 Hz by the
+        # adapter; the release route judges FR-42 (d) against it.
+        watch_only_sub = ros_node().create_subscription(
+            RosString,
+            "gf_watch_only",
+            lambda msg: robot_releases.on_watch_only(cast(RosString, msg).data),
+            rclpy.qos.QoSProfile(
+                history=rclpy.qos.HistoryPolicy.KEEP_LAST,
+                depth=1,
+                reliability=rclpy.qos.ReliabilityPolicy.RELIABLE,
+                durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL,
+            ),
+        )
+        self._subscriptions.append(watch_only_sub)
+
         chargers_sub = ros_node().create_subscription(
             RosString,
             "gf_chargers",
@@ -310,6 +344,9 @@ class RmfGateway:
             ),
         )
         self._subscriptions.append(chargers_sub)
+
+    def _publish_robot_releases(self, fleet: str, payload: dict) -> None:
+        self._robot_releases.publish(RosString(data=json.dumps(payload)))
 
     def _publish_lane_request(
         self, fleet: str, close: List[int], open_: List[int]

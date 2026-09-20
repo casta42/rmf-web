@@ -32,6 +32,10 @@ class AppConfig:
     # DR-3/FR-10: path to the site's zones.yaml served read-only at /zones
     # for the dashboard map overlays. None disables the route (404).
     zones_file: Optional[str] = None
+    # FR-42: the site this server serves (GF_SITE, D-53: never defaulted).
+    # Keys the release store; None means "cannot be keyed" = a named
+    # instrument fault and nobody released.
+    site: Optional[str] = None
     # DR-4/D-17 (proposed D-19): base URL of the localhost-only site-config
     # sidecar the /site_config zone-editor routes proxy to, plus the shared
     # secret authenticating this proxy to it. None disables the routes (404).

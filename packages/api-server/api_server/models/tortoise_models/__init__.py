@@ -19,6 +19,7 @@ from .ingestor_state import IngestorState
 from .lane_closure import LaneClosure
 from .lift_state import LiftState
 from .log import LogMixin
+from .robot_release import ReleaseMigration, RobotRelease
 from .scheduled_task import *
 from .tasks import (
     TaskEventLog,
