@@ -163,7 +163,7 @@ async def lifespan(_app: FastIO):
     # the first fleet graph can arrive, so `on_graph` answers with it at
     # once; the maintenance loop runs migration (h), identity (j) and the
     # instrument alert (f) on the app loop, never in a ROS callback
-    robot_releases.configure(app_config.site)
+    robot_releases.configure(app_config.site, app_config.release_migration)
     robot_releases.set_alert_repository(routes.internal.alert_repo)
     await robot_releases.load()
     release_maintenance = loop.create_task(robot_releases.maintenance_loop())

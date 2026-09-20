@@ -36,6 +36,10 @@ class AppConfig:
     # Keys the release store; None means "cannot be keyed" = a named
     # instrument fault and nobody released.
     site: Optional[str] = None
+    # FR-42 (h): "pending" (this site predates FR-42, migrate once) or
+    # "off" (created at or after it, never migrate). Written once by
+    # install.sh; unset on an unmanaged stack, where the ledger decides.
+    release_migration: Optional[str] = None
     # DR-4/D-17 (proposed D-19): base URL of the localhost-only site-config
     # sidecar the /site_config zone-editor routes proxy to, plus the shared
     # secret authenticating this proxy to it. None disables the routes (404).
