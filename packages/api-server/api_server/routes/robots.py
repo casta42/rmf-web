@@ -78,4 +78,5 @@ async def post_release(
         )
     except robot_releases.ReleaseRefused as refused:
         raise HTTPException(refused.status_code, detail=refused.detail) from refused
-    return {"released": record, **robot_releases.status(fleet)}
+    # `released` in the status is the whole set; the row just written is `record`
+    return {**robot_releases.status(fleet), "record": record}
