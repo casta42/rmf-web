@@ -710,9 +710,17 @@ async def reconcile_identity(fleet: str) -> List[str]:
     if data is None or age is None or age > STATUS_MAX_AGE_S:
         return []
     configured = {str(n) for n in (data.get("configured") or [])}
+    admitted = {str(n) for n in (data.get("admitted") or [])}
     if not configured:
         return []  # an empty roster is "cannot tell", never "delete everything"
-    gone = [name for name in list(_rows.get(fleet, {})) if name not in configured]
+    # a robot the fleet has ADMITTED is in the config by construction —
+    # whatever the roster says (the f1-n39 boot published a roster that
+    # shrank as robots were admitted); its record is never retired here
+    gone = [
+        name
+        for name in list(_rows.get(fleet, {}))
+        if name not in configured and name not in admitted
+    ]
     for name in gone:
         try:
             await ttm.RobotRelease.filter(site=_site, fleet=fleet, robot=name).delete()

@@ -478,3 +478,22 @@ def test_watch_only_positions_are_the_unadmitted_bodies(_clean):
     rows = rr.watch_only_positions()
     assert [r["name"] for r in rows] == ["gentle_bot_1"]
     assert rows[0]["watch_only"] is True and rows[0]["x"] == 3.0
+
+
+def test_identity_never_retires_an_admitted_robot_on_a_shrunken_roster(_clean):
+    """The f1-n39 first-boot shape: the adapter's roster shrank to the
+    unadmitted robots while the admitted ones were absent from it. An
+    admitted robot is in the config by construction; its row stays."""
+    rr.configure(SITE)
+    rr.on_watch_only(
+        _status(configured=("gentle_bot_1", "gentle_bot_2", "gentle_bot_3"))
+    )
+    _run(rr.migrate_if_first(FLEET))
+    rr.on_watch_only(
+        _status(configured=("gentle_bot_3",), admitted=("gentle_bot_1", "gentle_bot_2"))
+    )
+    assert _run(rr.reconcile_identity(FLEET)) == []
+    assert set(rr.released(FLEET)) == {"gentle_bot_1", "gentle_bot_2", "gentle_bot_3"}
+    # a robot truly gone (neither configured nor admitted) is still retired
+    rr.on_watch_only(_status(configured=("gentle_bot_3",), admitted=("gentle_bot_1",)))
+    assert _run(rr.reconcile_identity(FLEET)) == ["gentle_bot_2"]
