@@ -46,6 +46,25 @@ logger = base_logger.getChild("RobotReleases")
 STATUS_MAX_AGE_S = 10.0
 MAINTENANCE_PERIOD_S = 3.0
 
+# FR-42 (h), G ruling 2026-09-20 on F-350: WHICH SITES MAY MIGRATE.
+# The installer records it once, in the site env, and never changes it:
+#   "pending" — this site EXISTED BEFORE FR-42 (install.sh upgrade found
+#               no marker), so its robots were running unreleased by a
+#               fleet that had no such concept: migrate them once so the
+#               site keeps running across the upgrade;
+#   "off"     — this site was CREATED AT OR AFTER FR-42 (install.sh
+#               install wrote the marker), so there is nothing to carry
+#               over: every robot joins WATCH-ONLY and is released by an
+#               admin, which is the customer-onboarding path FR-42 (a)
+#               exists for.
+# Unset means nobody recorded it — an unmanaged stack (the repo's dev
+# compose file, a hand-run container). Then the LEDGER decides: a
+# database with operational history predates FR-42 the same way an
+# upgraded site does; an empty one is a fresh site. Whichever rule
+# decides, it says so in the log.
+MIGRATION_PENDING = "pending"
+MIGRATION_OFF = "off"
+
 ACTOR_ADMIN = "admin"
 ACTOR_HARNESS = "harness"
 ACTOR_MIGRATION = "migration"
@@ -63,6 +82,8 @@ CHECKLIST_LINES = (
 )
 
 _site: Optional[str] = None
+_migration_marker: Optional[str] = None
+_migration_decided: Dict[str, str] = {}  # fleet -> rule that decided
 _rows: Dict[str, Dict[str, dict]] = {}  # fleet -> robot -> row dict
 _migrated: Dict[str, dict] = {}  # fleet -> migration row dict
 _store_fault: Optional[str] = None  # this process could not read
@@ -74,9 +95,17 @@ _instrument_alert: Dict[str, str] = {}  # fleet -> open alert id
 _alert_repo: Any = None
 
 
-def configure(site: Optional[str]) -> None:
-    global _site  # pylint: disable=global-statement
+def configure(site: Optional[str], migration: Optional[str] = None) -> None:
+    global _site, _migration_marker  # pylint: disable=global-statement
     _site = site or None
+    _migration_marker = (migration or "").strip().lower() or None
+    if _migration_marker not in (None, MIGRATION_PENDING, MIGRATION_OFF):
+        logger.error(
+            "FR-42: GF_RELEASE_MIGRATION=%r is not 'pending' or 'off' — "
+            "ignoring it and deciding from the ledger instead",
+            migration,
+        )
+        _migration_marker = None
     if _site is None:
         logger.error(
             "FR-42: no site name configured (GF_SITE) — the release store "
@@ -96,7 +125,10 @@ def set_alert_repository(repo: Any) -> None:
 
 def _reset_for_test() -> None:
     global _site, _store_fault, _seq, _alert_repo  # pylint: disable=global-statement
+    global _migration_marker  # pylint: disable=global-statement
     _site = None
+    _migration_marker = None
+    _migration_decided.clear()
     _rows.clear()
     _migrated.clear()
     _store_fault = None
@@ -642,6 +674,52 @@ async def _audit_alert(
 # ---- maintenance: migration (h), identity (j), instrument alert (f) ---
 
 
+async def _ledger_has_history() -> Optional[bool]:
+    """Does this database predate FR-42 — i.e. was the fleet running
+    before the release store existed? Answered by the one thing a
+    pre-FR-42 site has and a fresh one does not: recorded task history.
+    None means the question could not be asked."""
+    try:
+        return bool(await ttm.TaskState.all().limit(1).count())
+    except Exception as e:  # noqa: BLE001
+        logger.warning("FR-42: could not read task history: %s", e)
+        return None
+
+
+async def may_migrate(fleet: str) -> Tuple[bool, str]:
+    """(may this site migrate, the rule that decided). The marker the
+    installer wrote wins; with no marker the ledger decides; when neither
+    can answer, NOBODY is migrated and the log says what to do — the safe
+    direction is a robot that will not move."""
+    if _migration_marker == MIGRATION_OFF:
+        return False, (
+            "GF_RELEASE_MIGRATION=off — this site was created at or after "
+            "FR-42, so there is nothing to carry over"
+        )
+    if _migration_marker == MIGRATION_PENDING:
+        return True, (
+            "GF_RELEASE_MIGRATION=pending — this site predates FR-42 "
+            "(recorded by install.sh upgrade)"
+        )
+    history = await _ledger_has_history()
+    if history is True:
+        return True, (
+            "no GF_RELEASE_MIGRATION marker (unmanaged stack) and the "
+            "ledger holds task history — this database predates FR-42"
+        )
+    if history is False:
+        return False, (
+            "no GF_RELEASE_MIGRATION marker (unmanaged stack) and the "
+            "ledger is empty — this is a fresh site"
+        )
+    return False, (
+        "no GF_RELEASE_MIGRATION marker and the task history could not be "
+        "read — nobody is migrated. Set GF_RELEASE_MIGRATION=pending in "
+        "the site env if this site predates FR-42, or release each robot "
+        "from its robot page"
+    )
+
+
 async def migrate_if_first(fleet: str) -> Optional[List[str]]:
     """FR-42 (h): ONCE per (site, fleet), on first deployment: the robots
     present in the fleet config at that moment are recorded as released
@@ -654,6 +732,19 @@ async def migrate_if_first(fleet: str) -> Optional[List[str]]:
     data, _ = _status_of(fleet)
     if data is None:
         return None
+    allowed, why = await may_migrate(fleet)
+    if not allowed:
+        if _migration_decided.get(fleet) != why:
+            _migration_decided[fleet] = why
+            logger.warning(
+                "FR-42: fleet [%s] at site [%s] does NOT migrate: %s. Every "
+                "robot joins WATCH-ONLY until an admin releases it.",
+                fleet,
+                _site,
+                why,
+            )
+        return None
+    _migration_decided[fleet] = why
     configured = [str(n) for n in (data.get("configured") or [])]
     now_millis = int(time.time() * 1000)
     try:
@@ -684,11 +775,12 @@ async def migrate_if_first(fleet: str) -> Optional[List[str]]:
     logger.warning(
         "FR-42: MIGRATION at site [%s] fleet [%s]: %d robot(s) recorded as released "
         "because they were present in the fleet config at first deployment: %s. "
-        "A robot added to the config from now on joins WATCH-ONLY.",
+        "A robot added to the config from now on joins WATCH-ONLY. Rule: %s",
         _site,
         fleet,
         len(configured),
         configured,
+        why,
     )
     await _audit_alert(
         f"fr42-migration-{fleet}-{now_millis}",
@@ -853,5 +945,7 @@ def status(fleet: str) -> dict:
         "admitted": list((data or {}).get("admitted") or []),
         "released": released(fleet),
         "migrated": _migrated.get(fleet),
+        "migration_marker": _migration_marker,
+        "migration_rule": _migration_decided.get(fleet),
         "robots": robots,
     }

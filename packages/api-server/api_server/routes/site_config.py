@@ -93,9 +93,17 @@ async def robot_positions() -> List[Dict[str, Any]]:
         )
         if row["assigned_to"]
     }
+    # F-353/D-64: this snapshot decides where robots are MOVED before a
+    # site change lands, and `/fleet_states` republishes a robot's last
+    # accepted pose forever. Each row carries the one freshness verdict
+    # the api-server already holds, so the planner can refuse a robot it
+    # cannot locate instead of evacuating a ghost — or missing one.
+    from api_server.routes.fleets import position_is_stale  # noqa: PLC0415
+
     out: List[Dict[str, Any]] = []
     for row in await DbFleetState.all():
         state = row.data if isinstance(row.data, dict) else {}
+        fleet_name = str(row.name)
         for name, robot in (state.get("robots") or {}).items():
             location = (robot or {}).get("location") or {}
             x = location.get("x")
@@ -108,6 +116,7 @@ async def robot_positions() -> List[Dict[str, Any]]:
                     "x": float(x),
                     "y": float(y),
                     "parked": str(name) not in busy,
+                    "unjudgeable": position_is_stale(fleet_name, str(name)),
                 }
             )
     # FR-42 (k): the robots the fleet may NOT command are bodies too. They
@@ -319,7 +328,9 @@ def remember_retired(candidate: Dict[str, Any], report: Any) -> None:
     if not isinstance(report, dict) or "retired_waypoints" not in report:
         return
     now = _time.monotonic()
-    for key in [k for k, (t, _v) in _RETIRED_CACHE.items() if now - t > _RETIRED_CACHE_TTL_S]:
+    for key in [
+        k for k, (t, _v) in _RETIRED_CACHE.items() if now - t > _RETIRED_CACHE_TTL_S
+    ]:
         _RETIRED_CACHE.pop(key, None)
     while len(_RETIRED_CACHE) >= _RETIRED_CACHE_MAX:
         _RETIRED_CACHE.pop(next(iter(_RETIRED_CACHE)), None)
