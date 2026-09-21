@@ -252,6 +252,74 @@ def task_log_has_error(task_log: mdl.TaskEventLog) -> bool:
     return False
 
 
+TASK_LOG_ERROR_TEXT = "reported an error in its event log"
+
+
+async def alert_on_task_state(task_state: mdl.TaskState, repo):
+    """F-22: only a failed or canceled task alerts, once per task (terminal
+    states may be re-broadcast). F-95: a failure carries the WHY when the
+    dispatcher knows it — a task refused at dispatch time has the
+    adapter's structured errors in dispatch.errors; execution failures do
+    not.
+
+    F-374: one row per task, keyed by the task id (the dashboard's
+    caption for a task alert IS that id). The only row this may replace
+    is an OPEN log-error row for the same task: the terminal verdict,
+    with its reason, says more than "reported an error". A row the
+    operator has resolved, or a terminal alert already raised, is left
+    alone — replacing it would re-open it, because create_alert resets
+    the ack and the resolution."""
+    if task_state.status not in (mdl.TaskStatus.failed, mdl.TaskStatus.canceled):
+        return None
+    task_id = task_state.booking.id
+    existing = await repo.get_alert(task_id)
+    if existing is not None and (
+        existing.unix_millis_resolved_time is not None
+        or TASK_LOG_ERROR_TEXT not in (existing.message or "")
+    ):
+        return None
+    assigned = task_state.assigned_to
+    reason = (
+        dispatch_failure_reason(task_state.dispatch.errors)
+        if task_state.dispatch is not None
+        else None
+    )
+    message = f"Task {task_id} {task_state.status.value}"
+    if task_state.status == mdl.TaskStatus.failed and reason:
+        message = f"{message}: {reason}"
+    return await repo.create_alert(
+        task_id,
+        "task",
+        severity=(
+            ttm.Alert.Severity.Critical
+            if task_state.status == mdl.TaskStatus.failed
+            else ttm.Alert.Severity.Info
+        ),
+        fleet=assigned.group if assigned is not None else None,
+        robot=assigned.name if assigned is not None else None,
+        message=message,
+    )
+
+
+async def alert_on_task_log(task_log: mdl.TaskEventLog, repo):
+    """A task whose event log carries an error alerts ONCE (F-374). The
+    first cut re-created the row on every log update with an error: the
+    same id as the task's failed/canceled alert, and create_alert resets
+    the ack and the resolution — so a task alert the operator resolved
+    came back on the next log update ("the bell will not clear"), and a
+    failure alert's reason was overwritten by this generic line."""
+    if not task_log_has_error(task_log):
+        return None
+    if await repo.alert_exists(task_log.task_id):
+        return None
+    return await repo.create_alert(
+        task_log.task_id,
+        "task",
+        severity=ttm.Alert.Severity.Critical,
+        message=f"Task {task_log.task_id} {TASK_LOG_ERROR_TEXT}",
+    )
+
+
 def check_low_battery(
     robot_id: str, robot: mdl.RobotState, now_millis: int
 ) -> Tuple[Optional[str], Optional[str]]:
@@ -1001,52 +1069,18 @@ async def process_msg(msg: Dict[str, Any], fleet_repo: FleetRepository) -> None:
         # after 2.5 h of traffic) and buried the real ones. Only failed and
         # canceled tasks alert; terminal states may be re-broadcast, so alert
         # once per task.
-        if task_state.status in (
-            mdl.TaskStatus.failed,
-            mdl.TaskStatus.canceled,
-        ):
-            if not await alert_repo.alert_exists(task_state.booking.id):
-                assigned = task_state.assigned_to
-                # F-95: carry the WHY when the dispatcher knows it. A task
-                # refused at dispatch time has the adapter's structured
-                # errors in dispatch.errors; execution failures do not.
-                reason = (
-                    dispatch_failure_reason(task_state.dispatch.errors)
-                    if task_state.dispatch is not None
-                    else None
-                )
-                message = f"Task {task_state.booking.id} {task_state.status.value}"
-                if task_state.status == mdl.TaskStatus.failed and reason:
-                    message = f"{message}: {reason}"
-                alert = await alert_repo.create_alert(
-                    task_state.booking.id,
-                    "task",
-                    severity=(
-                        ttm.Alert.Severity.Critical
-                        if task_state.status == mdl.TaskStatus.failed
-                        else ttm.Alert.Severity.Info
-                    ),
-                    fleet=assigned.group if assigned is not None else None,
-                    robot=assigned.name if assigned is not None else None,
-                    message=message,
-                )
-                if alert is not None:
-                    alert_events.alerts.on_next(alert)
+        alert = await alert_on_task_state(task_state, alert_repo)
+        if alert is not None:
+            alert_events.alerts.on_next(alert)
 
     elif payload_type == "task_log_update":
         task_log = mdl.TaskEventLog(**msg["data"])
         await task_repo.save_task_log(task_log)
         task_events.task_event_logs.on_next(task_log)
 
-        if task_log_has_error(task_log):
-            alert = await alert_repo.create_alert(
-                task_log.task_id,
-                "task",
-                severity=ttm.Alert.Severity.Critical,
-                message=f"Task {task_log.task_id} reported an error in its event log",
-            )
-            if alert is not None:
-                alert_events.alerts.on_next(alert)
+        alert = await alert_on_task_log(task_log, alert_repo)
+        if alert is not None:
+            alert_events.alerts.on_next(alert)
 
     elif payload_type == "fleet_state_update":
         fleet_state = mdl.FleetState(**msg["data"])
