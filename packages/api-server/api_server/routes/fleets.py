@@ -171,6 +171,17 @@ def robot_motion(robot: str, fleet: Optional[str] = None) -> Motion:
     return _motion.motion_of_robot(robot, _t.monotonic(), fleet, stale)
 
 
+@router.get("/charging")
+async def get_charging() -> Dict[str, Any]:
+    """F-386 (D-82): per-robot CHARGING verdict by battery truth, relayed
+    from the fleet adapter — on its own dock by the LIVE pose AND its SoC
+    rising; `null` is "cannot tell", never charging. The Charging chip,
+    state line and map marker read this and nothing else."""
+    from api_server import charging_truth  # pylint: disable=import-outside-toplevel
+
+    return charging_truth.snapshot()
+
+
 @router.get("/position_freshness")
 async def get_position_freshness() -> Dict[str, Any]:
     """Per-robot position freshness (F-268).
