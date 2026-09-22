@@ -3,6 +3,7 @@ import contextlib
 import os
 import signal
 import threading
+import time
 from typing import Any, Callable, Coroutine, Union
 
 import schedule
@@ -16,7 +17,7 @@ from fastapi.openapi.docs import (
 from fastapi.staticfiles import StaticFiles
 from tortoise import Tortoise
 
-from . import gateway, lane_closures, robot_releases, ros, routes
+from . import gateway, internal_tasks, lane_closures, robot_releases, ros, routes
 from .app_config import app_config
 from .authenticator import AuthenticationError, authenticator, user_dep
 from .fast_io import FastIO
@@ -188,6 +189,18 @@ async def lifespan(_app: FastIO):
     await ttm.User.update_or_create(
         {"is_admin": True}, username=app_config.builtin_admin
     )
+
+    # F-379: the bell is what an operator must act on. Archive the open
+    # alerts the fleet's own tasks raised under the old rule (a cancel is
+    # the fleet managing itself); failures stay open. Idempotent.
+    swept = await internal_tasks.sweep_internal_task_alerts(
+        ttm.Alert, round(time.time() * 1000)
+    )
+    if swept:
+        logger.info(
+            f"F-379: archived {swept} open alert(s) raised by the fleet's own "
+            "tasks (not failures) — the bell shows what an operator must act on"
+        )
 
     # Order is important here
     # 1. load states from db, this populate the sio/fast_io rooms with the latest data

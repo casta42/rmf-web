@@ -1,8 +1,8 @@
 # NOTE: This will eventually replace `gateway.py``
+import asyncio
 import math
 import time
 from dataclasses import dataclass
-import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
 
@@ -11,19 +11,23 @@ from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisco
 from api_server import models as mdl
 from api_server import phantom_completion
 from api_server.app_config import app_config
-from api_server.shielded import shielded
-from api_server.interrupted_tasks import (
-    INTERRUPTED_LABEL, RunBoundary, is_interrupted_row, tasks_named_by,
-)
 from api_server.dispatch_reason import dispatch_failure_reason
-from api_server.redispatch import Redispatcher
+from api_server.internal_tasks import pages_operator
+from api_server.interrupted_tasks import (
+    INTERRUPTED_LABEL,
+    RunBoundary,
+    is_interrupted_row,
+    tasks_named_by,
+)
 from api_server.logger import logger as base_logger
 from api_server.models import tortoise_models as ttm
 from api_server.models.rmf_api.robot_state import Status as RobotStatus
+from api_server.redispatch import Redispatcher
 from api_server.repositories import AlertRepository, FleetRepository, TaskRepository
 from api_server.rmf_io import alert_events
 from api_server.rmf_io import cancellation as task_cancellation
 from api_server.rmf_io import fleet_events, rmf_events, task_events
+from api_server.shielded import shielded
 
 # Fault issue categories the fleet adapter raises (RobotCommandHandle
 # `_faults`): these mean the robot is out of service and its tasks were
@@ -272,6 +276,10 @@ async def alert_on_task_state(task_state: mdl.TaskState, repo):
     if task_state.status not in (mdl.TaskStatus.failed, mdl.TaskStatus.canceled):
         return None
     task_id = task_state.booking.id
+    # F-379: the fleet's own tasks (charging trips, holds, retreats) page
+    # the operator only when they FAIL — a cancel is the fleet at work
+    if not pages_operator(task_id, task_state.status == mdl.TaskStatus.failed):
+        return None
     existing = await repo.get_alert(task_id)
     if existing is not None and (
         existing.unix_millis_resolved_time is not None
@@ -309,6 +317,10 @@ async def alert_on_task_log(task_log: mdl.TaskEventLog, repo):
     came back on the next log update ("the bell will not clear"), and a
     failure alert's reason was overwritten by this generic line."""
     if not task_log_has_error(task_log):
+        return None
+    # F-379: an error line in the fleet's own task's log is not a failure;
+    # if that task does fail, its terminal state raises the alert
+    if not pages_operator(task_log.task_id, failed=False):
         return None
     if await repo.alert_exists(task_log.task_id):
         return None
