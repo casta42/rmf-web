@@ -120,7 +120,18 @@ def isolated_place(nav_graph: dict, places: List[str]) -> Optional[str]:
     reject (it may belong to another map)."""
     vertices = nav_graph.get("vertices") or []
     lanes = nav_graph.get("lanes") or []
+    # F-388 (D-24 §5): a place a zone cut off is not in the graph at all
+    # (the fleet's graph drops the orphan) — but the derivation recorded
+    # it, so it is refused here with the same reason, not left for the
+    # fleet to reject as an unknown name.
+    cut_off = {
+        str(entry.get("name"))
+        for entry in nav_graph.get("out_of_service") or []
+        if isinstance(entry, dict)
+    }
     for place in places:
+        if place in cut_off:
+            return place
         index = next(
             (i for i, vertex in enumerate(vertices)
              if vertex.get("name") == place),

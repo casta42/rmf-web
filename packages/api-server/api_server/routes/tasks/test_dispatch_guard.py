@@ -170,6 +170,18 @@ def test_unknown_place_is_left_to_the_fleet():
     assert isolated_place(nav_graph, ["elsewhere"]) is None
 
 
+def test_a_place_a_zone_cut_off_is_refused_by_name():
+    """F-388 (D-24 §5): the fleet's graph drops the orphan, the derivation
+    records it — the guard refuses it with the F-111 reason instead of
+    leaving the fleet to reject an unknown name. Both ways: a place not
+    recorded still passes, and a name no graph knows is still the fleet's."""
+    nav_graph = _graph_with(["j_w1", "j_s2"], [(0, 1)])
+    nav_graph["out_of_service"] = [{"name": "patrol_1", "x": 29.0, "y": 2.6}]
+    assert isolated_place(nav_graph, ["patrol_1"]) == "patrol_1"
+    assert isolated_place(nav_graph, ["j_w1"]) is None
+    assert isolated_place(nav_graph, ["elsewhere"]) is None
+
+
 def test_patrol_places_reads_every_stop_and_fails_open():
     request = TaskRequest(
         category="patrol", description={"places": ["a", "b"], "rounds": 1}

@@ -103,6 +103,44 @@ class TestZonesRoute(AppFixture):
                 # one directed entry only -> one-way
                 self.assertFalse(lanes[(2, 0)]["bidirectional"])
                 self.assertEqual(0.3, lanes[(2, 0)]["params"]["speed_limit"])
+                # F-388: a site with nothing cut off serves an empty list
+                self.assertEqual([], graph["out_of_service"])
+            finally:
+                app_config.zones_file = old
+
+    def test_serves_the_places_a_zone_cut_off(self):
+        """F-388 (D-24 §5): the derivation records a cut-off place under
+        the level's gf_out_of_service key (RMF never reads it); the map is
+        served it with its point and params so it stays drawn."""
+        cut = NAV_GRAPH_YAML + (
+            "    gf_out_of_service:\n"
+            "    - {name: patrol_1, x: 29.0, y: 2.6, params: {is_holding_point: true}}\n"
+        )
+        with tempfile.TemporaryDirectory() as site_dir:
+            zones_path = os.path.join(site_dir, "zones.yaml")
+            with open(zones_path, "w", encoding="utf8") as f:
+                f.write(ZONES_YAML)
+            os.mkdir(os.path.join(site_dir, "nav_graphs"))
+            with open(
+                os.path.join(site_dir, "nav_graphs", "0.yaml"), "w", encoding="utf8"
+            ) as f:
+                f.write(cut)
+            old = app_config.zones_file
+            app_config.zones_file = zones_path
+            try:
+                graph = self.client.get("/zones/nav_graph").json()
+                self.assertEqual(3, len(graph["vertices"]))
+                self.assertEqual(
+                    [
+                        {
+                            "name": "patrol_1",
+                            "x": 29.0,
+                            "y": 2.6,
+                            "params": {"is_holding_point": True},
+                        }
+                    ],
+                    graph["out_of_service"],
+                )
             finally:
                 app_config.zones_file = old
 

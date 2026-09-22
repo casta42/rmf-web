@@ -84,10 +84,29 @@ def _normalize_nav_graph(data: Dict[str, Any]) -> Dict[str, Any]:
             lanes[key] = {"a": u, "b": v, "bidirectional": False, "params": params}
         else:
             entry["bidirectional"] = True
+    # F-388 (D-24 §5, D-82): the named places the derivation could not
+    # serve — a zone closed every route to them. The fleet's graph drops
+    # them (F-186); the apply records them in the same file so the map
+    # keeps them, drawn OUT OF SERVICE, until the zone lifts.
+    out_of_service = []
+    for entry in level.get("gf_out_of_service") or []:
+        if not isinstance(entry, dict) or not entry.get("name"):
+            continue
+        params = dict(entry.get("params") or {})
+        params.pop("name", None)
+        out_of_service.append(
+            {
+                "name": str(entry["name"]),
+                "x": float(entry.get("x", 0.0)),
+                "y": float(entry.get("y", 0.0)),
+                "params": params,
+            }
+        )
     return {
         "level": level_name,
         "vertices": vertices,
         "lanes": list(lanes.values()),
+        "out_of_service": out_of_service,
     }
 
 
