@@ -204,8 +204,18 @@ class TestSiteConfigRoutes(AppFixture):
             positions = kwargs["json"]["robot_positions"]
             self.assertEqual(
                 # D-24 §5: parked=True — no mission rows exist in this
-                # fixture, so the robot counts as parked (evacuable)
-                [{"name": "gentle_bot_2", "x": 9.0, "y": 3.5, "parked": True}],
+                # fixture, so the robot counts as parked (evacuable).
+                # F-353 (d52bfe45): the snapshot carries pose freshness —
+                # a fresh fixture pose is judgeable
+                [
+                    {
+                        "name": "gentle_bot_2",
+                        "x": 9.0,
+                        "y": 3.5,
+                        "parked": True,
+                        "unjudgeable": False,
+                    }
+                ],
                 positions,
             )
         finally:
