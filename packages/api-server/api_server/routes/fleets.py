@@ -85,11 +85,14 @@ async def sub_fleet_log(_req: SubscriptionRequest, name: str):
 from typing import Any, Dict, Optional  # noqa: E402
 
 from api_server.position_freshness import FreshnessWatch  # noqa: E402
+from api_server.robot_motion import Motion, MotionWatch  # noqa: E402
 
 _watch = FreshnessWatch()
 _verdict: Optional[Any] = None
 _poses: Dict[str, Dict[str, Any]] = {}
 _at: Optional[float] = None
+# F-387: pose history for the D-17 guard's motion judgment (robot_motion.py)
+_motion = MotionWatch()
 
 
 def on_fleet_positions(msg, now: Optional[float] = None) -> None:
@@ -108,6 +111,7 @@ def on_fleet_positions(msg, now: Optional[float] = None) -> None:
     for robot in msg.robots:
         key = f"{msg.name}/{robot.name}"
         stamps[key] = robot.location.t.sec + robot.location.t.nanosec * 1e-9
+        _motion.sample(now, key, robot.location.x, robot.location.y)
         _poses[key] = {
             "fleet": msg.name,
             "robot": robot.name,
@@ -122,10 +126,11 @@ def on_fleet_positions(msg, now: Optional[float] = None) -> None:
 
 def _reset_freshness_for_test() -> None:
     """Test seam: forget every verdict, as a fresh process would."""
-    global _watch, _verdict, _at  # pylint: disable=global-statement
+    global _watch, _verdict, _at, _motion  # pylint: disable=global-statement
     _watch = FreshnessWatch()
     _verdict = None
     _at = None
+    _motion = MotionWatch()
     _poses.clear()
 
 
@@ -149,6 +154,21 @@ def position_is_stale(fleet: str, robot: str) -> bool:
     if _verdict.feed_frozen:
         return True
     return f"{fleet}/{robot}" in _verdict.stale_keys
+
+
+def robot_motion(robot: str, fleet: Optional[str] = None) -> Motion:
+    """F-387 (D-82): is the robot a task row names MOVING, STATIONARY, or
+    of UNKNOWN motion? Read from the same `/fleet_states` feed and the same
+    F-268 freshness verdict as everything else in this process: a STALE
+    pose looks perfectly still and is not evidence of stillness."""
+    import time as _t  # pylint: disable=import-outside-toplevel
+
+    if fleet is None:
+        keys = _motion.keys_for(robot)
+        if len(keys) == 1:
+            fleet = keys[0].rsplit("/", 1)[0]
+    stale = position_is_stale(fleet, robot) if fleet else False
+    return _motion.motion_of_robot(robot, _t.monotonic(), fleet, stale)
 
 
 @router.get("/position_freshness")

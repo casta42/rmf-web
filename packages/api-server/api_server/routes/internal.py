@@ -1210,21 +1210,43 @@ async def internal_cancel_missions(request: Request) -> list:
     failures. The sidecar calls this immediately before the restart, so
     a job that failed validation or evacuation never cancels anything.
     Best-effort per task: the restart interrupts the mission either way;
-    what this adds is the honest record."""
+    what this adds is the honest record.
+
+    F-387 (D-82): the guard no longer counts the fleet's own task on a
+    stationary robot as a mission, so an apply or upgrade can restart
+    over it without a hard-confirm — and the restart would leave its row
+    to the F-77 janitor as a "failed" ChargeBattery that never failed.
+    `scope`: "all" (the default, the hard-confirmed path) cancels every
+    non-terminal task; "fleet" cancels only the fleet's own stationary
+    tasks, which the sidecar and the upgrade gate send whenever they
+    restart WITHOUT a hard-confirm. Each is labelled for what it is."""
     from datetime import datetime as _datetime
 
     from api_server import models as _mdl
     from api_server.models.rmf_api.task_state import Cancellation
     from api_server.rmf_io import cancellation as _task_cancellation
     from api_server.rmf_io import tasks_service
-    from api_server.routes.site_config import active_missions
+    from api_server.routes.site_config import FLEET_TASK_NOTE, mission_census
 
     _require_internal_token(request)
     body = await request.json()
     applied_by = str(body.get("applied_by") or "admin")
-    label = "Interrupted by a site configuration change " f"(applied by {applied_by})"
-    missions = await active_missions()
-    for mission in missions:
+    scope = str(body.get("scope") or "all")
+    if scope not in ("all", "fleet"):
+        raise HTTPException(422, f"unknown scope '{scope}' (all | fleet)")
+    mission_label = (
+        "Interrupted by a site configuration change " f"(applied by {applied_by})"
+    )
+    fleet_label = (
+        f"Ended by a coordination restart — {FLEET_TASK_NOTE} "
+        f"(applied by {applied_by})"
+    )
+    census = await mission_census()
+    work = [(m, fleet_label) for m in census["fleet_tasks"]]
+    if scope == "all":
+        work = [(m, mission_label) for m in census["missions"]] + work
+    missions = [m for m, _ in work]
+    for mission, label in work:
         task_id = str(mission.get("task_id") or "")
         if not task_id:
             continue
@@ -1250,10 +1272,12 @@ async def internal_cancel_missions(request: Request) -> list:
                 e,
             )
     logger.info(
-        "D-24: %d mission(s) canceled ahead of a site-change restart "
-        "(applied by %s)",
+        "D-24: %d task(s) canceled ahead of a site-change restart "
+        "(scope %s, applied by %s; %d of them the fleet's own, F-387)",
         len(missions),
+        scope,
         applied_by,
+        len(census["fleet_tasks"]),
     )
     return missions
 

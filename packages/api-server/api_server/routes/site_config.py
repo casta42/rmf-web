@@ -428,8 +428,10 @@ async def _proxy(
     return resp.json()
 
 
-async def active_missions() -> List[Dict[str, Any]]:
-    """Non-terminal missions, for the D-17 guard and its 409 payload."""
+async def nonterminal_tasks() -> List[Dict[str, Any]]:
+    """Every non-terminal task row, operator's and fleet's own alike —
+    what a coordination restart actually interrupts, and what a
+    hard-confirmed apply cancels with an honest record."""
     rows = await DbTaskState.filter(status__in=_NON_TERMINAL_MATCH).values(
         "id_", "status", "assigned_to"
     )
@@ -443,8 +445,66 @@ async def active_missions() -> List[Dict[str, Any]]:
     ]
 
 
+# The fleet's own task on a robot standing still is not a running mission
+# (F-387): the restart re-creates it (the charge governor, the F-87 sweep
+# and RMF's own charging all act again on the new process's first ticks).
+FLEET_TASK_NOTE = "the fleet's own, re-created after the restart"
+
+
+async def mission_census() -> Dict[str, List[Dict[str, Any]]]:
+    """F-387 (G ruling 2026-09-22, D-82): the D-17 guard and the upgrade
+    gate JUDGE BY MOTION.
+
+    `missions` — what blocks: every operator mission, whatever its robot is
+    doing (a queued patrol is lost to a restart as surely as one under
+    way), and the fleet's own task on a robot IN MOTION or whose motion
+    cannot be seen (a stale or missing pose is not evidence of stillness —
+    F-191; the reason is carried so the admin is told why it counts).
+
+    `fleet_tasks` — what does not: the fleet's own task on a robot that is
+    stationary (charging on its dock, holding, waiting), or on no robot at
+    all. Named, never hidden, and never a reason to refuse.
+
+    The internal-task predicate is the bell's (internal_tasks.py, F-379):
+    one list of what the fleet does for itself."""
+    from api_server.internal_tasks import (  # pylint: disable=import-outside-toplevel
+        is_internal_task,
+    )
+    from api_server.routes.fleets import (  # pylint: disable=import-outside-toplevel
+        robot_motion,
+    )
+
+    missions: List[Dict[str, Any]] = []
+    fleet_tasks: List[Dict[str, Any]] = []
+    for entry in await nonterminal_tasks():
+        if not is_internal_task(entry["task_id"]):
+            missions.append(entry)
+            continue
+        robot = entry.get("robot")
+        if not robot:
+            fleet_tasks.append({**entry, "motion": "no robot", "note": FLEET_TASK_NOTE})
+            continue
+        motion = robot_motion(str(robot))
+        if motion.stationary:
+            fleet_tasks.append(
+                {**entry, "motion": motion.state, "note": FLEET_TASK_NOTE}
+            )
+        else:
+            missions.append({**entry, "motion": motion.state, "why": motion.reason})
+    return {"missions": missions, "fleet_tasks": fleet_tasks}
+
+
+async def active_missions() -> List[Dict[str, Any]]:
+    """The missions a coordination restart would interrupt that someone
+    must answer for — the D-17 guard's list, its 409 payload, and the
+    upgrade gate's (via /_internal/active_missions). F-387: judged by
+    motion; see mission_census."""
+    return (await mission_census())["missions"]
+
+
 async def _guard_missions(acknowledged: bool) -> None:
-    missions = await active_missions()
+    census = await mission_census()
+    missions = census["missions"]
     if missions and not acknowledged:
         raise HTTPException(
             409,
@@ -456,6 +516,7 @@ async def _guard_missions(acknowledged: bool) -> None:
                     "first, or confirm the interruption explicitly."
                 ),
                 "missions": missions,
+                "fleet_tasks": census["fleet_tasks"],
             },
         )
 

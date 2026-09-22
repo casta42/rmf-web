@@ -20,6 +20,16 @@ class _FakeResponse:
         return self._json
 
 
+def _census(missions_fn):
+    """F-387: the guard reads mission_census(); lift a missions-list fake
+    into it (no fleet tasks)."""
+
+    async def census():
+        return {"missions": await missions_fn(), "fleet_tasks": []}
+
+    return census
+
+
 def _fake_async_client(recorder, response: _FakeResponse):
     class _FakeClient:
         async def __aenter__(self):
@@ -96,7 +106,7 @@ class TestSiteConfigRoutes(AppFixture):
         with unittest.mock.patch(
             "api_server.routes.site_config.httpx.AsyncClient", fake
         ), unittest.mock.patch(
-            "api_server.routes.site_config.active_missions", fake_active
+            "api_server.routes.site_config.mission_census", _census(fake_active)
         ):
             body = {
                 "candidate": {"base_commit": "abc", "zones": {}},
@@ -130,7 +140,7 @@ class TestSiteConfigRoutes(AppFixture):
         with unittest.mock.patch(
             "api_server.routes.site_config.httpx.AsyncClient", fake
         ), unittest.mock.patch(
-            "api_server.routes.site_config.active_missions", no_missions
+            "api_server.routes.site_config.mission_census", _census(no_missions)
         ):
             body = {
                 "candidate": {"base_commit": "abc", "zones": {}},
@@ -395,7 +405,7 @@ class TestSiteConfigRoutes(AppFixture):
             with unittest.mock.patch(
                 "api_server.routes.site_config.httpx.AsyncClient", fake
             ), unittest.mock.patch(
-                "api_server.routes.site_config.active_missions", no_missions
+                "api_server.routes.site_config.mission_census", _census(no_missions)
             ):
                 resp = self.client.post(
                     "/site_config/apply",
@@ -444,7 +454,7 @@ class TestSiteConfigRoutes(AppFixture):
         with unittest.mock.patch(
             "api_server.routes.site_config.httpx.AsyncClient", fake
         ), unittest.mock.patch(
-            "api_server.routes.site_config.active_missions", no_missions
+            "api_server.routes.site_config.mission_census", _census(no_missions)
         ):
             resp = self.client.post(
                 "/site_config/apply",
@@ -498,6 +508,231 @@ class TestSiteConfigRoutes(AppFixture):
             self.assertEqual("gentle_bot_7", match[0]["robot"])
         finally:
             portal.call(lambda: DbTaskState.filter(id_="f86-boundary-row").delete())
+
+    # ------------------------------------------------------------------
+    # F-387 (G ruling 2026-09-22, D-82): the guard JUDGES BY MOTION. Real
+    # TaskState rows (the F-343 lesson: never a permissive double of the
+    # model); only the motion feed is stubbed, with the module's own
+    # Motion verdicts, and RMF's cancel service.
+    # ------------------------------------------------------------------
+    def _f387_rows(self, rows):
+        from api_server.models import TaskStatus
+        from api_server.models.tortoise_models import TaskState as DbTaskState
+
+        portal = self.get_portal()
+        for task_id, status, robot in rows:
+            portal.call(
+                lambda t=task_id, st=status, r=robot: DbTaskState.update_or_create(
+                    {"data": {}, "status": getattr(TaskStatus, st), "assigned_to": r},
+                    id_=t,
+                )
+            )
+
+        def cleanup():
+            for task_id, _, _ in rows:
+                portal.call(lambda t=task_id: DbTaskState.filter(id_=t).delete())
+
+        self.addCleanup(cleanup)
+        return {r[0] for r in rows}
+
+    def _f387_motion(self, **by_robot):
+        from api_server.robot_motion import MOVING, STATIONARY, UNKNOWN, Motion
+
+        verdicts = {
+            "moving": Motion(MOVING, "it moved 4.10 m in the last 10 s"),
+            "stationary": Motion(STATIONARY, "it has not moved in 10 s"),
+            "stale": Motion(UNKNOWN, "its position is STALE"),
+        }
+
+        def fake(robot, fleet=None):
+            return verdicts.get(
+                by_robot.get(robot, ""),
+                Motion(UNKNOWN, "no position has been received for it"),
+            )
+
+        return unittest.mock.patch("api_server.routes.fleets.robot_motion", fake)
+
+    def _f387_census(self, ids):
+        from api_server.routes.site_config import mission_census
+
+        with_ids = self.get_portal().call(mission_census)
+        return (
+            [m for m in with_ids["missions"] if m["task_id"] in ids],
+            [m for m in with_ids["fleet_tasks"] if m["task_id"] in ids],
+        )
+
+    def test_f387_a_robot_charging_on_its_dock_is_not_a_running_mission(self):
+        """PASSES: the f1-n51 shape — the fleet's own ChargeBattery on a
+        robot standing on its dock. Not a mission, named as the fleet's
+        own, and the apply goes through with no hard-confirm."""
+        ids = self._f387_rows([("Charge4a8a39", "underway", "gentle_bot_5")])
+        with self._f387_motion(gentle_bot_5="stationary"):
+            missions, fleet_tasks = self._f387_census(ids)
+            self.assertEqual([], missions)
+            self.assertEqual(["Charge4a8a39"], [m["task_id"] for m in fleet_tasks])
+            self.assertEqual("stationary", fleet_tasks[0]["motion"])
+            self.assertIn("re-created after the restart", fleet_tasks[0]["note"])
+            calls = []
+            fake = _fake_async_client(calls, _FakeResponse(json_body={"state": "validating"}))
+            with unittest.mock.patch("api_server.routes.site_config.httpx.AsyncClient", fake):
+                resp = self.client.post(
+                    "/site_config/apply",
+                    json={"candidate": {"base_commit": "abc", "zones": {}},
+                          "acknowledge_fleet_pause": True},
+                )
+            self.assertEqual(200, resp.status_code, resp.content)
+            self.assertTrue([c for c in calls if c[1].endswith("/site_config/apply")])
+
+    def test_f387_a_robot_in_motion_on_the_fleets_own_task_is_a_mission(self):
+        """FIRES: the same ChargeBattery on a robot DRIVING home blocks —
+        with the motion and what was seen, so the admin knows why."""
+        ids = self._f387_rows([("Charge77aa01", "underway", "gentle_bot_3")])
+        with self._f387_motion(gentle_bot_3="moving"):
+            missions, fleet_tasks = self._f387_census(ids)
+            self.assertEqual(["Charge77aa01"], [m["task_id"] for m in missions])
+            self.assertEqual("moving", missions[0]["motion"])
+            self.assertIn("moved", missions[0]["why"])
+            self.assertEqual([], fleet_tasks)
+            calls = []
+            fake = _fake_async_client(calls, _FakeResponse(json_body={"state": "validating"}))
+            with unittest.mock.patch("api_server.routes.site_config.httpx.AsyncClient", fake):
+                resp = self.client.post(
+                    "/site_config/apply",
+                    json={"candidate": {"base_commit": "abc", "zones": {}},
+                          "acknowledge_fleet_pause": True},
+                )
+            self.assertEqual(409, resp.status_code, resp.content)
+            detail = resp.json()["detail"]
+            self.assertIn("Charge77aa01", [m["task_id"] for m in detail["missions"]])
+            self.assertEqual(0, len(calls))  # the sidecar was never reached
+
+    def test_f387_an_operator_mission_blocks_whatever_its_robot_is_doing(self):
+        """FIRES: a patrol queued on a robot that is standing still is lost
+        to a restart as surely as one under way — motion never excuses an
+        operator's mission."""
+        ids = self._f387_rows([
+            ("patrol.dispatch-2001", "queued", "gentle_bot_2"),
+            ("a417b316-4ff3-4d5e-b7e3-4387ffd086cd", "underway", "gentle_bot_4"),
+        ])
+        with self._f387_motion(gentle_bot_2="stationary", gentle_bot_4="stationary"):
+            missions, fleet_tasks = self._f387_census(ids)
+        self.assertEqual(ids, {m["task_id"] for m in missions})
+        self.assertEqual([], fleet_tasks)
+        self.assertTrue(all("motion" not in m for m in missions))
+
+    def test_f387_motion_that_cannot_be_seen_counts_as_running(self):
+        """A stale or missing pose is not evidence of stillness (F-191):
+        the fleet's own task on such a robot still counts, and says why."""
+        ids = self._f387_rows([
+            ("f36-retreat-gentle_bot_1-7", "underway", "gentle_bot_1"),
+            ("f338-hold-gentle_bot_6-9", "underway", "gentle_bot_6"),
+        ])
+        with self._f387_motion(gentle_bot_1="stale"):
+            missions, _ = self._f387_census(ids)
+        by_id = {m["task_id"]: m for m in missions}
+        self.assertEqual(ids, set(by_id))
+        self.assertIn("STALE", by_id["f36-retreat-gentle_bot_1-7"]["why"])
+        self.assertIn("no position", by_id["f338-hold-gentle_bot_6-9"]["why"])
+
+    def test_f387_a_fleet_task_on_no_robot_moves_nothing(self):
+        ids = self._f387_rows([("wait.unassigned-1", "queued", None)])
+        with self._f387_motion():
+            missions, fleet_tasks = self._f387_census(ids)
+        self.assertEqual([], missions)
+        self.assertEqual("no robot", fleet_tasks[0]["motion"])
+
+    def test_f387_the_upgrade_gate_sees_only_what_blocks(self):
+        """/_internal/active_missions is what install.sh upgrade counts: the
+        same judgment, the same list (shape unchanged — a list)."""
+        ids = self._f387_rows([
+            ("Charge4a8a40", "underway", "gentle_bot_5"),
+            ("Charge77aa02", "underway", "gentle_bot_3"),
+        ])
+        with self._f387_motion(gentle_bot_5="stationary", gentle_bot_3="moving"):
+            resp = self.client.get(
+                "/_internal/active_missions",
+                headers={"x-gf-internal-token": "test-token"},
+            )
+        self.assertEqual(200, resp.status_code, resp.content)
+        listed = {m["task_id"] for m in resp.json()} & ids
+        self.assertEqual({"Charge77aa02"}, listed)
+
+    def test_f387_a_restart_closes_the_fleets_own_tasks_with_their_own_record(self):
+        """scope=fleet (sent whenever a restart goes ahead WITHOUT a
+        hard-confirm) cancels only the fleet's own stationary tasks, labelled
+        as such; scope=all (the hard-confirmed path) cancels everything,
+        each labelled for what it is; an unknown scope is refused."""
+        ids = self._f387_rows([
+            ("Charge4a8a41", "underway", "gentle_bot_5"),
+            ("patrol.dispatch-2002", "underway", "gentle_bot_2"),
+        ])
+        sent = []
+
+        class _Service:
+            async def call(self, payload):
+                sent.append(payload)
+                return "{}"
+
+        headers = {"x-gf-internal-token": "test-token"}
+        with self._f387_motion(gentle_bot_5="stationary", gentle_bot_2="moving"), \
+                unittest.mock.patch("api_server.rmf_io.tasks_service", lambda: _Service()):
+            resp = self.client.post(
+                "/_internal/cancel_missions",
+                json={"applied_by": "admin", "scope": "fleet"},
+                headers=headers,
+            )
+            self.assertEqual(200, resp.status_code, resp.content)
+            self.assertEqual({"Charge4a8a41"}, {m["task_id"] for m in resp.json()} & ids)
+            fleet_sent = [p for p in sent if "Charge4a8a41" in p]
+            self.assertEqual(1, len(fleet_sent))
+            self.assertIn("re-created after the restart", fleet_sent[0])
+            self.assertFalse([p for p in sent if "patrol.dispatch-2002" in p])
+
+            sent.clear()
+            resp = self.client.post(
+                "/_internal/cancel_missions",
+                json={"applied_by": "admin"},
+                headers=headers,
+            )
+            self.assertEqual(200, resp.status_code, resp.content)
+            self.assertEqual(ids, {m["task_id"] for m in resp.json()} & ids)
+            patrol = [p for p in sent if "patrol.dispatch-2002" in p]
+            self.assertIn("Interrupted by a site configuration change", patrol[0])
+
+            resp = self.client.post(
+                "/_internal/cancel_missions",
+                json={"applied_by": "admin", "scope": "everything"},
+                headers=headers,
+            )
+            self.assertEqual(422, resp.status_code, resp.content)
+
+    def test_f387_motion_is_read_from_the_live_fleet_state_feed(self):
+        """The wiring, not a stub: `robot_motion` answers from what the
+        `/fleet_states` ingest (on_fleet_positions) stored."""
+        import time
+        from types import SimpleNamespace as NS
+
+        from api_server.routes import fleets as fleets_route
+
+        fleets_route._reset_freshness_for_test()
+        self.addCleanup(fleets_route._reset_freshness_for_test)
+
+        def msg(stamp, xs):
+            t = NS(sec=int(stamp), nanosec=int((stamp % 1) * 1e9))
+            return NS(name="gentle_fleet", robots=[
+                NS(name=n, location=NS(t=t, x=x, y=15.5, yaw=0.0, level_name="L1"))
+                for n, x in xs.items()
+            ])
+
+        start = time.monotonic() - 15.0
+        for k in range(150):  # 15 s at 10 Hz, ending now
+            fleets_route.on_fleet_positions(
+                msg(500.0 + k * 0.1, {"gentle_bot_5": 1.5, "gentle_bot_3": 1.5 + 0.05 * k}),
+                now=start + k * 0.1,
+            )
+        self.assertEqual("stationary", fleets_route.robot_motion("gentle_bot_5").state)
+        self.assertEqual("moving", fleets_route.robot_motion("gentle_bot_3").state)
+        self.assertEqual("unknown", fleets_route.robot_motion("gentle_bot_9").state)
 
     def test_non_admin_is_403(self):
         self.client.set_user("operator1")
