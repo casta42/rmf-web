@@ -598,6 +598,7 @@ async def process_robot_alerts(fleet_state: mdl.FleetState) -> None:
 
     await process_fr36_conditions(fleet_state, now_millis)
     await process_charger_conditions(fleet_state, now_millis)
+    await process_stranded_conditions(fleet_state, now_millis)
 
 
 def _fr36_message(category: str, detail: dict) -> str:
@@ -824,6 +825,93 @@ async def process_charger_conditions(
         resolved = await alert_repo.resolve_alert(alert_id)
         if resolved is not None:
             alert_events.alerts.on_next(resolved)
+
+
+# F-391 (G ruling 2026-09-28): a robot the fleet has REFUSED TO RECOVER.
+# The adapter tried to settle it back to the route network and could not —
+# every way home crosses a keep-out, or nothing it may rest on is
+# reachable — so only a person can free it. One alert per episode, the
+# same shape as the charger conditions, resolved when the adapter drops
+# the issue. Before this, the condition was diagnosed in the adapter log
+# and nowhere else: the overview read "Idle · No active task" and the
+# bell was empty while the robot sat stuck (measured 2026-09-22).
+STRANDED_CATEGORY = "robot_stranded_off_graph"
+_stranded_alerted: Dict[str, str] = {}  # episode -> alert_id
+_stranded_stale_swept: set = set()
+
+
+def _stranded_message(detail: dict) -> str:
+    robot = str(detail.get("robot") or "?")
+    zone = str(detail.get("zone") or "")
+    position = detail.get("position")
+    where = (
+        f" at ({float(position[0]):.1f}, {float(position[1]):.1f})"
+        if isinstance(position, (list, tuple)) and len(position) >= 2
+        else ""
+    )
+    why = (
+        f" — every way back to the route network crosses the keep-out "
+        f"area [{zone}]"
+        if zone
+        else " — no waypoint it may rest on can be reached from where it is"
+    )
+    return (
+        f"{robot} is off the route network{where} and the fleet cannot "
+        f"drive it back{why}. It is taking no work and nothing the fleet "
+        f"can do will move it: someone must move the robot clear of the "
+        f"area, onto a lane, or remove the zone from Site settings."
+    )
+
+
+async def process_stranded_conditions(
+    fleet_state: mdl.FleetState, now_millis: int
+) -> None:
+    """One alert per stranded episode, resolved when the robot is back on
+    the graph (the adapter drops the issue)."""
+    fleet = fleet_state.name
+    if fleet not in _stranded_stale_swept:
+        # a previous server life's episodes cannot be resolved by this one
+        _stranded_stale_swept.add(fleet)
+        await alert_repo.resolve_alerts_by_prefix(f"stranded__{fleet}__")
+    live: Dict[str, Tuple[dict, str]] = {}
+    for robot_name, robot in (fleet_state.robots or {}).items():
+        for issue in robot.issues or []:
+            if str(issue.category or "") != STRANDED_CATEGORY:
+                continue
+            detail = issue.detail if isinstance(issue.detail, dict) else {}
+            episode = str(detail.get("episode") or "")
+            if not episode:
+                continue
+            live[f"{fleet}--{episode}".replace("/", "-")] = (detail, robot_name)
+    for episode, (detail, robot_name) in live.items():
+        if episode in _stranded_alerted:
+            if not await _refire_due(_stranded_alerted[episode], now_millis):
+                continue
+            _stranded_alerted.pop(episode, None)
+        alert_id = f"stranded__{fleet}__{episode}__{now_millis}"
+        _stranded_alerted[episode] = alert_id
+        alert = await alert_repo.create_alert(
+            alert_id,
+            "robot",
+            severity=ttm.Alert.Severity.Critical,
+            fleet=fleet,
+            robot=robot_name,
+            message=_stranded_message(detail),
+        )
+        if alert is not None:
+            alert_events.alerts.on_next(alert)
+    for episode in list(_stranded_alerted):
+        if episode in live or not episode.startswith(f"{fleet}--"):
+            continue
+        alert_id = _stranded_alerted.pop(episode)
+        resolved = await alert_repo.resolve_alert(alert_id)
+        if resolved is not None:
+            alert_events.alerts.on_next(resolved)
+
+
+def _reset_stranded_for_test() -> None:
+    _stranded_alerted.clear()
+    _stranded_stale_swept.clear()
 
 
 def classify_charge_ghost(robot: mdl.RobotState, task_id: str) -> Optional[str]:
