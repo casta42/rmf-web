@@ -7,6 +7,7 @@ from rmf_task_msgs.srv import GetDispatchStates
 
 from api_server import clock
 from api_server.authenticator import user_dep
+from api_server.build_identity import build_identity
 from api_server.models import Permission, User
 from api_server.models.tortoise_models import ResourcePermission
 from api_server.ros import ros_node
@@ -62,6 +63,27 @@ async def get_time():
     Get the current rmf time in unix milliseconds
     """
     return clock.now()
+
+
+@router.get("/health")
+async def get_health():
+    """F4.2 (FR-30): liveness, and which RELEASE this server runs.
+
+    Unauthenticated, like every health probe — so it carries the release
+    version and nothing more. The full build identity (the product commit,
+    the RMF pin, the upstream patches) is fingerprinting material and is
+    served to a signed-in user only, at /about.
+    """
+    return {"status": "ok", "version": build_identity()["version"]}
+
+
+@router.get("/about")
+async def get_about(user: User = Depends(user_dep)):
+    """F4.2 (FR-30): the full build identity of this server — what the
+    dashboard's About dialog shows, and what an integrator compares with the
+    images' labels and the support bundle. Signed-in users only."""
+    del user  # authentication is the point; no permission beyond it
+    return build_identity()
 
 
 @router.get("/health/rmf")
