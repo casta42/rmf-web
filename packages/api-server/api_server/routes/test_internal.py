@@ -659,3 +659,121 @@ class TestChargerMessage(unittest.TestCase):
         self.assertIn("is NOT charging", msg)
         self.assertIn("Check the charger's power", msg)
         self.assertNotIn("send it somewhere it can reach", msg)
+
+
+class TestFleetStateCadenceWiring(unittest.IsolatedAsyncioTestCase):
+    """F-395 (G ruling 2026-09-29, D-84): the adapter pushes at its rate cap
+    (0.2 s); process_msg emits a visible change to the dashboards at once and
+    keeps the database write, the heartbeat, the alert rules and the reapers
+    on the 1 s cycle — driven through the REAL handler with upstream's
+    message shape."""
+
+    class _Clock:
+        def __init__(self):
+            self.t = 500.0
+
+        def monotonic(self):
+            return self.t
+
+    class _Repo:
+        def __init__(self):
+            self.saved = 0
+
+        async def save_fleet_state(self, _state):
+            self.saved += 1
+
+    def setUp(self):
+        import types
+
+        from api_server.fleet_state_cadence import FleetStateCadence
+        from api_server.rmf_io import fleet_events, rmf_events
+
+        from . import internal
+
+        self.internal = internal
+        self.clock = self._Clock()
+        self.alert_passes = 0
+
+        async def counted(*_a, **_k):
+            self.alert_passes += 1
+
+        async def quiet(*_a, **_k):
+            return None
+
+        self._saved = {
+            name: getattr(internal, name)
+            for name in (
+                "fleet_state_cadence",
+                "time",
+                "process_robot_alerts",
+                "reap_charge_ghosts",
+                "reap_interrupted_tasks",
+                "sweep_stale_tasks",
+                "_run_boundary",
+            )
+        }
+        internal.fleet_state_cadence = FleetStateCadence()
+        internal.time = types.SimpleNamespace(monotonic=self.clock.monotonic)
+        internal.process_robot_alerts = counted
+        internal.reap_charge_ghosts = quiet
+        internal.reap_interrupted_tasks = quiet
+        internal.sweep_stale_tasks = quiet
+        internal._run_boundary = types.SimpleNamespace(observe=lambda *_a: None)
+        self.emitted, self.heartbeats = [], []
+        self._subs = [
+            fleet_events.fleet_states.subscribe(self.emitted.append),
+            rmf_events.fleet_states.subscribe(self.heartbeats.append),
+        ]
+        self.repo = self._Repo()
+
+    def tearDown(self):
+        for sub in self._subs:
+            sub.dispose()
+        for name, value in self._saved.items():
+            setattr(self.internal, name, value)
+
+    @staticmethod
+    def msg(battery=0.874, x=1.5, stamp=1):
+        return {
+            "type": "fleet_state_update",
+            "data": {
+                "name": "gentle_fleet",
+                "robots": {
+                    "gentle_bot_1": {
+                        "name": "gentle_bot_1",
+                        "status": "working",
+                        "task_id": "patrol.dispatch-1",
+                        "unix_millis_time": stamp,
+                        "battery": battery,
+                        "location": {"map": "L1", "x": x, "y": 1.5, "yaw": 0.0},
+                        "issues": [],
+                    }
+                },
+            },
+        }
+
+    async def at(self, t, message):
+        self.clock.t = t
+        await self.internal.process_msg(message, self.repo)
+
+    async def test_changes_go_out_at_once_and_the_book_keeping_keeps_its_second(self):
+        await self.at(500.0, self.msg(stamp=1))  # first: full
+        await self.at(500.2, self.msg(stamp=2))  # nothing visible changed
+        await self.at(500.4, self.msg(battery=0.864, stamp=3))  # 87 -> 86 %
+        await self.at(500.6, self.msg(battery=0.864, stamp=4))  # unchanged
+        await self.at(501.0, self.msg(battery=0.864, stamp=5))  # periodic
+        await self.at(501.2, self.msg(battery=0.864, x=2.0, stamp=6))  # moved
+        await self.at(501.4, self.msg(battery=0.864, x=2.0, stamp=7))  # unchanged
+        self.assertEqual(len(self.emitted), 4)  # 500.0, 500.4, 501.0, 501.2
+        self.assertEqual(self.repo.saved, 2)  # 500.0, 501.0 — the 1 s cycle
+        self.assertEqual(len(self.heartbeats), 2)
+        self.assertEqual(self.alert_passes, 2)
+        self.assertAlmostEqual(self.emitted[1].robots["gentle_bot_1"].battery, 0.864)
+        self.assertEqual(self.emitted[3].robots["gentle_bot_1"].location.x, 2.0)
+
+    async def test_known_good_an_unchanging_floor_still_gets_its_periodic_push(self):
+        for i in range(11):  # 2 s of 0.2 s pushes, nothing visible changing
+            await self.at(500.0 + 0.2 * i, self.msg(stamp=i))
+        self.assertEqual(len(self.emitted), 3)  # 500.0, 501.0, 502.0
+        self.assertEqual(self.repo.saved, 3)
+        self.assertEqual(len(self.heartbeats), 3)

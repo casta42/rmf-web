@@ -12,6 +12,7 @@ from api_server import models as mdl
 from api_server import phantom_completion
 from api_server.app_config import app_config
 from api_server.dispatch_reason import dispatch_failure_reason
+from api_server.fleet_state_cadence import FleetStateCadence
 from api_server.internal_tasks import pages_operator
 from api_server.interrupted_tasks import (
     INTERRUPTED_LABEL,
@@ -42,6 +43,9 @@ logger = base_logger.getChild("RmfGatewayApp")
 user: mdl.User = mdl.User(username="__rmf_internal__", is_admin=True)
 task_repo = TaskRepository(user)
 alert_repo = AlertRepository(user, task_repo)
+# F-395: when a fleet-state message reaches the dashboards, and when it
+# rides the 1 s cycle (database, heartbeat, alert rules, reapers)
+fleet_state_cadence = FleetStateCadence()
 
 
 async def _redispatch_request(request: mdl.TaskRequest) -> str:
@@ -1183,7 +1187,17 @@ async def process_msg(msg: Dict[str, Any], fleet_repo: FleetRepository) -> None:
             alert_events.alerts.on_next(alert)
 
     elif payload_type == "fleet_state_update":
+        # F-395 (G ruling 2026-09-29, D-84): the adapter pushes at the rate
+        # cap; a change an operator can see goes to the dashboards at once,
+        # and the database, the heartbeat, the alert rules and the reapers
+        # keep the 1 s cycle they had when the adapter pushed once a second.
+        emit, full = fleet_state_cadence.decide(msg["data"], time.monotonic())
+        if not emit:
+            return
         fleet_state = mdl.FleetState(**msg["data"])
+        if not full:
+            fleet_events.fleet_states.on_next(fleet_state)
+            return
         await fleet_repo.save_fleet_state(fleet_state)
         fleet_events.fleet_states.on_next(fleet_state)
         # feeds the health watchdog's robot heartbeats (FR-17 robot offline)
