@@ -67,3 +67,41 @@ def dispatch_failure_reason(errors: Optional[List[Error]]) -> Optional[str]:
     # Unknown shape: stay honest with the raw detail rather than silent.
     detail = next((e.detail for e in errors if e.detail), None)
     return detail
+
+
+# G ruling 2026-10-01 item 6 (F-410/F-412 class): "A timed-out auction never
+# becomes a failed mission: re-auction with backoff, and fail only after N
+# attempts with the reason named." api_server/redispatch.py does the
+# re-auctioning; this is the reason it names when the LAST auction also
+# closes with no bid.
+#
+# Two different failures end up here and the operator must be told which.
+# The dispatcher's own code 10 alone means NOBODY ANSWERED: with the auction
+# closing early once every fleet has answered, a healthy fleet adapter
+# always answers, even when it has no robot to offer — so repeated silence is
+# not "the robots are busy", it is fleet coordination not running, and the
+# wording sends the operator there. Any other error next to code 10 is the
+# fleet adapter's own refusal: it DID answer, every time, and what it said
+# (battery, an unreachable stop) is the reason — not the silence.
+_NO_BID_CODE = 10
+
+
+def no_bid_failure_reason(
+    errors: Optional[List[Error]], auctions: int, over_s: Optional[float] = None
+) -> str:
+    """Operator-language reason for a mission whose last auction also got
+    no bid. `auctions` is how many it had in a row, `over_s` how long that
+    took from the first one opening (left out when it is not known)."""
+    count = "1 auction" if auctions == 1 else f"{auctions} auctions in a row"
+    if over_s is not None and over_s >= 0:
+        count = f"{count} over {over_s:.0f} s"
+    said = [e for e in errors or [] if e.code != _NO_BID_CODE]
+    if not said:
+        return (
+            f"no robot answered {count} — the fleet is not answering "
+            "dispatches; check that the fleet coordination service is running"
+        )
+    why = dispatch_failure_reason(said) or (
+        "the fleet answered every time without saying why"
+    )
+    return f"no robot offered to take this mission at {count} — {why}"

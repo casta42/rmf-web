@@ -1,7 +1,7 @@
 # F-95: dispatch failures must reach the operator with their WHY.
 import unittest
 
-from api_server.dispatch_reason import dispatch_failure_reason
+from api_server.dispatch_reason import dispatch_failure_reason, no_bid_failure_reason
 from api_server.models.rmf_api.error import Error
 
 LIMITED_CAPACITY = Error(
@@ -60,6 +60,69 @@ class TestDispatchFailureReason(unittest.TestCase):
     def test_unknown_falls_back_to_raw_detail(self):
         self.assertEqual(
             dispatch_failure_reason([Error(code=42, detail="weird")]), "weird"
+        )
+
+
+class TestNoBidFailureReason(unittest.TestCase):
+    """G ruling 2026-10-01 item 6 (F-410/F-412 class): "fail only after N
+    attempts with the reason named" — the reason on a mission whose LAST
+    auction also got no bid. Silence and a refusal are different failures
+    and must read differently."""
+
+    def test_silence_sends_the_operator_to_fleet_coordination(self):
+        reason = no_bid_failure_reason([NO_BID], 5, 77.4)
+        self.assertEqual(
+            reason,
+            "no robot answered 5 auctions in a row over 77 s — the fleet is "
+            "not answering dispatches; check that the fleet coordination "
+            "service is running",
+        )
+        # not the robot-availability wording of a single no-bid: a healthy
+        # fleet adapter answers even when it has no robot to offer
+        self.assertNotIn("busy", reason)
+        self.assertNotIn("dispatching again usually works", reason)
+
+    def test_a_fleet_that_answered_is_quoted_not_called_silent(self):
+        # the real persisted shape: the adapter's refusal, then code 10
+        reason = no_bid_failure_reason([LOW_BATTERY, NO_BID], 5, 38)
+        self.assertIn(
+            "no robot offered to take this mission at 5 auctions in a row "
+            "over 38 s",
+            reason,
+        )
+        self.assertIn("too low on battery", reason)
+        self.assertNotIn("not answering dispatches", reason)
+        self.assertIn(
+            "one battery charge", no_bid_failure_reason([NO_BID, LIMITED_CAPACITY], 5)
+        )
+        # an answer this module has no words for is quoted as it came
+        self.assertIn(
+            "weird", no_bid_failure_reason([Error(code=42, detail="weird"), NO_BID], 5)
+        )
+        # ...and one with nothing to quote still says the fleet answered
+        self.assertIn(
+            "answered every time without saying why",
+            no_bid_failure_reason([Error(code=42), NO_BID], 5),
+        )
+
+    def test_the_boring_inputs(self):
+        silent = "no robot answered 5 auctions in a row — the fleet is not"
+        # no errors on the state at all, and no span known
+        self.assertIn(silent, no_bid_failure_reason(None, 5))
+        self.assertIn(silent, no_bid_failure_reason([], 5))
+        self.assertIn(silent, no_bid_failure_reason([NO_BID], 5, None))
+        # a span that came out negative (a clock stepped) is left out, not
+        # printed
+        self.assertIn(silent, no_bid_failure_reason([NO_BID], 5, -3.0))
+        self.assertIn("over 0 s", no_bid_failure_reason([NO_BID], 5, 0.2))
+        self.assertIn("no robot answered 1 auction —", no_bid_failure_reason([], 1))
+
+    def test_a_single_no_bid_keeps_its_own_wording(self):
+        # F-95's translation is untouched: it is still what the queue and a
+        # mission somebody canceled mid-auction read
+        self.assertIn(
+            "no robot answered the dispatch in time",
+            dispatch_failure_reason([NO_BID]),
         )
 
 

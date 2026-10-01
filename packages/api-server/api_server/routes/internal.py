@@ -11,7 +11,7 @@ from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisco
 from api_server import models as mdl
 from api_server import phantom_completion
 from api_server.app_config import app_config
-from api_server.dispatch_reason import dispatch_failure_reason
+from api_server.dispatch_reason import dispatch_failure_reason, no_bid_failure_reason
 from api_server.fleet_state_cadence import FleetStateCadence
 from api_server.internal_tasks import pages_operator
 from api_server.interrupted_tasks import (
@@ -23,7 +23,13 @@ from api_server.interrupted_tasks import (
 from api_server.logger import logger as base_logger
 from api_server.models import tortoise_models as ttm
 from api_server.models.rmf_api.robot_state import Status as RobotStatus
-from api_server.redispatch import Redispatcher
+from api_server.redispatch import (
+    Redispatcher,
+    no_bid_since_of,
+    no_bid_verdict_of,
+    supersede,
+    unsupersede,
+)
 from api_server.repositories import AlertRepository, FleetRepository, TaskRepository
 from api_server.rmf_io import alert_events
 from api_server.rmf_io import cancellation as task_cancellation
@@ -68,8 +74,48 @@ async def _load_request(task_id: str):
     return await task_repo.get_task_request(task_id)
 
 
+async def _first_recorded_s(task_id: str) -> Optional[float]:
+    """Wall-clock second this database first recorded the task (the F-37
+    `created_at` column) — for a dispatched mission, when its auction
+    opened. None when the row cannot be read; never a guess."""
+    try:
+        stamps = await ttm.TaskState.filter(id_=task_id).values_list(
+            "created_at", flat=True)
+    except Exception:  # noqa: BLE001 — cannot see, so cannot say
+        return None
+    if not stamps or stamps[0] is None:
+        return None
+    return stamps[0].timestamp()
+
+
+async def _fail_abandoned_reauction(task_id: str, reason: str) -> None:
+    """G ruling 2026-10-01 item 6 (F-410/F-412 class): an attempt that got
+    no bid was recorded as put back on the floor ("auctioned again in
+    N s"), and the re-auction could not be made — the request is not
+    stored, or the dispatch was refused. That mission is not waiting for
+    anything: it failed, and it must not sit in the ledger as a tidy
+    cancel with no successor. The row is amended back to `failed` and the
+    operator is paged with the reason; the Info line raised for the
+    cancel is replaced, because it described a re-auction that never
+    happened."""
+    state = await task_repo.get_task_state(task_id)
+    if state is None or not unsupersede(state):
+        return
+    await task_repo.save_task_state(state)
+    task_events.task_states.on_next(state)
+    alert = await alert_repo.create_alert(
+        task_id,
+        "task",
+        severity=ttm.Alert.Severity.Critical,
+        message=f"Task {task_id} failed: {reason}",
+    )
+    if alert is not None:
+        alert_events.alerts.on_next(alert)
+
+
 redispatcher = Redispatcher(
-    _redispatch_request, _load_request, logger.getChild("Redispatch"))
+    _redispatch_request, _load_request, logger.getChild("Redispatch"),
+    abandon=_fail_abandoned_reauction, first_seen=_first_recorded_s)
 
 
 _request_labels: Dict[str, Optional[list]] = {}
@@ -263,12 +309,38 @@ def task_log_has_error(task_log: mdl.TaskEventLog) -> bool:
 TASK_LOG_ERROR_TEXT = "reported an error in its event log"
 
 
+def no_bid_final_reason(
+    task_state: mdl.TaskState, now_s: Optional[float] = None
+) -> Optional[str]:
+    """G ruling 2026-10-01 item 6 (F-410/F-412 class): the named reason
+    for a mission whose LAST auction also got no bid — how many auctions,
+    over how long, and whether the fleet was silent or answered with a
+    refusal. None for every other state, including a no-bid attempt that
+    still has auctions left (supersede() has recorded that one as put
+    back on the floor, and it raises no failure)."""
+    verdict = no_bid_verdict_of(task_state)
+    if verdict is None or not verdict.final or task_state.dispatch is None:
+        return None
+    since = no_bid_since_of(task_state.booking.labels)
+    over_s = None
+    if since is not None:
+        over_s = (time.time() if now_s is None else now_s) - since
+    return no_bid_failure_reason(
+        task_state.dispatch.errors, verdict.attempt, over_s)
+
+
 async def alert_on_task_state(task_state: mdl.TaskState, repo):
     """F-22: only a failed or canceled task alerts, once per task (terminal
     states may be re-broadcast). F-95: a failure carries the WHY when the
     dispatcher knows it — a task refused at dispatch time has the
     adapter's structured errors in dispatch.errors; execution failures do
     not.
+
+    G ruling 2026-10-01 item 6: an auction nobody bid on is a failure —
+    and a Critical alert — only when it was the mission's last one; the
+    reason then names the count and the span. Every earlier attempt
+    reaches this function already recorded as `canceled` (supersede() in
+    process_msg) and raises the same Info line a hand-back does.
 
     F-374: one row per task, keyed by the task id (the dashboard's
     caption for a task alert IS that id). The only row this may replace
@@ -291,11 +363,11 @@ async def alert_on_task_state(task_state: mdl.TaskState, repo):
     ):
         return None
     assigned = task_state.assigned_to
-    reason = (
-        dispatch_failure_reason(task_state.dispatch.errors)
-        if task_state.dispatch is not None
-        else None
-    )
+    reason = None
+    if task_state.dispatch is not None:
+        reason = no_bid_final_reason(task_state) or dispatch_failure_reason(
+            task_state.dispatch.errors
+        )
     message = f"Task {task_id} {task_state.status.value}"
     if task_state.status == mdl.TaskStatus.failed and reason:
         message = f"{message}: {reason}"
@@ -1151,6 +1223,15 @@ async def process_msg(msg: Dict[str, Any], fleet_repo: FleetRepository) -> None:
         # gf:redispatch-of provenance the morning-after row matches on.
         # The stored REQUEST is the truth; stamp its labels back.
         await _preserve_booking_labels(task_state)
+        # G ruling 2026-10-01 item 6 (F-410/F-412 class): "A timed-out
+        # auction never becomes a failed mission." An auction that closed
+        # with no bid and still has attempts left is recorded as put back
+        # on the floor — canceled, with the gf:redispatch marker and the
+        # plain reason, the dispatcher's errors kept — BEFORE anything is
+        # stored, broadcast or alerted on, so no consumer ever sees it as
+        # a failure. After the labels are restored: the attempt count
+        # rides in them. _redispatch_later auctions it again.
+        supersede(task_state)
         # F-292: the dispatcher AWARDS a task it canceled in flight while
         # its bidding was still open (measured: canceled 01:55:45, awarded
         # to gentle_bot_1 01:55:51), and the queued future mission then
@@ -1164,7 +1245,8 @@ async def process_msg(msg: Dict[str, Any], fleet_repo: FleetRepository) -> None:
         # FR-12 charge governor (F-36/F-286): a mission the fleet canceled
         # to charge its robot comes back to the floor for another robot —
         # after a settle delay, off this handler (F-291), so the fleet
-        # feed is never held up behind a dispatch.
+        # feed is never held up behind a dispatch. The same hook auctions
+        # a mission nobody bid on again, after its backoff.
         asyncio.get_running_loop().create_task(_redispatch_later(task_state))
 
         # F-22: alerts are exceptions (FR-17) - a cleanly completed task must
