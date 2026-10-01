@@ -5,7 +5,8 @@ The bell is what an operator must act on. The fleet runs tasks of its own
 — upstream's automatic ChargeBattery (`Charge<hex>`) and responsive wait
 (`wait.`), and every trip this product issues for itself: the F-36 rescue
 and retreat (`f36-`), the F-87 charge sweep (`f87-`), the FR-36 idle and
-cut-vertex retreat (`fr36-`), the F-338 hold (`f338-`) — plus a residual
+cut-vertex retreat (`fr36-`), the F-338 hold (`f338-`), the F-412 queue reservation
+(`f412-`) — plus a residual
 D-29 `ParkRobot`. The fleet cancels and replaces these constantly, by
 design; each cancellation raised "Task <id> canceled", and on the dev site
 590 of 762 open alerts were exactly that (F3, 2026-09-22), burying the
@@ -20,7 +21,9 @@ the adapter holds the two equal, so neither can drift alone.
 
 from typing import Optional
 
-INTERNAL_TASK_PREFIXES = ("Charge", "wait.", "f36-", "f87-", "fr36-", "f338-", "ParkRobot")
+INTERNAL_TASK_PREFIXES = (
+    "Charge", "wait.", "f36-", "f87-", "fr36-", "f338-", "f412-", "ParkRobot"
+)
 
 # who the startup sweep records as having resolved a row it archives
 SWEEP_RESOLVER = "system (F-379: the fleet's own task, not an operator action)"
