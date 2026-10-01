@@ -1,5 +1,6 @@
 # NOTE: This will eventually replace `gateway.py``
 import asyncio
+import json
 import math
 import time
 from dataclasses import dataclass
@@ -9,7 +10,7 @@ from typing import Any, Dict, Optional, Tuple
 from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 
 from api_server import models as mdl
-from api_server import phantom_completion
+from api_server import phantom_completion, waiting_missions
 from api_server.app_config import app_config
 from api_server.dispatch_reason import dispatch_failure_reason, no_bid_failure_reason
 from api_server.fleet_state_cadence import FleetStateCadence
@@ -24,11 +25,18 @@ from api_server.logger import logger as base_logger
 from api_server.models import tortoise_models as ttm
 from api_server.models.rmf_api.robot_state import Status as RobotStatus
 from api_server.redispatch import (
+    CLASS_NO_BID,
+    REASON_LABEL,
     Redispatcher,
+    class_of,
     no_bid_since_of,
     no_bid_verdict_of,
+    origin_of,
+    root_of,
+    status_tail,
     supersede,
     unsupersede,
+    wants_redispatch,
 )
 from api_server.repositories import AlertRepository, FleetRepository, TaskRepository
 from api_server.rmf_io import alert_events
@@ -95,9 +103,8 @@ async def _fail_abandoned_reauction(task_id: str, reason: str) -> None:
     stored, or the dispatch was refused. That mission is not waiting for
     anything: it failed, and it must not sit in the ledger as a tidy
     cancel with no successor. The row is amended back to `failed` and the
-    operator is paged with the reason; the Info line raised for the
-    cancel is replaced, because it described a re-auction that never
-    happened."""
+    operator is paged with the reason; its broadcast takes the chain out
+    of the waiting registry (F-435)."""
     state = await task_repo.get_task_state(task_id)
     if state is None or not unsupersede(state):
         return
@@ -116,9 +123,30 @@ async def _fail_abandoned_reauction(task_id: str, reason: str) -> None:
         alert_events.alerts.on_next(alert)
 
 
+# F-435 (G ruling 2026-10-01, ruling 2): the missions waiting for a robot
+waiting = waiting_missions.registry
+
+async def _hand_back_lost(task_id: str, reason: str) -> None:
+    """F-435: a hand-back whose re-dispatch could not be made (its request
+    is not stored, or the dispatch was refused) is no longer waiting for a
+    robot — nothing will put it back on the floor until a restart resumes
+    it. Its chain leaves the waiting list and its alert, if raised, is
+    closed; the row stays the marked cancel it is, which the tooling counts
+    as a LOST mission."""
+    entry = waiting.find_task(task_id)
+    if entry is None:
+        return
+    waiting.leave(entry.root_id)
+    logger.error("F-435: mission %s is no longer waiting — its attempt [%s] "
+                 "could not be put back on the floor: %s", entry.root_id,
+                 task_id, reason)
+    await _resolve_waiting_alert(entry)
+
+
 redispatcher = Redispatcher(
     _redispatch_request, _load_request, logger.getChild("Redispatch"),
-    abandon=_fail_abandoned_reauction, first_seen=_first_recorded_s)
+    abandon=_fail_abandoned_reauction, first_seen=_first_recorded_s,
+    wanted=waiting.wanted, lost=_hand_back_lost)
 
 
 _request_labels: Dict[str, Optional[list]] = {}
@@ -188,16 +216,344 @@ async def _redispatch_later(task_state: mdl.TaskState) -> None:
             # can ever take it") from a transient one
             errors = [{"code": e.code, "detail": e.detail}
                       for e in task_state.dispatch.errors]
-        await redispatcher.maybe_redispatch(
-            task_state.booking.id,
+        task_id = task_state.booking.id
+        new_id = await redispatcher.maybe_redispatch(
+            task_id,
             task_state.status,
             task_state.cancellation.labels
             if task_state.cancellation is not None else None,
             booking_labels=task_state.booking.labels,
             dispatch_errors=errors,
         )
+        if new_id is not None:
+            waiting.redispatched(
+                root_of(task_state.booking.labels) or task_id, task_id,
+                new_id)
     except Exception:  # pylint: disable=broad-except
         logger.exception("re-dispatch of [%s] failed", task_state.booking.id)
+
+
+# ----------------------------------------------------------------------
+# F-435 (G ruling 2026-10-01, ruling 2): "a mission never fails because a
+# robot is busy or charging. It waits, shown to the operator as 'waiting
+# for a robot' with its age, and raises one alert after a threshold."
+# The registry (waiting_missions.py) follows every task state the
+# api-server broadcasts — whichever path wrote it (the fleet's feed, the
+# abandoned re-auction, the interrupted-mission sweep, a local close) —
+# so a chain that starts or ends by any route leaves it.
+# ----------------------------------------------------------------------
+WAITING_ALERT_PERIOD_S = 5.0
+# resume_waiting_chains: how far back a restart looks for chains it would
+# otherwise drop, and how many rows it reads at most to find them
+RESUME_WINDOW_S = 24 * 3600.0
+RESUME_SCAN_LIMIT = 5000
+_LIVE_RAW = {"queued", "standby", "uninitialized"}
+
+
+def _request_category_places(request: Any) -> Tuple[Optional[str], list]:
+    """The mission as the operator dispatched it: its category and its
+    stops, from the stored request (a model or its JSON)."""
+    if request is None:
+        return None, []
+    if not isinstance(request, dict):
+        request = request.model_dump(mode="json")
+    description = request.get("description")
+    places = description.get("places") if isinstance(description, dict) else None
+    places = [p for p in places if isinstance(p, str)] if isinstance(
+        places, list) else []
+    category = request.get("category")
+    return (str(category) if category else None), places
+
+
+async def _enrich_waiting(entry: waiting_missions.WaitingMission) -> None:
+    """Fill in what the task state does not carry: since when the mission
+    waits (the ledger's first record of its root) and what it is (the
+    stored request). Best effort — a row that cannot be read leaves the
+    first-seen time and an empty route, never a guess."""
+    try:
+        since = await _first_recorded_s(entry.root_id)
+        if since is not None:
+            entry.since_unix = min(entry.since_unix, since)
+        request = await task_repo.get_task_request(entry.task_id)
+        if request is None and entry.task_id != entry.root_id:
+            request = await task_repo.get_task_request(entry.root_id)
+        entry.category, entry.places = _request_category_places(request)
+        entry.enriched = True
+    except Exception:  # pylint: disable=broad-except
+        logger.exception("F-435: [%s] waiting entry could not be read",
+                         entry.root_id)
+
+
+async def _resolve_waiting_alert(entry: waiting_missions.WaitingMission) -> None:
+    """The chain started or ended: its one alert is closed (the shape of
+    every episode alert in this module)."""
+    if entry.alerted is None:
+        return
+    resolved = await alert_repo.resolve_alert(entry.alerted)
+    if resolved is not None:
+        alert_events.alerts.on_next(resolved)
+
+
+def _on_task_state(task_state: mdl.TaskState) -> None:
+    """task_events.task_states observer: keep the registry in step with
+    every broadcast state. Synchronous, so the registry never lags the
+    feed; the database work it needs runs on the loop. Never raises into
+    the emitter."""
+    try:
+        change = waiting.observe(task_state)
+        if change is None:
+            return
+        loop = asyncio.get_running_loop()
+        if change.kind == "left":
+            if change.entry.alerted is not None:
+                loop.create_task(_resolve_waiting_alert(change.entry))
+        elif not change.entry.enriched:
+            loop.create_task(_enrich_waiting(change.entry))
+    except RuntimeError:
+        return      # no running loop: a synchronous caller, nothing to schedule
+    except Exception:  # pylint: disable=broad-except
+        logger.exception("F-435: the waiting registry missed a task state")
+
+
+task_events.task_states.subscribe(_on_task_state)
+
+
+async def process_waiting_alerts(now_s: Optional[float] = None) -> int:
+    """F-435: ONE Warning per chain that has waited GF_WAITING_ALERT_S
+    (waiting_missions.py says why 900 s), never a second. Returns how many
+    it raised."""
+    now_s = time.time() if now_s is None else now_s
+    raised = 0
+    for entry in waiting.due_alerts(now_s, waiting_missions.WAITING_ALERT_S):
+        alert_id = f"waiting__{entry.root_id}"
+        alert = await alert_repo.create_alert(
+            alert_id,
+            "fleet",
+            severity=ttm.Alert.Severity.Warning,
+            message=waiting_missions.alert_message(entry, now_s),
+        )
+        entry.alerted = alert_id
+        raised += 1
+        if alert is not None:
+            alert_events.alerts.on_next(alert)
+        if waiting.get(entry.root_id) is not entry:
+            # the chain started or ended while the alert was written
+            await _resolve_waiting_alert(entry)
+    return raised
+
+
+async def withdraw_waiting(task_id: str, labels: list):
+    """POST /tasks/cancel_task on an attempt that is already `canceled`:
+    when it is an attempt a chain is WAITING on (between auctions), the
+    operator is canceling the mission, not that row. The chain leaves the
+    registry, the pending re-dispatch is not made (Redispatcher `wanted`),
+    and the row is recorded as the operator's cancel — the gf:redispatch
+    marker removed, so the ledger reads a canceled mission (not a lost
+    one) and a restart does not resume it. An attempt the chain has
+    already moved past forwards the cancel to the one it waits on now.
+    Returns the response, or None when no waiting chain is concerned."""
+    state = await task_repo.get_task_state(task_id)
+    if state is None:
+        return None
+    cancel_labels = state.cancellation.labels if state.cancellation else None
+    if wants_redispatch(state.status, cancel_labels) is None:
+        return None
+    entry = waiting.get(root_of(state.booking.labels) or task_id)
+    if entry is not None and entry.task_id != task_id:
+        from api_server.routes.tasks.tasks import post_cancel_task
+
+        return await post_cancel_task(
+            mdl.CancelTaskRequest(
+                type="cancel_task_request", task_id=entry.task_id,
+                labels=labels),
+            task_repo,
+        )
+    note = (f"it was waiting for a robot — {entry.reason}" if entry
+            else "it was waiting for a robot")
+    entry = waiting.withdraw(task_id, [*labels, note])
+    if entry is None:
+        return None
+    from api_server.models.rmf_api.task_state import Cancellation
+
+    state.cancellation = Cancellation(
+        unix_millis_request_time=round(time.time() * 1e3),
+        labels=waiting.withdrawn_labels(task_id) or [],
+    )
+    task_cancellation.latch(task_id, state.cancellation)
+    await task_repo.save_task_state(state)
+    task_events.task_states.on_next(state)
+    await _resolve_waiting_alert(entry)
+    logger.warning("F-435: [%s] (mission %s) canceled by an operator while "
+                   "it waited for a robot", task_id, entry.root_id)
+    return {"success": True,
+            "detail": "canceled — the mission was waiting for a robot and "
+                      "will not be dispatched again"}
+
+
+def _apply_withdrawal(task_state: mdl.TaskState) -> None:
+    """A withdrawn attempt stays the operator's cancel: a later broadcast
+    of it (a fleet re-sends terminal states) must not bring the marker
+    back."""
+    labels = waiting.withdrawn_labels(task_state.booking.id)
+    if labels is None or task_state.cancellation is None:
+        return
+    task_state.cancellation.labels = labels
+
+
+def _resume_reason(labels: Optional[list]) -> str:
+    """The latest reason of a chain found waiting on a LIVE attempt at
+    start: the hand-back's own reason rides in the attempt's labels; a
+    no-bid's answer does not, so it is named generically."""
+    if class_of(labels) == CLASS_NO_BID:
+        return "no robot took it at its last auction"
+    for label in labels or []:
+        if label.startswith(REASON_LABEL) and label[len(REASON_LABEL):]:
+            return label[len(REASON_LABEL):]
+    return "handed back by the fleet"
+
+
+def _as_dict(value) -> dict:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, (str, bytes)):
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+async def resume_waiting_chains(now_s: Optional[float] = None) -> list:
+    """F-435, at api-server start: rebuild the registry from the ledger and
+    RESUME what the restart would otherwise have dropped. The wait before
+    a re-dispatch is an in-process sleep, so a restart inside it left the
+    chain's last row a marked cancel with no successor — the mission
+    silently gone. Every such TAIL created in the last RESUME_WINDOW_S is
+    re-dispatched through the ordinary path, after the ordinary backoff;
+    a chain whose latest attempt is live (queued, assigned) is registered
+    as waiting on it. Bounded: at most RESUME_SCAN_LIMIT rows are read.
+    Returns the tail ids it re-dispatched."""
+    now_s = time.time() if now_s is None else now_s
+    cutoff = datetime.fromtimestamp(now_s - RESUME_WINDOW_S, tz=timezone.utc)
+    rows = await ttm.TaskState.filter(created_at__gte=cutoff).order_by(
+        "-created_at").limit(RESUME_SCAN_LIMIT).values_list(
+        "id_", "status", "created_at")
+    if len(rows) >= RESUME_SCAN_LIMIT:
+        logger.warning(
+            "F-435: the resume scan read its limit of %d rows; chains older "
+            "than the oldest of them are not resumed", RESUME_SCAN_LIMIT)
+    status_of = {str(i): status_tail(s) for i, s, _ in rows}
+    created_of = {str(i): c for i, _, c in rows}
+    labels_of: Dict[str, list] = {}
+    requests: Dict[str, dict] = {}
+    ids = list(status_of)
+    for at in range(0, len(ids), 500):
+        for task_id, raw in await ttm.TaskRequest.filter(
+                id___in=ids[at:at + 500]).values_list("id_", "request"):
+            request = _as_dict(raw)
+            requests[str(task_id)] = request
+            labels = request.get("labels")
+            labels_of[str(task_id)] = labels if isinstance(labels, list) else []
+    replaced = {origin_of(labels) for labels in labels_of.values()} - {None}
+
+    def root(task_id: str) -> str:
+        return root_of(labels_of.get(task_id)) or task_id
+
+    canceled_in = {}
+    for task_id, status in status_of.items():
+        if status in waiting_missions.CANCELED:
+            canceled_in.setdefault(root(task_id), []).append(task_id)
+    tails: list = []
+    candidates = [i for i in ids if status_of[i] in waiting_missions.CANCELED
+                  and i not in replaced]
+    for at in range(0, len(candidates), 200):
+        for task_id, data in await ttm.TaskState.filter(
+                id___in=candidates[at:at + 200]).values_list("id_", "data"):
+            try:
+                state = mdl.TaskState(**_as_dict(data))
+            except Exception:  # noqa: BLE001 — a corrupt row is skipped
+                continue
+            reason = waiting_missions.waiting_reason(state)
+            if reason is None:
+                continue        # an operator's cancel: the mission ended
+            tails.append(state)
+    first_seen: Dict[str, float] = {}
+
+    async def since_of(chain: str, task_id: str) -> float:
+        if chain not in first_seen:
+            since = await _first_recorded_s(chain)
+            if since is None and created_of.get(task_id) is not None:
+                since = created_of[task_id].timestamp()
+            first_seen[chain] = since if since is not None else now_s
+        return first_seen[chain]
+
+    for state in tails:
+        task_id = state.booking.id
+        chain = root(task_id)
+        category, places = _request_category_places(requests.get(task_id))
+        waiting.adopt(waiting_missions.WaitingMission(
+            root_id=chain, task_id=task_id,
+            since_unix=await since_of(chain, task_id),
+            reason=waiting_missions.waiting_reason(state) or "",
+            attempts=len(canceled_in.get(chain, [])) or 1,
+            category=category, places=places, enriched=True))
+    for task_id in ids:
+        labels = labels_of.get(task_id)
+        # a live attempt that is not the chain's first: the chain waits on it
+        if status_of[task_id] not in _LIVE_RAW or root_of(labels) is None \
+                or task_id in replaced:
+            continue
+        chain = root(task_id)
+        category, places = _request_category_places(requests.get(task_id))
+        waiting.adopt(waiting_missions.WaitingMission(
+            root_id=chain, task_id=task_id,
+            since_unix=await since_of(chain, task_id),
+            reason=_resume_reason(labels),
+            attempts=len(canceled_in.get(chain, [])) or 1,
+            category=category, places=places, enriched=True))
+    # the one alert per chain survives the restart: a chain whose alert was
+    # already raised (open, or resolved by an operator) is not paged again;
+    # an open one whose chain is no longer waiting is closed
+    for entry in waiting.entries():
+        alert_id = f"waiting__{entry.root_id}"
+        if await alert_repo.resolved_millis(alert_id) != 0:
+            entry.alerted = alert_id
+    stale = await ttm.Alert.filter(
+        original_id__startswith=waiting_missions.ALERT_PREFIX,
+        unix_millis_resolved_time__isnull=True).values_list("id", flat=True)
+    for alert_id in stale:
+        root_id = str(alert_id)[len(waiting_missions.ALERT_PREFIX):]
+        if waiting.get(root_id) is None:
+            resolved = await alert_repo.resolve_alert(str(alert_id))
+            if resolved is not None:
+                alert_events.alerts.on_next(resolved)
+    resumed = []
+    loop = asyncio.get_running_loop()
+    for state in tails:
+        resumed.append(state.booking.id)
+        loop.create_task(_redispatch_later(state))
+    if resumed or len(waiting):
+        logger.warning(
+            "F-435: %d mission(s) waiting for a robot at start; %d of them "
+            "had been dropped by the restart and are back on the floor: %s",
+            len(waiting), len(resumed), ", ".join(resumed[:12]))
+    return resumed
+
+
+async def waiting_maintenance_loop() -> None:
+    """Started with the app: resume once, then raise the waiting alerts
+    that come due."""
+    try:
+        await resume_waiting_chains()
+    except Exception:  # pylint: disable=broad-except
+        logger.exception("F-435: resuming the waiting missions failed")
+    while True:
+        try:
+            await process_waiting_alerts()
+        except Exception:  # pylint: disable=broad-except
+            logger.exception("F-435: the waiting-mission alert pass failed")
+        await asyncio.sleep(WAITING_ALERT_PERIOD_S)
 
 # FR-17 low battery alerts: a robot re-arms only after its battery rises above
 # `low_battery_threshold` plus this margin (battery is a fraction, 0.0-1.0).
@@ -347,7 +703,8 @@ async def alert_on_task_state(task_state: mdl.TaskState, repo):
     F-435, only after the fifth answer that no robot can ever take it);
     the reason then names the count and the span. Every earlier attempt
     reaches this function already recorded as `canceled` (supersede() in
-    process_msg) and raises the same Info line a hand-back does.
+    process_msg) and, like a hand-back, raises nothing: the mission is
+    waiting (F-435, below).
 
     F-374: one row per task, keyed by the task id (the dashboard's
     caption for a task alert IS that id). The only row this may replace
@@ -357,6 +714,17 @@ async def alert_on_task_state(task_state: mdl.TaskState, repo):
     alone — replacing it would re-open it, because create_alert resets
     the ack and the resolution."""
     if task_state.status not in (mdl.TaskStatus.failed, mdl.TaskStatus.canceled):
+        return None
+    # F-435 (G ruling 2026-10-01, ruling 2): an attempt the fleet put back
+    # on the floor — a hand-back, or a no-bid auction superseded at ingest —
+    # is not a canceled mission and does not ring the bell. The mission is
+    # WAITING: the queue shows it, and it "raises one alert after a
+    # threshold" (waiting_missions.py) — never one line per attempt, which
+    # for a mission that waits an hour would be one every minute.
+    if wants_redispatch(
+        task_state.status,
+        task_state.cancellation.labels if task_state.cancellation else None,
+    ):
         return None
     task_id = task_state.booking.id
     # F-379: the fleet's own tasks (charging trips, holds, retreats) page
@@ -1218,6 +1586,9 @@ async def process_msg(msg: Dict[str, Any], fleet_repo: FleetRepository) -> None:
         # stored rows and broadcasts agree (the canceled-vs-completed race
         # on the dead-robot path can wipe RMF's own field)
         task_cancellation.apply(task_state)
+        # F-435: an attempt an operator canceled while its mission waited
+        # stays that operator's cancel when the fleet re-sends it
+        _apply_withdrawal(task_state)
         # F-343: `completed` is stored only when every phase is completed —
         # the fleet reports the ACTIVE phase's status as the task's, and a
         # patrol whose next stop had no route read "completed" for eight

@@ -614,7 +614,7 @@ class Redispatcher:
 
     def __init__(self, dispatch, load_request, logger: logging.Logger,
                  cap: int = 2048, abandon=None, first_seen=None,
-                 clock=time.time, wanted=None):
+                 clock=time.time, wanted=None, lost=None):
         self._dispatch = dispatch          # async (request) -> new task id
         self._load_request = load_request  # async (task_id) -> TaskRequest
         self._logger = logger
@@ -627,6 +627,9 @@ class Redispatcher:
         # (task_id) -> bool: is the mission still wanted after the wait?
         # False when an operator canceled it in the meantime (F-435)
         self._wanted = wanted
+        # async (task_id, reason): a hand-back could not be put back on the
+        # floor — the mission is not waiting any more (F-435 registry)
+        self._lost = lost
         self._seen: List[str] = []
         self._cap = cap
         self.redispatched = 0
@@ -657,6 +660,16 @@ class Redispatcher:
                 "re-dispatch: [%s] was canceled by an operator while it "
                 "waited for a robot — not dispatched again", task_id)
         return wanted
+
+    async def _hand_back_lost(self, task_id: str, reason: str) -> None:
+        self.refused += 1
+        if self._lost is None:
+            return
+        try:
+            await self._lost(task_id, reason)
+        except Exception:  # pylint: disable=broad-except
+            self._logger.exception(
+                "re-dispatch: [%s] lost, and could not be recorded", task_id)
 
     async def _give_up(self, task_id: str, reason: str) -> None:
         """The row says "auctioned again" and it will not be: hand it to
@@ -765,7 +778,7 @@ class Redispatcher:
             self._logger.warning(
                 "re-dispatch: [%s] was handed back but its request is not "
                 "stored (a direct mission?) — left canceled", task_id)
-            self.refused += 1
+            await self._hand_back_lost(task_id, "its request is not stored")
             return None
         labels = next_labels(request.labels, task_id, reason)
         request = request.model_copy(update={"labels": labels})
@@ -775,7 +788,8 @@ class Redispatcher:
             self._logger.warning(
                 "re-dispatch of [%s] refused: %s — left canceled with its "
                 "provenance", task_id, exc)
-            self.refused += 1
+            await self._hand_back_lost(
+                task_id, str(getattr(exc, "detail", None) or exc))
             return None
         self.redispatched += 1
         self._logger.warning(

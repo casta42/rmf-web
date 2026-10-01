@@ -1,7 +1,11 @@
 # F-95: dispatch failures must reach the operator with their WHY.
 import unittest
 
-from api_server.dispatch_reason import dispatch_failure_reason, no_bid_failure_reason
+from api_server.dispatch_reason import (
+    dispatch_failure_reason,
+    no_bid_failure_reason,
+    no_bid_waiting_reason,
+)
 from api_server.models.rmf_api.error import Error
 
 LIMITED_CAPACITY = Error(
@@ -124,6 +128,56 @@ class TestNoBidFailureReason(unittest.TestCase):
             "no robot answered the dispatch in time",
             dispatch_failure_reason([NO_BID]),
         )
+
+
+class TestNoBidWaitingReason(unittest.TestCase):
+    """G ruling 2026-10-01, ruling 2 (F-435): the reason a mission whose
+    last auction got no bid is WAITING — the line on its "waiting for a
+    robot" row and in its one alert. It says what the fleet answered, and
+    never tells the operator to dispatch again (the fleet already is)."""
+
+    def test_each_answer_reads_as_itself(self):
+        self.assertEqual(
+            no_bid_waiting_reason([NO_BID]), "no robot answered its last auction"
+        )
+        self.assertEqual(
+            no_bid_waiting_reason([LOW_BATTERY, NO_BID]),
+            "every robot is too low on battery for it until charging finishes",
+        )
+        self.assertEqual(
+            no_bid_waiting_reason([LIMITED_CAPACITY, NO_BID]),
+            "no robot can finish it on one battery charge, even starting full",
+        )
+        self.assertEqual(
+            no_bid_waiting_reason(
+                [Error(code=9, category="Not feasible", detail="novel"), NO_BID]
+            ),
+            "no robot's schedule can fit it at the moment",
+        )
+        self.assertEqual(
+            no_bid_waiting_reason([Error(code=13, detail="boom"), NO_BID]),
+            "fleet coordination hit an internal error on its last auction",
+        )
+        self.assertEqual(
+            no_bid_waiting_reason([Error(code=42, detail="weird"), NO_BID]),
+            "no robot offered to take it at its last auction",
+        )
+
+    def test_the_permanent_answer_wins_over_a_transient_one(self):
+        self.assertIn(
+            "one battery charge",
+            no_bid_waiting_reason([LOW_BATTERY, LIMITED_CAPACITY, NO_BID]),
+        )
+
+    def test_the_boring_inputs(self):
+        for errors in (None, [], [NO_BID]):
+            self.assertEqual(
+                no_bid_waiting_reason(errors), "no robot answered its last auction"
+            )
+        for errors in ([NO_BID], [LOW_BATTERY, NO_BID], [LIMITED_CAPACITY]):
+            reason = no_bid_waiting_reason(errors)
+            self.assertNotIn("dispatch again", reason)
+            self.assertNotIn("dispatching again", reason)
 
 
 if __name__ == "__main__":

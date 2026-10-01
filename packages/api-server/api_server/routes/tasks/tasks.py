@@ -8,10 +8,9 @@ from fastapi import Body, Depends, HTTPException, Path, Query
 from fastapi.responses import JSONResponse
 from reactivex import operators as rxops
 
-from api_server import dispatch_horizon
-from api_server import cordon
-from api_server import hold_guard
+from api_server import cordon, dispatch_horizon, hold_guard
 from api_server import models as mdl
+from api_server import waiting_missions
 from api_server.app_config import app_config
 from api_server.cancel_route import (
     ROUTE_ALREADY_CANCELED,
@@ -265,6 +264,17 @@ async def post_cancel_task(
         raise HTTPException(
             404, detail=f"task [{request.task_id}] is not known to this site")
     if route == ROUTE_ALREADY_CANCELED:
+        # F-435: an attempt a mission is WAITING on between auctions is
+        # `canceled` already, but the operator is canceling the mission —
+        # it must not be dispatched again (routes/internal.py)
+        from api_server.routes.internal import withdraw_waiting
+
+        withdrawn = await withdraw_waiting(request.task_id,
+                                           list(request.labels or []))
+        if isinstance(withdrawn, dict):
+            return RawJSONResponse(json.dumps(withdrawn).encode())
+        if withdrawn is not None:
+            return withdrawn
         return RawJSONResponse(
             json.dumps({"success": True,
                         "detail": f"task is already {status_tail(stored.status)}"}
@@ -664,6 +674,17 @@ async def post_robot_task(
     if not resp.root.root.success:
         return RawJSONResponse(resp.model_dump_json(), 400)
     return resp
+
+
+@router.get("/waiting")
+async def get_waiting_missions():
+    """F-435 (G ruling 2026-10-01, ruling 2): every mission waiting for a
+    robot — a chain whose latest attempt was handed back or got no bid and
+    that has not started since — the longest wait first. `task_id` is the
+    attempt it waits on now (cancel that one to cancel the mission);
+    `root_id` the id the operator was given; `since_unix` when it was
+    first recorded; `reason` the latest, in an operator's words."""
+    return waiting_missions.registry.views(time.time())
 
 
 @router.get("/deferred")

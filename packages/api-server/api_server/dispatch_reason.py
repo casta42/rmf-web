@@ -105,3 +105,28 @@ def no_bid_failure_reason(
         "the fleet answered every time without saying why"
     )
     return f"no robot offered to take this mission at {count} — {why}"
+
+
+# G ruling 2026-10-01, ruling 2 (F-435): "a mission never fails because a
+# robot is busy or charging. It waits, shown to the operator as 'waiting for
+# a robot' with its age". This is the reason that row (and its one alert)
+# names while a mission whose last auction got no bid waits for the next.
+# Unlike the failure wording above it never tells the operator to dispatch
+# again: the fleet is already doing that.
+def no_bid_waiting_reason(errors: Optional[List[Error]]) -> str:
+    """Why a mission whose last auction got no bid is waiting, in an
+    operator's words, from what the fleet answered (code 10 alone: it did
+    not answer)."""
+    said = [e for e in errors or [] if e.code != _NO_BID_CODE]
+    if not said:
+        return "no robot answered its last auction"
+    details = [(e.code, e.detail or "") for e in said]
+    if any(code == 9 and _LIMITED_CAPACITY in d for code, d in details):
+        return "no robot can finish it on one battery charge, even starting full"
+    if any(code == 9 and _LOW_BATTERY in d for code, d in details):
+        return "every robot is too low on battery for it until charging finishes"
+    if any(code == 9 for code, _ in details):
+        return "no robot's schedule can fit it at the moment"
+    if any(code == 13 for code, _ in details):
+        return "fleet coordination hit an internal error on its last auction"
+    return "no robot offered to take it at its last auction"

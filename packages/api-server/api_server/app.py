@@ -221,6 +221,12 @@ async def lifespan(_app: FastIO):
     )
     await health_watchdog.start()
 
+    # F-435 (G ruling 2026-10-01, ruling 2): rebuild the missions waiting
+    # for a robot from the ledger, resume the ones a restart dropped, and
+    # raise each one's single alert when it comes due
+    waiting_loop = loop.create_task(routes.internal.waiting_maintenance_loop())
+    shutdown_cbs.append(waiting_loop.cancel)
+
     logger.info("starting scheduler")
     asyncio.create_task(_spin_scheduler())
     # F-293: missions held for their start are released on this clock

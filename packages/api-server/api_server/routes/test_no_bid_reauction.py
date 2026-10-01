@@ -10,10 +10,11 @@ back. Only the fleet is a mock (tasks_service().call), and the waits are
 shortened — the schedule itself is pinned in test_redispatch.py.
 
 KNOWN BAD, must act: a first-generation mission whose auction closed with
-no bid is stored as put back on the floor (never as failed), raises an
-Info line and no Critical, and is auctioned again exactly once with the
-labels that fold its chain; so is a SIXTH silent auction (F-435: a
-transient no-bid is never a failure). When the re-auction cannot be
+no bid is stored as put back on the floor (never as failed), rings nothing
+— the mission is waiting (F-435: one alert per waiting mission, after a
+threshold, never one per attempt) — and is auctioned again exactly once
+with the labels that fold its chain; so is a SIXTH silent auction (F-435:
+a transient no-bid is never a failure). When the re-auction cannot be
 made, the row is amended to failed and a Critical alert names why.
 
 KNOWN GOOD, must stay as it was: the last PERMANENT answer (failed,
@@ -171,9 +172,8 @@ class NoBidReauctionRouteTest(AppFixture):
         # ...with the dispatcher's own verdict kept as provenance
         self.assertEqual(row["dispatch"]["status"], "failed_to_assign")
         self.assertEqual(row["dispatch"]["errors"][0]["code"], 10)
-        # the bell: an Info line, not a Critical
-        self.assertEqual(alert["severity"], "info")
-        self.assertEqual(alert["message"], f"Task {task_id} canceled")
+        # the bell: nothing — the mission is waiting, not canceled (F-435)
+        self.assertIsNone(alert)
         # auctioned again, once, through the operator's dispatch path
         self.assertEqual(mock.call_count, 1)
         sent = json.loads(mock.call_args[0][0])
@@ -193,7 +193,7 @@ class NoBidReauctionRouteTest(AppFixture):
         self.assertEqual(200, resp.status_code, resp.content)
         self.assertEqual(resp.json()["labels"], labels)
         self.assertEqual(self.state(task_id)["status"], "canceled")
-        self.assertEqual(self.alert(task_id)["severity"], "info")
+        self.assertIsNone(self.alert(task_id))
         self.assertEqual(internal.redispatcher.reauctioned, before + 1)
 
     def test_FIRES_a_re_auction_that_cannot_be_made_is_a_named_failure(self):
@@ -202,7 +202,7 @@ class NoBidReauctionRouteTest(AppFixture):
         task_id = self.new_id()
         (row, alert), mock = self.ingest(closed_auction(task_id), expect_dispatch=False)
         self.assertEqual(row["status"], "canceled")
-        self.assertEqual(alert["severity"], "info")
+        self.assertIsNone(alert)
         mock.assert_not_called()
         row, alert = self.state(task_id), self.alert(task_id)
         self.assertEqual(row["status"], "failed")
@@ -247,7 +247,7 @@ class NoBidReauctionRouteTest(AppFixture):
             row["cancellation"]["labels"][1],
             r"^no robot answered the auction \(attempt 6\) — auctioned again",
         )
-        self.assertEqual(alert["severity"], "info")
+        self.assertIsNone(alert)
         self.assertEqual(mock.call_count, 1)
         sent = json.loads(mock.call_args[0][0])["request"]["labels"]
         self.assertEqual(no_bid_attempt_of(sent), NO_BID_MAX_ATTEMPTS + 2)
@@ -342,7 +342,7 @@ class NoBidReauctionRouteTest(AppFixture):
         }
         (row, alert), mock = self.ingest(hand_back, reply=ok_reply(child_id))
         self.assertEqual(row["status"], "canceled")
-        self.assertEqual(alert["severity"], "info")
+        self.assertIsNone(alert, "a hand-back is a wait, not a cancel (F-435)")
         self.assertEqual(mock.call_count, 1)
         labels = json.loads(mock.call_args[0][0])["request"]["labels"]
         self.assertIn("shift=night", labels)

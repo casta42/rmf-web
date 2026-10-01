@@ -19,6 +19,7 @@ from types import SimpleNamespace
 
 from api_server import models as mdl
 from api_server.models import tortoise_models as ttm
+from api_server.models.rmf_api.task_state import Cancellation
 from api_server.redispatch import (
     NO_BID_ATTEMPT_LABEL,
     NO_BID_MAX_ATTEMPTS,
@@ -219,16 +220,18 @@ class TestNoBidAlerts(unittest.IsolatedAsyncioTestCase):
     never becomes a failed mission: re-auction with backoff, and fail only
     after N attempts with the reason named." F-435 (G ruling 2026-10-01,
     ruling 2): only the answer that NO robot can ever take it runs out of
-    attempts; every other no-bid waits. At the bell, both ways: no
-    Critical while the mission waits, a Critical that names the reason when
-    the last permanent answer is in — on the real model, through the same
-    two calls process_msg makes (supersede, then alert_on_task_state)."""
+    attempts; every other no-bid waits. At the bell, both ways: nothing
+    while the mission waits — not even an Info line per attempt (the
+    mission raises ONE alert if it waits too long, waiting_missions.py) —
+    and a Critical that names the reason when the last permanent answer is
+    in — on the real model, through the same two calls process_msg makes
+    (supersede, then alert_on_task_state)."""
 
     async def ingest(self, state, repo):
         supersede(state)
         return await alert_on_task_state(state, repo)
 
-    async def test_PASSES_no_critical_while_the_mission_waits(self):
+    async def test_PASSES_nothing_rings_while_the_mission_waits(self):
         cases = [auction_state(a) for a in range(1, 9)]
         cases += [auction_state(6, errors=[REFUSAL, NO_BID_ERROR])]
         cases += [
@@ -237,13 +240,32 @@ class TestNoBidAlerts(unittest.IsolatedAsyncioTestCase):
         ]
         for state in cases:
             repo = Repo()
-            alert = await self.ingest(state, repo)
+            self.assertIsNone(await self.ingest(state, repo))
             self.assertEqual(state.status, mdl.TaskStatus.canceled)
-            self.assertEqual(alert.severity, ttm.Alert.Severity.Info)
-            self.assertEqual(alert.message, f"Task {TASK} canceled")
-            # the dispatcher never re-sends it, but if anything did: once
-            await self.ingest(state, repo)
-            self.assertEqual(repo.creates, 1)
+            # the dispatcher never re-sends it, but if anything did: still
+            # nothing
+            self.assertIsNone(await self.ingest(state, repo))
+            self.assertEqual(repo.creates, 0)
+
+    async def test_PASSES_a_hand_back_rings_nothing_either(self):
+        repo = Repo()
+        state = task_state("canceled")
+        state.cancellation = Cancellation(
+            unix_millis_request_time=1,
+            labels=[REDISPATCH_LABEL, "charge hold (F-319): [b4] is held"],
+        )
+        self.assertIsNone(await alert_on_task_state(state, repo))
+        self.assertEqual(repo.creates, 0)
+
+    async def test_FIRES_an_operator_s_cancel_still_rings_its_info_line(self):
+        repo = Repo()
+        state = task_state("canceled")
+        state.cancellation = Cancellation(
+            unix_millis_request_time=1, labels=["canceled from mission queue by g"]
+        )
+        alert = await alert_on_task_state(state, repo)
+        self.assertEqual(alert.severity, ttm.Alert.Severity.Info)
+        self.assertEqual(alert.message, f"Task {TASK} canceled")
 
     async def test_FIRES_a_critical_naming_the_reason_at_the_last_permanent_answer(
         self,
@@ -280,9 +302,8 @@ class TestNoBidAlerts(unittest.IsolatedAsyncioTestCase):
         ):
             repo = Repo()
             self.assertIsNone(no_bid_final_reason(state, now_s=1077.4))
-            alert = await self.ingest(state, repo)
+            self.assertIsNone(await self.ingest(state, repo))
             self.assertEqual(state.status, mdl.TaskStatus.canceled)
-            self.assertNotEqual(alert.severity, ttm.Alert.Severity.Critical)
 
     async def test_PASSES_the_failures_that_are_not_an_exhausted_auction(self):
         # a planner refusal with no code 10; a mission somebody canceled

@@ -294,6 +294,52 @@ class RedispatcherTest(unittest.TestCase):
     async def requests_get(self, task_id):
         return self.requests.get(task_id)
 
+    def test_F435_a_hand_back_that_cannot_go_back_is_reported_lost(self):
+        """FIRES: the request is not stored, or the dispatch is refused —
+        the mission is not waiting any more, and whoever shows it as
+        waiting is told. PASSES: a successful re-dispatch and an operator's
+        withdrawal are not losses."""
+        lost = []
+
+        async def on_lost(task_id, reason):
+            lost.append((task_id, reason))
+
+        async def refuse(_request):
+            raise RuntimeError("destination occupied (F-34)")
+
+        async def load(task_id):
+            return self.requests.get(task_id)
+
+        rd = Redispatcher(refuse, load, logging.getLogger("t"), lost=on_lost)
+        self.assertIsNone(self.run_(rd.maybe_redispatch(
+            "patrol.dispatch-1", "canceled", [REDISPATCH_LABEL, REASON],
+            sleep=self._sleep)))
+        self.assertIsNone(self.run_(rd.maybe_redispatch(
+            "not-stored", "canceled", [REDISPATCH_LABEL, REASON],
+            sleep=self._sleep)))
+        self.assertEqual(lost, [
+            ("patrol.dispatch-1", "destination occupied (F-34)"),
+            ("not-stored", "its request is not stored")])
+        self.assertEqual(rd.refused, 2)
+        lost.clear()
+        self.rd._lost = on_lost         # pylint: disable=protected-access
+        self.assertIsNotNone(self.run_(self.rd.maybe_redispatch(
+            "patrol.dispatch-1", "canceled", [REDISPATCH_LABEL, REASON],
+            sleep=self._sleep)))
+        self.rd._wanted = lambda _tid: False  # pylint: disable=protected-access
+        self.requests["w"] = FakeRequest(labels=None)
+        self.assertIsNone(self.run_(self.rd.maybe_redispatch(
+            "w", "canceled", [REDISPATCH_LABEL, REASON], sleep=self._sleep)))
+        self.assertEqual(lost, [])
+
+        async def broken(_task_id, _reason):
+            raise RuntimeError("registry gone")
+
+        rd._lost = broken               # pylint: disable=protected-access
+        self.assertIsNone(self.run_(rd.maybe_redispatch(
+            "patrol.dispatch-9", "canceled", [REDISPATCH_LABEL, REASON],
+            sleep=self._sleep)))
+
 
 class F435HandBackWaitsTest(unittest.TestCase):
     """G ruling 2026-10-01, ruling 2 (F-435): a hand-back is a WAIT,
