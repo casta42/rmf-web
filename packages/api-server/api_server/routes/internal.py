@@ -103,11 +103,14 @@ async def _fail_abandoned_reauction(task_id: str, reason: str) -> None:
         return
     await task_repo.save_task_state(state)
     task_events.task_states.on_next(state)
+    # keyed like every task alert — the row's own booking id (F-374), which
+    # is also what the alert catalogue reads (F3.2)
+    alert_id = state.booking.id
     alert = await alert_repo.create_alert(
-        task_id,
+        alert_id,
         "task",
         severity=ttm.Alert.Severity.Critical,
-        message=f"Task {task_id} failed: {reason}",
+        message=f"Task {alert_id} failed: {reason}",
     )
     if alert is not None:
         alert_events.alerts.on_next(alert)
