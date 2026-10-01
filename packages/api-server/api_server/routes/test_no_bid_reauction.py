@@ -12,13 +12,14 @@ shortened — the schedule itself is pinned in test_redispatch.py.
 KNOWN BAD, must act: a first-generation mission whose auction closed with
 no bid is stored as put back on the floor (never as failed), raises an
 Info line and no Critical, and is auctioned again exactly once with the
-labels that fold its chain. When the re-auction cannot be made, the row
-is amended to failed and a Critical alert names why.
+labels that fold its chain; so is a SIXTH silent auction (F-435: a
+transient no-bid is never a failure). When the re-auction cannot be
+made, the row is amended to failed and a Critical alert names why.
 
-KNOWN GOOD, must stay as it was: the last attempt (failed, Critical, the
-reason named), a failure with another cause, a mission somebody canceled
-while its auction was open, and an ordinary hand-back — which still
-takes its own path and spends its own budget.
+KNOWN GOOD, must stay as it was: the last PERMANENT answer (failed,
+Critical, the reason named — the one no-bid that still fails), a failure
+with another cause, a mission somebody canceled while its auction was
+open, and an ordinary hand-back — which still takes its own path.
 """
 
 import json
@@ -35,6 +36,7 @@ from api_server.redispatch import (
     CLASS_NO_BID,
     NO_BID_ATTEMPT_LABEL,
     NO_BID_MAX_ATTEMPTS,
+    NO_BID_PERMANENT_LABEL,
     NO_BID_SINCE_LABEL,
     REDISPATCH_LABEL,
     class_of,
@@ -118,7 +120,10 @@ class NoBidReauctionRouteTest(AppFixture):
         return resp.json()
 
     def alert(self, task_id):
+        """The task's alert, or None when it raised none."""
         resp = self.client.get(f"/alerts/{task_id}")
+        if resp.status_code == 404:
+            return None
         self.assertEqual(200, resp.status_code, resp.content)
         return resp.json()
 
@@ -128,7 +133,9 @@ class NoBidReauctionRouteTest(AppFixture):
         wait; the fleet mock)."""
         task_id = msg["data"]["booking"]["id"]
         with patch.object(redispatch, "NO_BID_BACKOFF_S", FAST), patch.object(
-            redispatch, "SETTLE_DELAY_S", 0.05
+            redispatch, "NO_BID_MAX_BACKOFF_S", 0.05
+        ), patch.object(redispatch, "HAND_BACK_BACKOFF_STEP_S", 0.05), patch.object(
+            redispatch, "HAND_BACK_MAX_BACKOFF_S", 0.05
         ), patch.object(tasks_service(), "call") as mock:
             if reply is not None:
                 mock.return_value = reply
@@ -158,7 +165,7 @@ class NoBidReauctionRouteTest(AppFixture):
         # pinned on the real model in test_redispatch.py)
         self.assertRegex(
             reason,
-            r"^no robot answered the auction \(attempt 1 of 5\) — auctioned "
+            r"^no robot answered the auction \(attempt 1\) — auctioned "
             r"again in \d+ s$",
         )
         # ...with the dispatcher's own verdict kept as provenance
@@ -220,16 +227,52 @@ class NoBidReauctionRouteTest(AppFixture):
 
     # -- known good: must stay as it was -------------------------------------
 
-    def test_PASSES_the_last_attempt_fails_with_the_reason_named(self):
+    def test_FIRES_a_sixth_silent_auction_is_auctioned_again(self):
+        """F-435: THE CONTRACT CHANGED. A fifth silent auction used to be
+        the failure; silence is transient now, and the sixth is put back on
+        the floor like the first."""
+        since = time.time() - 61
+        labels = [
+            f"{NO_BID_ATTEMPT_LABEL}{NO_BID_MAX_ATTEMPTS + 1}",
+            f"{NO_BID_SINCE_LABEL}{since:.0f}",
+        ]
+        task_id = self.dispatch(labels=labels)
+        child_id = self.new_id()
+        before = internal.redispatcher.no_bid_exhausted
+        (row, alert), mock = self.ingest(
+            closed_auction(task_id, labels=labels), reply=ok_reply(child_id)
+        )
+        self.assertEqual(row["status"], "canceled")
+        self.assertRegex(
+            row["cancellation"]["labels"][1],
+            r"^no robot answered the auction \(attempt 6\) — auctioned again",
+        )
+        self.assertEqual(alert["severity"], "info")
+        self.assertEqual(mock.call_count, 1)
+        sent = json.loads(mock.call_args[0][0])["request"]["labels"]
+        self.assertEqual(no_bid_attempt_of(sent), NO_BID_MAX_ATTEMPTS + 2)
+        self.assertEqual(int(no_bid_since_of(sent)), int(float(f"{since:.0f}")))
+        self.assertEqual(internal.redispatcher.no_bid_exhausted, before)
+
+    def test_PASSES_the_last_permanent_answer_fails_with_the_reason_named(self):
         since = time.time() - 61
         labels = [
             f"{NO_BID_ATTEMPT_LABEL}{NO_BID_MAX_ATTEMPTS}",
             f"{NO_BID_SINCE_LABEL}{since:.0f}",
+            f"{NO_BID_PERMANENT_LABEL}{NO_BID_MAX_ATTEMPTS - 1}",
         ]
         task_id = self.dispatch(labels=labels)
         before = internal.redispatcher.no_bid_exhausted
+        limited = {
+            "code": 9,
+            "category": "Not feasible",
+            "detail": "[TaskPlanner] Failed to compute assignments for task_id "
+            f"[{task_id}] due to insufficient battery capacity to accommodate "
+            "one or more requests by any of the robots in this fleet.",
+        }
         (row, alert), mock = self.ingest(
-            closed_auction(task_id, labels=labels), expect_dispatch=False
+            closed_auction(task_id, labels=labels, errors=[limited, no_bid_error(task_id)]),
+            expect_dispatch=False,
         )
         mock.assert_not_called()
         self.assertEqual(row["status"], "failed")
@@ -237,9 +280,10 @@ class NoBidReauctionRouteTest(AppFixture):
         self.assertEqual(alert["severity"], "critical")
         self.assertRegex(
             alert["message"],
-            rf"^Task {task_id} failed: no robot answered 5 auctions in a row "
-            r"over 6\d s — the fleet is not answering dispatches; check that "
-            r"the fleet coordination service is running$",
+            rf"^Task {task_id} failed: no robot offered to take this mission at 5 "
+            r"auctions in a row over 6\d s — no robot can finish this mission on "
+            r"one battery charge, even starting full — shorten it \(fewer rounds "
+            r"or stops\) or split it into smaller missions$",
         )
         self.assertEqual(internal.redispatcher.no_bid_exhausted, before + 1)
 

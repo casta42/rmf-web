@@ -5,12 +5,20 @@ back as a new dispatch carrying its origin, generation and reason, once,
 even though the fleet re-broadcasts the terminal state.
 
 KNOWN GOOD, must stay silent: an operator's cancel (no marker), a
-completed mission, a failed one, a direct mission with no stored request,
-and a chain that has already run MAX_GENERATIONS hops.
+completed mission, a failed one, a direct mission with no stored request.
+
+G ruling 2026-10-01, ruling 2 (F-435) — "a mission never fails because a
+robot is busy or charging ... It fails only if NO robot can ever take it
+... The 900 s / 8-hop failure path is removed." — proven both ways below:
+a chain at generation 9 and a charge hold at 1000 s are re-dispatched
+(both were failed), every class backs off 15 s per generation up to 60 s,
+a transient no-bid is auctioned again forever (60 s apart after the
+fourth), and only a PERMANENT answer ("insufficient battery capacity")
+still fails after five auctions with the reason named.
 
 G ruling 2026-10-01 item 6 (F-410/F-412 class) — "A timed-out auction
-never becomes a failed mission: re-auction with backoff, and fail only
-after N attempts with the reason named" — also proven both ways, below.
+never becomes a failed mission: re-auction with backoff" — also proven
+both ways, below.
 
 KNOWN BAD, must act: ANY dispatched mission whose auction closed with no
 bid (failed + dispatcher code 10), first generation included, is
@@ -19,8 +27,8 @@ not as a failure, exactly once, without spending a hand-back.
 
 KNOWN GOOD, must stay silent: a failure with any other cause, a mission
 somebody canceled, an ordinary hand-back (which must keep its own path),
-the LAST attempt (which is the failure), and the boring shapes — no
-labels, empty labels, no dispatch block, no stored request.
+the LAST permanent attempt (which is the failure), and the boring shapes
+— no labels, empty labels, no dispatch block, no stored request.
 """
 import asyncio
 import logging
@@ -29,41 +37,48 @@ from typing import List, Optional
 
 from pydantic import BaseModel
 
+from api_server import dispatch_reason
 from api_server import models as mdl
 from api_server.redispatch import (
-    CHARGE_HOLD_MAX_BACKOFF_S,
-    CHARGE_HOLD_MAX_WAIT_S,
     CLASS_CHARGE_HOLD,
     CLASS_HAND_BACK,
+    CLASS_LABEL,
     CLASS_NO_BID,
     GENERATION_LABEL,
-    MAX_GENERATIONS,
+    HAND_BACK_BACKOFF_STEP_S,
+    HAND_BACK_MAX_BACKOFF_S,
+    LEGACY_WAITING_LABEL,
     NO_BID_ATTEMPT_LABEL,
     NO_BID_BACKOFF_S,
     NO_BID_CODE,
     NO_BID_MAX_ATTEMPTS,
+    NO_BID_MAX_BACKOFF_S,
+    NO_BID_PERMANENT_LABEL,
     NO_BID_SINCE_LABEL,
     ORIGIN_LABEL,
+    PERMANENT_NO_BID_DETAIL,
     REASON_LABEL,
     REDISPATCH_LABEL,
-    WAITING_LABEL,
+    ROOT_LABEL,
     Redispatcher,
-    charge_hold_backoff,
     class_of,
     generation_of,
+    hand_back_backoff,
     is_charge_hold,
     next_labels,
     next_no_bid_labels,
     no_bid_attempt_of,
     no_bid_backoff,
+    no_bid_is_permanent,
+    no_bid_permanent_of,
     no_bid_since_of,
     no_bid_verdict,
     no_bid_verdict_of,
     origin_of,
     root_of,
     supersede,
+    transient_no_bid_backoff,
     unsupersede,
-    waiting_since_of,
     wants_redispatch,
     wants_retry,
 )
@@ -81,6 +96,21 @@ REASON = ("charge preemption (F-36): [gentle_bot_3] at SoC 0.17 cannot "
           "finish this mission and still reach [gentle_bot_3_charger] "
           "above 0.10 (the trip home costs 0.06) — mission returned to "
           "the fleet for re-dispatch")
+
+# the planner's answers, byte-identical to FleetUpdateHandle.cpp
+LIMITED = {"code": 9, "category": "Not feasible",
+           "detail": "[TaskPlanner] Failed to compute assignments for task_id "
+                     "[patrol.dispatch-1] due to insufficient battery capacity "
+                     "to accommodate one or more requests by any of the "
+                     "robots in this fleet."}
+LOW = {"code": 9, "category": "Not feasible",
+       "detail": "[TaskPlanner] Failed to compute assignments for task_id "
+                 "[patrol.dispatch-1] due to insufficient initial battery "
+                 "charge for all robots in this fleet."}
+PLANNER = {"code": 9, "category": "Not feasible",
+           "detail": "[TaskPlanner] Failed to compute assignments for task_id "
+                     "[patrol.dispatch-1]"}
+INTERNAL = {"code": 13, "category": "Internal bug", "detail": "boom"}
 
 
 class FakeRequest(BaseModel):
@@ -123,11 +153,16 @@ class LabelsTest(unittest.TestCase):
         self.assertEqual(
             sum(1 for lab in second if lab.startswith(GENERATION_LABEL)), 1)
 
-    def test_chain_stops_at_the_cap(self):
-        labels = [f"{GENERATION_LABEL}{MAX_GENERATIONS}"]
-        self.assertIsNone(next_labels(labels, "x", REASON))
-        labels = [f"{GENERATION_LABEL}{MAX_GENERATIONS - 1}"]
-        self.assertIsNotNone(next_labels(labels, "x", REASON))
+    def test_F435_the_chain_never_stops_and_the_generation_is_counted(self):
+        """THE CONTRACT CHANGED (G ruling 2026-10-01, ruling 2, F-435).
+        This test used to read "chain stops at the cap": generation 8 gave
+        None and the mission was dead. The ruling removed the bound — the
+        generation is still counted, it no longer stops anything."""
+        for gen in (7, 8, 9, 17, 1000):
+            out = next_labels([f"{GENERATION_LABEL}{gen}"], "x", REASON)
+            self.assertIsNotNone(out, gen)
+            self.assertEqual(generation_of(out), gen + 1)
+            self.assertEqual(class_of(out), CLASS_HAND_BACK)
 
     def test_garbage_generation_reads_as_zero(self):
         self.assertEqual(generation_of([f"{GENERATION_LABEL}abc"]), 0)
@@ -164,7 +199,9 @@ class RedispatcherTest(unittest.TestCase):
             "patrol.dispatch-1", "canceled", [REDISPATCH_LABEL, REASON],
             sleep=self._sleep))
         self.assertEqual(new_id, "patrol.dispatch-101")
-        self.assertEqual(self.slept, [5.0])            # settle first (F-291)
+        # F-435: every hand-back class backs off (the F-291 settle is
+        # inside the first step)
+        self.assertEqual(self.slept, [HAND_BACK_BACKOFF_STEP_S])
         self.assertEqual(len(self.dispatched), 1)
         labels = self.dispatched[0].labels
         self.assertIn("x=1", labels)
@@ -188,16 +225,14 @@ class RedispatcherTest(unittest.TestCase):
     def test_a_child_nobody_bid_on_is_auctioned_again_as_a_no_bid(self):
         # F-291: the fleet planner failed the immediate child twice.
         # THE CONTRACT CHANGED (G ruling 2026-10-01 item 6, F-410/F-412
-        # class). This test used to pin "retried once per generation,
-        # after 10 s, as generation 2" and, in its last lines, "a mission
-        # that is not a child is never retried". Both are gone: a no-bid
-        # auction is its own class now. The child is auctioned again on
-        # the no-bid schedule and its hand-back bookkeeping is carried,
-        # not advanced — an unanswered auction is not a hand-back.
+        # class): a no-bid auction is its own class. The child is
+        # auctioned again on the no-bid schedule and its hand-back
+        # bookkeeping is carried, not advanced.
         child_labels = next_labels(["x=1"], "patrol.dispatch-1", REASON)
         self.requests["patrol.dispatch-101"] = FakeRequest(labels=child_labels)
+        # F-435: a silent auction is transient — no "of 5" in its line
         self.assertIn(
-            "attempt 1 of 5",
+            "(attempt 1) — auctioned again in 2 s",
             wants_retry("failed", child_labels, [{"code": NO_BID_CODE}]))
         new_id = self.run_(self.rd.maybe_redispatch(
             "patrol.dispatch-101", "failed", None,
@@ -215,9 +250,7 @@ class RedispatcherTest(unittest.TestCase):
         self.assertEqual((self.rd.reauctioned, self.rd.redispatched), (1, 0))
         # a failure with another cause is never retried...
         self.assertIsNone(wants_retry("failed", child_labels, [{"code": 9}]))
-        # ...and the first-generation assertion is REVERSED by the ruling:
-        # it read assertIsNone, and a mission that is not a child is now
-        # auctioned again like any other.
+        # ...a mission that is not a child is auctioned again like any other
         self.assertIsNotNone(wants_retry("failed", ["x=1"],
                                          [{"code": NO_BID_CODE}]))
         # a canceled state with code 10 but no marker is somebody's
@@ -232,14 +265,20 @@ class RedispatcherTest(unittest.TestCase):
         self.assertEqual(self.dispatched, [])
         self.assertEqual(self.rd.refused, 1)
 
-    def test_capped_chain_is_refused_and_counted(self):
+    def test_F435_a_chain_past_the_old_hop_cap_is_re_dispatched(self):
+        """KNOWN BAD before F-435: generation 8 was refused and the mission
+        failed by allocation (drill 13). Now it is back on the floor, as
+        generation 9, after the capped backoff."""
         self.requests["deep"] = FakeRequest(
-            labels=[f"{GENERATION_LABEL}{MAX_GENERATIONS}"])
-        self.assertIsNone(self.run_(self.rd.maybe_redispatch(
+            labels=["x=1", f"{GENERATION_LABEL}8"])
+        new_id = self.run_(self.rd.maybe_redispatch(
             "deep", "canceled", [REDISPATCH_LABEL, REASON],
-            sleep=self._sleep)))
-        self.assertEqual(self.dispatched, [])
-        self.assertEqual(self.rd.refused, 1)
+            booking_labels=["x=1", f"{GENERATION_LABEL}8"],
+            sleep=self._sleep))
+        self.assertIsNotNone(new_id, "a hand-back is never stopped (F-435)")
+        self.assertEqual(generation_of(self.dispatched[0].labels), 9)
+        self.assertEqual(self.slept, [HAND_BACK_MAX_BACKOFF_S])
+        self.assertEqual((self.rd.redispatched, self.rd.refused), (1, 0))
 
     def test_a_refused_dispatch_is_logged_not_raised(self):
         async def refuse(_request):
@@ -256,89 +295,170 @@ class RedispatcherTest(unittest.TestCase):
         return self.requests.get(task_id)
 
 
-class ChargeHoldWaitTest(unittest.TestCase):
-    """F-319: a charge hold is a WAIT, not a defect.
+class F435HandBackWaitsTest(unittest.TestCase):
+    """G ruling 2026-10-01, ruling 2 (F-435): a hand-back is a WAIT,
+    whatever its class — no hop bound, no wall-clock bound, a progressive
+    backoff for every class.
 
-    KNOWN BAD, must not recur: with every healthy robot busy, the planner
-    picks the held robot again the moment the mission is back on the
-    floor. Same robot, same refusal — the old hop cap burned all eight in
-    about two minutes and killed the mission. The drill lost four that
-    way before this existed.
+    KNOWN BAD (drill 13, 38 of 88 missions failed by allocation): a
+    charge-hold chain past 900 s, and any chain past 8 hand-backs, was
+    stopped. Both are re-dispatched now.
 
-    KNOWN GOOD, must stay untouched: every OTHER reason keeps the
-    eight-hop cap, because eight hand-backs for any other cause really is
-    a robot winning a mission it cannot run.
-    """
+    KNOWN GOOD: the generation is still counted, the class label still
+    says whether a robot was charging, and the backoff is still capped so
+    a waiting mission is offered to the fleet every minute."""
+
+    def setUp(self):
+        self.dispatched: List[FakeRequest] = []
+        self.slept: List[float] = []
+        self.requests = {}
+
+        async def dispatch(request):
+            self.dispatched.append(request)
+            return f"child-{len(self.dispatched)}"
+
+        async def load(task_id):
+            return self.requests.get(task_id)
+
+        self.rd = Redispatcher(dispatch, load, logging.getLogger("t"))
+
+    async def _sleep(self, seconds):
+        self.slept.append(seconds)
+
+    def hand_back(self, task_id, labels, reason):
+        self.requests[task_id] = FakeRequest(labels=labels)
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(self.rd.maybe_redispatch(
+                task_id, "canceled", [REDISPATCH_LABEL, reason],
+                booking_labels=labels, sleep=self._sleep))
+        finally:
+            loop.close()
 
     def test_the_charge_hold_reasons_are_recognised(self):
         self.assertTrue(is_charge_hold(HOLD_AT_AWARD))
         self.assertTrue(is_charge_hold(HOLD_FIRST_TICK))
 
     def test_nothing_else_is_mistaken_for_a_charge_hold(self):
-        # the rescue preemption is a real hand-back but NOT a wait: the
-        # robot is going home now, and another robot should take this.
         self.assertFalse(is_charge_hold(REASON))
         self.assertFalse(is_charge_hold("robot fault (F-299): [b2] is faulted"))
         self.assertFalse(is_charge_hold(None))
         self.assertFalse(is_charge_hold(""))
 
-    def test_a_charge_hold_outlives_the_hop_cap(self):
-        """The defect this fixes: a mission that only needed to wait."""
-        labels = [f"{GENERATION_LABEL}{MAX_GENERATIONS + 4}",
-                  f"{WAITING_LABEL}1000"]
-        out = next_labels(labels, "origin-1", HOLD_AT_AWARD, now_s=1100.0)
-        self.assertIsNotNone(out, "a charge hold must not die on hop count")
-        self.assertEqual(generation_of(out), MAX_GENERATIONS + 5)
-        self.assertEqual(waiting_since_of(out), 1000.0,
-                         "the clock must start at the FIRST hand-back")
+    def test_FIRES_a_charge_hold_chain_at_generation_9_is_re_dispatched(self):
+        labels = ["x=1", f"{GENERATION_LABEL}9", f"{LEGACY_WAITING_LABEL}1000",
+                  f"{ROOT_LABEL}P", f"{CLASS_LABEL}{CLASS_CHARGE_HOLD}"]
+        new_id = self.hand_back("h9", labels, HOLD_AT_AWARD)
+        self.assertEqual(new_id, "child-1")
+        sent = self.dispatched[0].labels
+        self.assertEqual(generation_of(sent), 10)
+        self.assertEqual(class_of(sent), CLASS_CHARGE_HOLD)
+        self.assertEqual(root_of(sent), "P", "the chain is the same mission")
+        self.assertEqual(origin_of(sent), "h9")
+        self.assertEqual(self.slept, [HAND_BACK_MAX_BACKOFF_S])
 
-    def test_a_charge_hold_still_stops_on_the_clock(self):
-        labels = [f"{WAITING_LABEL}1000"]
-        self.assertIsNone(
-            next_labels(labels, "origin-1", HOLD_AT_AWARD,
-                        now_s=1000.0 + CHARGE_HOLD_MAX_WAIT_S + 1),
-            "a robot that never resumes IS a defect")
+    def test_FIRES_a_charge_hold_chain_waiting_1000_s_is_re_dispatched(self):
+        """The 900 s wall clock is gone: the legacy waiting-since label of a
+        chain in flight at deploy time is stripped and stops nothing."""
+        old = 1_700_000_000.0
+        labels = ["x=1", f"{GENERATION_LABEL}3",
+                  f"{LEGACY_WAITING_LABEL}{old - 1000:.0f}"]
+        new_id = self.hand_back("h1000", labels, HOLD_FIRST_TICK)
+        self.assertEqual(new_id, "child-1")
+        sent = self.dispatched[0].labels
+        self.assertFalse(any(lab.startswith(LEGACY_WAITING_LABEL)
+                             for lab in sent), "the bound's label is gone")
+        self.assertEqual(generation_of(sent), 4)
+        self.assertEqual(self.slept, [45.0])
 
-    def test_the_clock_starts_on_the_first_hand_back(self):
-        out = next_labels([], "origin-1", HOLD_AT_AWARD, now_s=500.0)
-        self.assertEqual(waiting_since_of(out), 500.0)
-        # ...and is carried down the chain unchanged
-        out2 = next_labels(out, "origin-2", HOLD_AT_AWARD, now_s=800.0)
-        self.assertEqual(waiting_since_of(out2), 500.0)
+    def test_FIRES_every_other_class_past_eight_is_re_dispatched(self):
+        for gen in (8, 9, 50):
+            self.hand_back(f"g{gen}", [f"{GENERATION_LABEL}{gen}"], REASON)
+        self.assertEqual([generation_of(r.labels) for r in self.dispatched],
+                         [9, 10, 51])
+        self.assertEqual({class_of(r.labels) for r in self.dispatched},
+                         {CLASS_HAND_BACK})
+        self.assertEqual((self.rd.redispatched, self.rd.refused), (3, 0))
 
-    def test_every_other_reason_keeps_the_eight_hop_cap(self):
-        """The boring half: this change must not loosen anything else."""
-        capped = [f"{GENERATION_LABEL}{MAX_GENERATIONS}"]
-        self.assertIsNone(next_labels(capped, "origin-1", REASON),
-                          "the rescue-preemption cap must be untouched")
-        self.assertIsNotNone(
-            next_labels([f"{GENERATION_LABEL}{MAX_GENERATIONS - 1}"],
-                        "origin-1", REASON))
+    def test_every_class_backs_off_15_s_per_generation_capped_at_60(self):
+        self.assertEqual((HAND_BACK_BACKOFF_STEP_S, HAND_BACK_MAX_BACKOFF_S),
+                         (15.0, 60.0))
+        self.assertEqual([hand_back_backoff(g) for g in range(0, 7)],
+                         [15.0, 15.0, 30.0, 45.0, 60.0, 60.0, 60.0])
+        self.assertEqual(hand_back_backoff(1000), 60.0)
+        self.assertEqual(hand_back_backoff(-3), 15.0)
+        # the class does not change the wait: same generation, same backoff
+        for reason in (REASON, HOLD_AT_AWARD, HOLD_FIRST_TICK,
+                       "robot fault (F-299): [b2] is faulted at award"):
+            self.hand_back(f"r-{len(self.slept)}", [f"{GENERATION_LABEL}2"],
+                           reason)
+        self.assertEqual(self.slept, [30.0] * 4)
 
-    def test_the_wait_outlasts_a_full_charge(self):
-        """0.19 -> 0.98 is ~630 s on the compressed pack; the bound has
-        to comfortably exceed that or the fix does not fix anything."""
-        self.assertGreater(CHARGE_HOLD_MAX_WAIT_S, 630.0)
-
-    def test_the_backoff_grows_and_is_capped(self):
-        first = charge_hold_backoff(0)
-        self.assertGreater(first, 0.0)
-        self.assertGreaterEqual(charge_hold_backoff(2), charge_hold_backoff(1))
-        self.assertEqual(charge_hold_backoff(99), CHARGE_HOLD_MAX_BACKOFF_S)
-        # and several attempts still fit inside the wall-clock bound
-        self.assertGreater(CHARGE_HOLD_MAX_WAIT_S / CHARGE_HOLD_MAX_BACKOFF_S,
-                           4.0)
+    def test_the_class_label_still_names_a_charge_hold(self):
+        out = next_labels([], "P", HOLD_AT_AWARD)
+        self.assertEqual(class_of(out), CLASS_CHARGE_HOLD)
+        self.assertFalse(any(lab.startswith(LEGACY_WAITING_LABEL)
+                             for lab in out))
+        self.assertEqual(class_of(next_labels([], "P", REASON)),
+                         CLASS_HAND_BACK)
 
 
 NO_BID = [{"code": NO_BID_CODE}]
 # the real persisted shape when the fleet adapter answered with a refusal:
 # its own error first, then the dispatcher's code 10 (Dispatcher.cpp)
 ANSWERED = [{"code": 9}, {"code": NO_BID_CODE}]
+PERMANENT = [LIMITED, {"code": NO_BID_CODE}]
+
+
+def permanent_labels(before: int, attempt: Optional[int] = None) -> List[str]:
+    """Labels of an attempt preceded by `before` permanent answers."""
+    labels = ["x=1"]
+    if attempt is not None:
+        labels.append(f"{NO_BID_ATTEMPT_LABEL}{attempt}")
+    if before:
+        labels.append(f"{NO_BID_PERMANENT_LABEL}{before}")
+    return labels
+
+
+class PermanenceTest(unittest.TestCase):
+    """F-435: which answers mean NO robot can ever take the mission. Both
+    ways, on both shapes the errors arrive in (dicts from the hook, the
+    real Error model from the state)."""
+
+    def test_the_detail_is_the_planner_s_own_and_dispatch_reason_s(self):
+        self.assertEqual(PERMANENT_NO_BID_DETAIL,
+                         dispatch_reason._LIMITED_CAPACITY)  # noqa: SLF001
+        self.assertIn(PERMANENT_NO_BID_DETAIL, LIMITED["detail"])
+
+    def test_FIRES_on_limited_capacity_alone_or_beside_others(self):
+        self.assertTrue(no_bid_is_permanent([LIMITED]))
+        self.assertTrue(no_bid_is_permanent(PERMANENT))
+        self.assertTrue(no_bid_is_permanent([LOW, LIMITED, NO_BID[0]]))
+        from api_server.models.rmf_api.error import Error
+        self.assertTrue(no_bid_is_permanent([Error(**LIMITED)]))
+
+    def test_PASSES_every_transient_answer(self):
+        for errors in ([], None, NO_BID, [LOW, NO_BID[0]],
+                       [PLANNER, NO_BID[0]], [INTERNAL, NO_BID[0]],
+                       ANSWERED, [{"code": 9, "detail": None}],
+                       [{"code": 10, "detail": LIMITED["detail"]}],
+                       [{"code": 13, "detail": LIMITED["detail"]}],
+                       [{}], [{"code": "x"}]):
+            self.assertFalse(no_bid_is_permanent(errors), errors)
+
+    def test_garbage_permanent_counts_read_as_none(self):
+        for labels in (None, [], [f"{NO_BID_PERMANENT_LABEL}abc"],
+                       [f"{NO_BID_PERMANENT_LABEL}-2"],
+                       [f"{NO_BID_PERMANENT_LABEL}"]):
+            self.assertEqual(no_bid_permanent_of(labels), 0, labels)
+        self.assertEqual(no_bid_permanent_of([f"{NO_BID_PERMANENT_LABEL}3"]),
+                         3)
 
 
 class NoBidVerdictTest(unittest.TestCase):
-    """G ruling 2026-10-01 item 6 (F-410/F-412 class): which states are an
-    auction nobody bid on, and which attempt it was. Both ways."""
+    """G ruling 2026-10-01 item 6 (F-410/F-412 class) and F-435: which
+    states are an auction nobody bid on, which attempt it was, and whether
+    it is the last. Both ways."""
 
     def test_FIRES_on_a_first_generation_mission(self):
         # the boring first-generation shapes: no labels, empty labels,
@@ -350,6 +470,7 @@ class NoBidVerdictTest(unittest.TestCase):
             self.assertEqual(verdict.delay_s, NO_BID_BACKOFF_S[0])
             self.assertFalse(verdict.final)
             self.assertFalse(verdict.answered)
+            self.assertFalse(verdict.permanent)
 
     def test_FIRES_and_says_when_the_fleet_answered_with_a_refusal(self):
         verdict = no_bid_verdict("failed", None, ANSWERED)
@@ -363,17 +484,19 @@ class NoBidVerdictTest(unittest.TestCase):
         """supersede() rewrites failed -> canceled + marker and keeps the
         dispatcher's errors: that shape must still read as the no-bid it
         is, or it would be taken for a hand-back."""
-        labels = [f"{NO_BID_ATTEMPT_LABEL}3"]
-        failed = no_bid_verdict("failed", labels, NO_BID)
-        superseded = no_bid_verdict(
-            "canceled", labels, NO_BID,
-            [REDISPATCH_LABEL, "no robot answered the auction ..."])
-        self.assertEqual(failed, superseded)
-        self.assertEqual(failed.attempt, 3)
+        for labels, errors in (([f"{NO_BID_ATTEMPT_LABEL}3"], NO_BID),
+                               (permanent_labels(2, 3), PERMANENT)):
+            failed = no_bid_verdict("failed", labels, errors)
+            superseded = no_bid_verdict(
+                "canceled", labels, errors,
+                [REDISPATCH_LABEL, "no robot answered the auction ..."])
+            self.assertEqual(failed, superseded)
+            self.assertEqual(failed.attempt, 3)
 
     def test_PASSES_everything_that_is_not_a_no_bid(self):
         # a failure with another cause, or with no dispatch errors at all
         self.assertIsNone(no_bid_verdict("failed", None, [{"code": 9}]))
+        self.assertIsNone(no_bid_verdict("failed", None, [LIMITED]))
         self.assertIsNone(no_bid_verdict("failed", None, [{"code": 13}]))
         self.assertIsNone(no_bid_verdict("failed", None, None))
         self.assertIsNone(no_bid_verdict("failed", None, []))
@@ -396,40 +519,92 @@ class NoBidVerdictTest(unittest.TestCase):
         self.assertIsNone(no_bid_verdict(
             "canceled", None, NO_BID, ["operator: wrong dock"]))
         self.assertIsNone(no_bid_verdict("canceled", None, NO_BID, None))
+        self.assertIsNone(no_bid_verdict(
+            "failed", None, PERMANENT, ["canceled from mission queue by g"]))
 
-    def test_the_backoff_schedule_is_the_ruled_one(self):
+    def test_the_permanent_schedule_is_item_6_exactly(self):
         self.assertEqual(NO_BID_MAX_ATTEMPTS, 5)
         self.assertEqual(
             [no_bid_backoff(n) for n in (1, 2, 3, 4)], [2.0, 5.0, 10.0, 20.0])
-        # one wait before each of attempts 2..N, and none after the last
         self.assertEqual(len(NO_BID_BACKOFF_S), NO_BID_MAX_ATTEMPTS - 1)
         self.assertIsNone(no_bid_backoff(NO_BID_MAX_ATTEMPTS))
         self.assertIsNone(no_bid_backoff(NO_BID_MAX_ATTEMPTS + 7))
-        # a count below one is a first attempt, never an index error
         self.assertEqual(no_bid_backoff(0), 2.0)
         self.assertEqual(no_bid_backoff(-3), 2.0)
-        # a mission the fleet never answers has failed 37 s of waiting
-        # (plus its five auctions) after it was dispatched
         self.assertEqual(sum(NO_BID_BACKOFF_S), 37.0)
+        # each permanent answer in a row, on the verdict
+        verdicts = [no_bid_verdict("failed", permanent_labels(k, k + 1),
+                                   PERMANENT) for k in range(5)]
+        self.assertEqual([v.run for v in verdicts], [1, 2, 3, 4, 5])
+        self.assertEqual([v.delay_s for v in verdicts],
+                         [2.0, 5.0, 10.0, 20.0, None])
+        self.assertEqual([v.final for v in verdicts],
+                         [False, False, False, False, True])
+        self.assertTrue(all(v.permanent and v.answered for v in verdicts))
 
-    def test_the_last_attempt_is_final_and_is_not_retried(self):
-        last = [f"{NO_BID_ATTEMPT_LABEL}{NO_BID_MAX_ATTEMPTS}"]
-        verdict = no_bid_verdict("failed", last, NO_BID)
+    def test_F435_the_transient_schedule_never_ends(self):
+        self.assertEqual(NO_BID_MAX_BACKOFF_S, 60.0)
+        self.assertEqual([transient_no_bid_backoff(n) for n in range(1, 9)],
+                         [2.0, 5.0, 10.0, 20.0, 60.0, 60.0, 60.0, 60.0])
+        self.assertEqual(transient_no_bid_backoff(0), 2.0)
+        self.assertEqual(transient_no_bid_backoff(10_000), 60.0)
+        for errors in (NO_BID, ANSWERED, [LOW, NO_BID[0]],
+                       [PLANNER, NO_BID[0]], [INTERNAL, NO_BID[0]]):
+            for attempt in (4, 5, 6, 50):
+                verdict = no_bid_verdict(
+                    "failed", [f"{NO_BID_ATTEMPT_LABEL}{attempt}"], errors)
+                self.assertFalse(verdict.final, (errors, attempt))
+                self.assertFalse(verdict.permanent)
+                self.assertEqual(verdict.delay_s,
+                                 transient_no_bid_backoff(attempt))
+
+    def test_F435_the_fifth_silent_auction_is_not_the_last_any_more(self):
+        """THE CONTRACT CHANGED (F-435). This test used to read "the last
+        attempt is final and is not retried" for a SILENT fifth auction.
+        Silence is transient now; only the fifth PERMANENT answer is."""
+        fifth = [f"{NO_BID_ATTEMPT_LABEL}{NO_BID_MAX_ATTEMPTS}"]
+        verdict = no_bid_verdict("failed", fifth, NO_BID)
+        self.assertFalse(verdict.final)
+        self.assertEqual(verdict.delay_s, NO_BID_MAX_BACKOFF_S)
+        self.assertIn("auctioned again in 60 s",
+                      wants_retry("failed", fifth, NO_BID))
+        # ...and the fifth permanent answer IS the last
+        last = permanent_labels(NO_BID_MAX_ATTEMPTS - 1, NO_BID_MAX_ATTEMPTS)
+        verdict = no_bid_verdict("failed", last, PERMANENT)
         self.assertTrue(verdict.final)
-        self.assertEqual(verdict.attempt, NO_BID_MAX_ATTEMPTS)
-        self.assertIsNone(wants_retry("failed", last, NO_BID))
-        # the one before it still is
-        fourth = [f"{NO_BID_ATTEMPT_LABEL}{NO_BID_MAX_ATTEMPTS - 1}"]
-        self.assertFalse(no_bid_verdict("failed", fourth, NO_BID).final)
+        self.assertIsNone(wants_retry("failed", last, PERMANENT))
+        fourth = permanent_labels(NO_BID_MAX_ATTEMPTS - 2)
+        self.assertFalse(no_bid_verdict("failed", fourth, PERMANENT).final)
         self.assertIn("auctioned again in 20 s",
-                      wants_retry("failed", fourth, NO_BID))
+                      wants_retry("failed", fourth, PERMANENT))
+
+    def test_a_transient_answer_between_permanent_ones_starts_the_count_again(
+            self):
+        """The bound counts permanent answers IN A ROW: a fleet that says
+        the mission can be taken (every robot too low NOW) resets it."""
+        labels = permanent_labels(3, 6)
+        self.assertEqual(no_bid_verdict("failed", labels, PERMANENT).run, 4)
+        out = next_no_bid_labels(labels, "t6", 1.0, permanent=False)
+        self.assertEqual(no_bid_permanent_of(out), 0)
+        self.assertFalse(any(lab.startswith(NO_BID_PERMANENT_LABEL)
+                             for lab in out))
+        self.assertEqual(no_bid_verdict("failed", out, PERMANENT).run, 1)
 
     def test_the_reason_reads_as_the_ruling_wrote_it(self):
         second = [f"{NO_BID_ATTEMPT_LABEL}2"]
         self.assertEqual(
             wants_retry("failed", second, NO_BID),
-            "no robot answered the auction (attempt 2 of 5) — auctioned "
-            "again in 5 s")
+            "no robot answered the auction (attempt 2) — auctioned again in "
+            "5 s")
+        self.assertEqual(
+            wants_retry("failed", permanent_labels(1, 2), PERMANENT),
+            "no robot offered to take this mission (attempt 2 of 5) — "
+            "auctioned again in 5 s")
+        self.assertEqual(
+            wants_retry("failed", [f"{NO_BID_ATTEMPT_LABEL}7"],
+                        [LOW, NO_BID[0]]),
+            "no robot offered to take this mission (attempt 7) — auctioned "
+            "again in 60 s")
 
     def test_a_garbage_count_reads_as_the_first_attempt(self):
         self.assertEqual(no_bid_attempt_of([f"{NO_BID_ATTEMPT_LABEL}abc"]), 1)
@@ -441,8 +616,8 @@ class NoBidVerdictTest(unittest.TestCase):
 
 
 class NoBidLabelsTest(unittest.TestCase):
-    """The two budgets must not spend each other, and every row must
-    carry enough to fold its chain (root, attempt, class)."""
+    """The no-bid and hand-back counts must not spend each other, and
+    every row must carry enough to fold its chain (root, attempt, class)."""
 
     def test_first_generation_gets_the_fold_labels_and_no_hand_back(self):
         out = next_no_bid_labels(["shift=night"], "patrol.dispatch-1", 1000.0)
@@ -452,20 +627,23 @@ class NoBidLabelsTest(unittest.TestCase):
         self.assertEqual(class_of(out), CLASS_NO_BID)
         self.assertEqual(no_bid_attempt_of(out), 2)
         self.assertEqual(no_bid_since_of(out), 1000.0)
+        self.assertEqual(no_bid_permanent_of(out), 0)
         # nothing of the hand-back class was invented
         self.assertEqual(generation_of(out), 0)
         self.assertFalse(any(lab.startswith((GENERATION_LABEL, REASON_LABEL,
-                                             WAITING_LABEL)) for lab in out))
+                                             NO_BID_PERMANENT_LABEL))
+                             for lab in out))
         # the boring inputs
         self.assertEqual(no_bid_attempt_of(next_no_bid_labels(None, "a", 1.0)),
                          2)
         self.assertEqual(no_bid_attempt_of(next_no_bid_labels([], "a", 1.0)),
                          2)
 
-    def test_the_count_climbs_the_root_and_clock_stay_and_it_stops(self):
+    def test_F435_a_transient_count_climbs_forever(self):
         labels, origin = None, "t1"
-        for attempt in range(2, NO_BID_MAX_ATTEMPTS + 1):
+        for attempt in range(2, 12):
             labels = next_no_bid_labels(labels, origin, 1000.0 + attempt)
+            self.assertIsNotNone(labels, attempt)
             self.assertEqual(no_bid_attempt_of(labels), attempt)
             self.assertEqual(origin_of(labels), origin)
             self.assertEqual(root_of(labels), "t1")
@@ -476,8 +654,22 @@ class NoBidLabelsTest(unittest.TestCase):
                 self.assertEqual(
                     sum(1 for lab in labels if lab.startswith(prefix)), 1)
             origin = f"t{attempt}"
-        self.assertIsNone(next_no_bid_labels(labels, origin, 9999.0),
-                          "the fifth auction is the last")
+
+    def test_a_permanent_count_climbs_and_stops_at_the_fifth(self):
+        labels, origin = None, "t1"
+        for k in range(1, NO_BID_MAX_ATTEMPTS):
+            labels = next_no_bid_labels(labels, origin, 1.0, permanent=True)
+            self.assertEqual(no_bid_permanent_of(labels), k)
+            self.assertEqual(no_bid_attempt_of(labels), k + 1)
+            self.assertEqual(
+                sum(1 for lab in labels
+                    if lab.startswith(NO_BID_PERMANENT_LABEL)), 1)
+            origin = f"t{k + 1}"
+        self.assertIsNone(
+            next_no_bid_labels(labels, origin, 1.0, permanent=True),
+            "the fifth permanent answer is the last")
+        # a transient answer at that point is still auctioned again
+        self.assertIsNotNone(next_no_bid_labels(labels, origin, 1.0))
 
     def test_mixed_chain_hand_back_then_no_bid_then_hand_back(self):
         # P is handed back (rescue preemption) -> C1
@@ -488,7 +680,7 @@ class NoBidLabelsTest(unittest.TestCase):
         # provenance is carried untouched, the link moves to the row
         # each one replaces
         c2 = next_no_bid_labels(c1, "C1", 500.0)
-        c3 = next_no_bid_labels(c2, "C2", 600.0)
+        c3 = next_no_bid_labels(c2, "C2", 600.0, permanent=True)
         for labels, parent, attempt in ((c2, "C1", 2), (c3, "C2", 3)):
             self.assertIn("x=1", labels)
             self.assertEqual(generation_of(labels), 1)
@@ -498,6 +690,7 @@ class NoBidLabelsTest(unittest.TestCase):
             self.assertEqual(class_of(labels), CLASS_NO_BID)
             self.assertEqual(no_bid_attempt_of(labels), attempt)
             self.assertEqual(no_bid_since_of(labels), 500.0)
+        self.assertEqual(no_bid_permanent_of(c3), 1)
         # C3 is awarded, and handed back again -> C4: one more hand-back,
         # and the no-bid run is over — the fleet answered
         c4 = next_labels(c3, "C3", REASON)
@@ -507,52 +700,42 @@ class NoBidLabelsTest(unittest.TestCase):
         self.assertEqual(no_bid_attempt_of(c4), 1)
         self.assertIsNone(no_bid_since_of(c4))
         self.assertFalse(any(lab.startswith((NO_BID_ATTEMPT_LABEL,
-                                             NO_BID_SINCE_LABEL))
+                                             NO_BID_SINCE_LABEL,
+                                             NO_BID_PERMANENT_LABEL))
                              for lab in c4))
         self.assertIn("x=1", c4)
 
-    def test_no_bid_retries_never_spend_the_hand_back_budget(self):
-        labels = [f"{GENERATION_LABEL}{MAX_GENERATIONS - 1}"]
+    def test_no_bid_retries_never_advance_the_generation(self):
+        labels = [f"{GENERATION_LABEL}7"]
         origin = "t0"
-        for n in range(NO_BID_MAX_ATTEMPTS - 1):
+        for n in range(12):
             labels = next_no_bid_labels(labels, origin, 1.0)
             origin = f"t{n + 1}"
-        self.assertEqual(generation_of(labels), MAX_GENERATIONS - 1)
-        # the eighth hand-back is still available after four no-bids...
-        self.assertIsNotNone(next_labels(labels, origin, REASON))
-        # ...and a mission already AT the hand-back cap is still auctioned
-        # again when nobody bids: that is not a ninth hand-back
-        capped = [f"{GENERATION_LABEL}{MAX_GENERATIONS}"]
-        out = next_no_bid_labels(capped, "x", 1.0)
-        self.assertEqual(generation_of(out), MAX_GENERATIONS)
-        self.assertIsNone(next_labels(out, "y", REASON),
-                          "and the cap itself is exactly where it was")
+        self.assertEqual(generation_of(labels), 7)
+        self.assertEqual(generation_of(next_labels(labels, origin, REASON)), 8)
 
-    def test_hand_backs_never_spend_the_no_bid_budget(self):
-        labels = next_no_bid_labels(None, "t0", 1.0)
-        for n in range(NO_BID_MAX_ATTEMPTS - 2):
-            labels = next_no_bid_labels(labels, f"n{n}", 1.0)
-        self.assertEqual(no_bid_attempt_of(labels), NO_BID_MAX_ATTEMPTS)
-        self.assertIsNone(next_no_bid_labels(labels, "last", 1.0))
+    def test_hand_backs_clear_the_permanent_count(self):
+        labels = None
+        for n in range(NO_BID_MAX_ATTEMPTS - 1):
+            labels = next_no_bid_labels(labels, f"n{n}", 1.0, permanent=True)
+        self.assertEqual(no_bid_permanent_of(labels), NO_BID_MAX_ATTEMPTS - 1)
+        self.assertIsNone(next_no_bid_labels(labels, "last", 1.0,
+                                             permanent=True))
         # an award and a hand-back later, the mission has all five again
         handed_back = next_labels(labels, "last", REASON)
         self.assertEqual(no_bid_attempt_of(handed_back), 1)
-        self.assertEqual(
-            no_bid_attempt_of(next_no_bid_labels(handed_back, "h", 2.0)), 2)
+        self.assertEqual(no_bid_permanent_of(handed_back), 0)
+        self.assertEqual(no_bid_permanent_of(
+            next_no_bid_labels(handed_back, "h", 2.0, permanent=True)), 1)
 
-    def test_a_charge_hold_clock_survives_a_no_bid(self):
-        held = next_labels([], "P", HOLD_AT_AWARD, now_s=500.0)
+    def test_a_charge_hold_class_survives_a_no_bid(self):
+        held = next_labels([], "P", HOLD_AT_AWARD)
         self.assertEqual(class_of(held), CLASS_CHARGE_HOLD)
         retried = next_no_bid_labels(held, "H1", 520.0)
-        self.assertEqual(waiting_since_of(retried), 500.0)
         self.assertEqual(generation_of(retried), 1)
-        again = next_labels(retried, "N1", HOLD_AT_AWARD, now_s=800.0)
-        self.assertEqual(waiting_since_of(again), 500.0)
+        again = next_labels(retried, "N1", HOLD_AT_AWARD)
         self.assertEqual(class_of(again), CLASS_CHARGE_HOLD)
-        # and the wall-clock bound is still the charge hold's own
-        self.assertIsNone(next_labels(
-            retried, "N1", HOLD_AT_AWARD,
-            now_s=500.0 + CHARGE_HOLD_MAX_WAIT_S + 1))
+        self.assertEqual(generation_of(again), 2)
 
 
 class ReauctionTest(unittest.TestCase):
@@ -564,6 +747,7 @@ class ReauctionTest(unittest.TestCase):
         self.abandoned = []
         self.slept = []
         self.first_seen = {"patrol.dispatch-1": 4000.0}
+        self.withdrawn = set()
 
         async def dispatch(request):
             self.dispatched.append(request)
@@ -582,7 +766,8 @@ class ReauctionTest(unittest.TestCase):
 
         self.rd = Redispatcher(dispatch, load, logging.getLogger("t"),
                                abandon=abandon, first_seen=first_seen,
-                               clock=lambda: 5000.0)
+                               clock=lambda: 5000.0,
+                               wanted=lambda tid: tid not in self.withdrawn)
 
     async def _sleep(self, seconds):
         self.slept.append(seconds)
@@ -620,27 +805,54 @@ class ReauctionTest(unittest.TestCase):
         self.assertEqual((self.rd.redispatched, self.rd.refused), (0, 0))
         self.assertEqual(self.abandoned, [])
 
-    def test_a_mission_nobody_ever_answers_gets_five_auctions_then_fails(self):
+    def test_F435_a_mission_nobody_answers_is_auctioned_again_forever(self):
+        """THE CONTRACT CHANGED (F-435). This test used to read "a mission
+        nobody ever answers gets five auctions, then fails". Silence is
+        transient: the sixth, seventh, ... auction come 60 s apart."""
         task_id = "patrol.dispatch-1"
-        for _ in range(NO_BID_MAX_ATTEMPTS - 1):
+        for _ in range(8):
             task_id = self.no_bid(task_id)
             self.assertIsNotNone(task_id)
-        self.assertEqual(self.slept, [2.0, 5.0, 10.0, 20.0])
-        self.assertEqual(len(self.dispatched), NO_BID_MAX_ATTEMPTS - 1)
-        self.assertEqual(
-            [no_bid_attempt_of(r.labels) for r in self.dispatched],
-            [2, 3, 4, 5])
+        self.assertEqual(self.slept,
+                         [2.0, 5.0, 10.0, 20.0, 60.0, 60.0, 60.0, 60.0])
+        self.assertEqual([no_bid_attempt_of(r.labels) for r in self.dispatched],
+                         [2, 3, 4, 5, 6, 7, 8, 9])
         self.assertEqual({root_of(r.labels) for r in self.dispatched},
                          {"patrol.dispatch-1"})
         self.assertEqual({no_bid_since_of(r.labels) for r in self.dispatched},
                          {4000.0})
-        # the fifth auction also gets no bid: that is the failure. No
-        # sixth auction, no wait, and it is counted as what it is.
-        self.assertIsNone(self.no_bid(task_id))
+        self.assertEqual((self.rd.no_bid_exhausted, self.rd.no_bid_abandoned),
+                         (0, 0))
+        self.assertEqual(self.abandoned, [])
+
+    def test_FIRES_a_transient_no_bid_at_attempt_6_is_re_auctioned_at_60_s(self):
+        for errors in (NO_BID, [LOW, NO_BID[0]], [PLANNER, NO_BID[0]],
+                       [INTERNAL, NO_BID[0]]):
+            task_id = f"six-{len(self.dispatched)}"
+            self.requests[task_id] = FakeRequest(
+                labels=["x=1", f"{NO_BID_ATTEMPT_LABEL}6"])
+            self.slept.clear()
+            new_id = self.no_bid(task_id, errors=errors)
+            self.assertIsNotNone(new_id, errors)
+            self.assertEqual(self.slept, [60.0])
+            self.assertEqual(no_bid_attempt_of(self.dispatched[-1].labels), 7)
+
+    def test_PASSES_a_permanent_answer_still_fails_after_five(self):
+        """G's item-6 rule, kept for the one answer that means no robot can
+        ever take the mission: four re-auctions, 2/5/10/20 s apart, and
+        the fifth answer is the failure — no sixth auction, no wait."""
+        task_id = "patrol.dispatch-1"
+        for _ in range(NO_BID_MAX_ATTEMPTS - 1):
+            task_id = self.no_bid(task_id, errors=PERMANENT)
+            self.assertIsNotNone(task_id)
+        self.assertEqual(self.slept, [2.0, 5.0, 10.0, 20.0])
+        self.assertEqual(
+            [no_bid_permanent_of(r.labels) for r in self.dispatched],
+            [1, 2, 3, 4])
+        self.assertIsNone(self.no_bid(task_id, errors=PERMANENT))
         self.assertEqual(len(self.dispatched), NO_BID_MAX_ATTEMPTS - 1)
         self.assertEqual(self.slept, [2.0, 5.0, 10.0, 20.0])
         self.assertEqual(self.rd.no_bid_exhausted, 1)
-        self.assertEqual(self.rd.reauctioned, NO_BID_MAX_ATTEMPTS - 1)
         # the last row is already `failed` at ingest: nothing to amend
         self.assertEqual(self.abandoned, [])
 
@@ -649,12 +861,12 @@ class ReauctionTest(unittest.TestCase):
         shape the hand-back path acts on. It must be auctioned again
         ONCE, on the no-bid path, and never also handed back."""
         marked = [REDISPATCH_LABEL,
-                  "no robot answered the auction (attempt 1 of 5) — "
+                  "no robot answered the auction (attempt 1) — "
                   "auctioned again in 2 s"]
         new_id = self.no_bid("patrol.dispatch-1", status="canceled",
                              cancellation=marked)
         self.assertEqual(new_id, "patrol.dispatch-101")
-        self.assertEqual(self.slept, [2.0], "not the hand-back settle delay")
+        self.assertEqual(self.slept, [2.0], "not the hand-back backoff")
         self.assertEqual(len(self.dispatched), 1)
         self.assertEqual(generation_of(self.dispatched[0].labels), 0)
         self.assertEqual((self.rd.reauctioned, self.rd.redispatched), (1, 0))
@@ -684,7 +896,7 @@ class ReauctionTest(unittest.TestCase):
             "patrol.dispatch-1", "canceled", [REDISPATCH_LABEL, REASON],
             booking_labels=["x=1"], dispatch_errors=None, sleep=self._sleep))
         self.assertIsNotNone(new_id)
-        self.assertEqual(self.slept, [5.0])
+        self.assertEqual(self.slept, [HAND_BACK_BACKOFF_STEP_S])
         self.assertEqual(generation_of(self.dispatched[0].labels), 1)
         self.assertEqual(no_bid_attempt_of(self.dispatched[0].labels), 1)
         self.assertEqual((self.rd.redispatched, self.rd.reauctioned), (1, 0))
@@ -698,7 +910,7 @@ class ReauctionTest(unittest.TestCase):
         self.assertEqual(len(self.abandoned), 1)
         task_id, reason = self.abandoned[0]
         self.assertEqual(task_id, "ros-cli-dispatch-9")
-        self.assertIn("no robot answered the auction (attempt 1 of 5)", reason)
+        self.assertIn("no robot answered the auction (attempt 1)", reason)
         self.assertIn("its request is not stored", reason)
 
     def test_a_refused_re_auction_is_failed_with_the_refusal(self):
@@ -732,18 +944,26 @@ class ReauctionTest(unittest.TestCase):
         self.assertIsNone(self.run_(loud.maybe_redispatch(
             "y", "failed", None, dispatch_errors=NO_BID, sleep=self._sleep)))
 
-    def test_the_bound_is_read_from_the_stored_request(self):
-        """A state that lost its labels reads as a first attempt. The
-        stored request is the truth: if it says this was the last
-        auction, there is no sixth."""
+    def test_the_permanent_bound_is_read_from_the_stored_request(self):
+        """A state that lost its labels reads as a first answer. The stored
+        request is the truth: if it says four permanent answers came
+        before, this one is the fifth and there is no sixth auction."""
         self.requests["lost"] = FakeRequest(
-            labels=[f"{NO_BID_ATTEMPT_LABEL}{NO_BID_MAX_ATTEMPTS}"])
+            labels=permanent_labels(NO_BID_MAX_ATTEMPTS - 1,
+                                    NO_BID_MAX_ATTEMPTS))
         self.assertIsNone(self.run_(self.rd.maybe_redispatch(
             "lost", "failed", None, booking_labels=None,
-            dispatch_errors=NO_BID, sleep=self._sleep)))
+            dispatch_errors=PERMANENT, sleep=self._sleep)))
         self.assertEqual(self.dispatched, [])
         self.assertEqual(self.rd.no_bid_exhausted, 1)
         self.assertIn("5 auctions in a row", self.abandoned[0][1])
+        # ...and the same request with a TRANSIENT answer is auctioned again
+        self.requests["lost-2"] = FakeRequest(
+            labels=permanent_labels(NO_BID_MAX_ATTEMPTS - 1,
+                                    NO_BID_MAX_ATTEMPTS))
+        self.assertIsNotNone(self.run_(self.rd.maybe_redispatch(
+            "lost-2", "failed", None, booking_labels=None,
+            dispatch_errors=[LOW, NO_BID[0]], sleep=self._sleep)))
 
     def test_the_span_falls_back_to_this_process_clock(self):
         """No ledger stamp (or a lookup that throws): the span starts
@@ -760,6 +980,30 @@ class ReauctionTest(unittest.TestCase):
         self.requests["patrol.dispatch-2"] = FakeRequest(labels=None)
         self.no_bid("patrol.dispatch-2")
         self.assertEqual(no_bid_since_of(self.dispatched[1].labels), 5000.0)
+
+    def test_F435_an_operator_s_cancel_during_the_wait_stops_both_classes(self):
+        """FIRES: an attempt withdrawn while it waited is not dispatched
+        again, on either path. PASSES: one that was not is (the boring
+        case — no withdrawal at all — is every other test here), and a
+        `wanted` that throws cannot block a mission."""
+        self.withdrawn.update({"patrol.dispatch-1", "hb"})
+        self.requests["hb"] = FakeRequest(labels=["x=1"])
+        self.assertIsNone(self.no_bid("patrol.dispatch-1"))
+        self.assertIsNone(self.run_(self.rd.maybe_redispatch(
+            "hb", "canceled", [REDISPATCH_LABEL, REASON],
+            booking_labels=["x=1"], sleep=self._sleep)))
+        self.assertEqual(self.dispatched, [])
+        self.assertEqual(self.rd.withdrawn, 2)
+        self.assertEqual(self.abandoned, [], "a withdrawal is not a failure")
+        self.requests["kept"] = FakeRequest(labels=["x=1"])
+        self.assertIsNotNone(self.no_bid("kept"))
+
+        def broken(_task_id):
+            raise RuntimeError("registry gone")
+
+        self.rd._wanted = broken        # pylint: disable=protected-access
+        self.requests["kept-2"] = FakeRequest(labels=["x=1"])
+        self.assertIsNotNone(self.no_bid("kept-2"))
 
 
 def real_state(status="failed", labels=None, errors=None, cancellation=None,
@@ -789,6 +1033,10 @@ def real_state(status="failed", labels=None, errors=None, cancellation=None,
     return mdl.TaskState(**data)
 
 
+NO_BID_ERROR = {"code": 10, "category": "rejection",
+                "detail": "No fleet adapters offered a bid"}
+
+
 class SupersedeRealModelTest(unittest.TestCase):
     """G ruling 2026-10-01 item 6: "a timed-out auction never becomes a
     failed mission" — the rewrite applied at ingest, on mdl.TaskState."""
@@ -802,7 +1050,7 @@ class SupersedeRealModelTest(unittest.TestCase):
             self.assertEqual(
                 state.cancellation.labels,
                 [REDISPATCH_LABEL,
-                 "no robot answered the auction (attempt 1 of 5) — "
+                 "no robot answered the auction (attempt 1) — "
                  "auctioned again in 2 s"])
             self.assertEqual(state.cancellation.unix_millis_request_time,
                              1_700_000_000_000)
@@ -827,13 +1075,37 @@ class SupersedeRealModelTest(unittest.TestCase):
                      "detail": "[TaskPlanner] Failed to compute assignments"},
                     {"code": 10, "category": "rejection", "detail": "none"}])
         verdict = supersede(state)
-        self.assertEqual((verdict.attempt, verdict.delay_s, verdict.answered),
-                         (2, 5.0, True))
+        self.assertEqual((verdict.attempt, verdict.delay_s, verdict.answered,
+                          verdict.permanent), (2, 5.0, True, False))
+        self.assertEqual(
+            state.cancellation.labels[1],
+            "no robot offered to take this mission (attempt 2) — "
+            "auctioned again in 5 s")
+        self.assertEqual(len(state.dispatch.errors), 2)
+
+    def test_F435_a_silent_sixth_auction_is_still_put_back(self):
+        """KNOWN BAD before F-435: the fifth silent auction stayed failed
+        (a Critical, a failed mission). Now the sixth is put back too."""
+        for attempt in (5, 6, 40):
+            state = real_state(labels=[f"{NO_BID_ATTEMPT_LABEL}{attempt}"])
+            verdict = supersede(state)
+            self.assertFalse(verdict.final)
+            self.assertEqual(state.status, mdl.TaskStatus.canceled)
+            self.assertEqual(
+                state.cancellation.labels[1],
+                f"no robot answered the auction (attempt {attempt}) — "
+                "auctioned again in 60 s")
+
+    def test_FIRES_a_permanent_answer_is_put_back_while_answers_remain(self):
+        state = real_state(labels=permanent_labels(1, 2),
+                           errors=[LIMITED, NO_BID_ERROR])
+        verdict = supersede(state)
+        self.assertTrue(verdict.permanent)
+        self.assertEqual(state.status, mdl.TaskStatus.canceled)
         self.assertEqual(
             state.cancellation.labels[1],
             "no robot offered to take this mission (attempt 2 of 5) — "
             "auctioned again in 5 s")
-        self.assertEqual(len(state.dispatch.errors), 2)
 
     def test_applying_it_twice_changes_nothing_more(self):
         state = real_state()
@@ -842,9 +1114,11 @@ class SupersedeRealModelTest(unittest.TestCase):
         self.assertIsNotNone(supersede(state, now_ms=99))
         self.assertEqual(state.model_dump(mode="json"), before)
 
-    def test_PASSES_the_last_attempt_stays_the_failure_it_is(self):
+    def test_PASSES_the_last_permanent_attempt_stays_the_failure_it_is(self):
         state = real_state(
-            labels=[f"{NO_BID_ATTEMPT_LABEL}{NO_BID_MAX_ATTEMPTS}"])
+            labels=permanent_labels(NO_BID_MAX_ATTEMPTS - 1,
+                                    NO_BID_MAX_ATTEMPTS),
+            errors=[LIMITED, NO_BID_ERROR])
         verdict = supersede(state)
         self.assertTrue(verdict.final)
         self.assertEqual(state.status, mdl.TaskStatus.failed)
@@ -854,6 +1128,7 @@ class SupersedeRealModelTest(unittest.TestCase):
         untouched = [
             # a non-allocation failure: the planner refused, nobody timed out
             real_state(errors=[{"code": 9, "detail": "not feasible"}]),
+            real_state(errors=[LIMITED]),
             real_state(errors=[{"code": 13, "detail": "internal"}]),
             real_state(errors=[]),
             # a failure during execution carries no dispatch block at all

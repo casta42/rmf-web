@@ -184,7 +184,10 @@ async def _redispatch_later(task_state: mdl.TaskState) -> None:
     try:
         errors = None
         if task_state.dispatch is not None and task_state.dispatch.errors:
-            errors = [{"code": e.code} for e in task_state.dispatch.errors]
+            # F-435: the detail is what tells a permanent answer ("no robot
+            # can ever take it") from a transient one
+            errors = [{"code": e.code, "detail": e.detail}
+                      for e in task_state.dispatch.errors]
         await redispatcher.maybe_redispatch(
             task_state.booking.id,
             task_state.status,
@@ -340,8 +343,9 @@ async def alert_on_task_state(task_state: mdl.TaskState, repo):
     not.
 
     G ruling 2026-10-01 item 6: an auction nobody bid on is a failure —
-    and a Critical alert — only when it was the mission's last one; the
-    reason then names the count and the span. Every earlier attempt
+    and a Critical alert — only when it was the mission's last one (since
+    F-435, only after the fifth answer that no robot can ever take it);
+    the reason then names the count and the span. Every earlier attempt
     reaches this function already recorded as `canceled` (supersede() in
     process_msg) and raises the same Info line a hand-back does.
 
