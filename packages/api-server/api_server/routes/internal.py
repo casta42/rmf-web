@@ -2,6 +2,7 @@
 import asyncio
 import json
 import math
+import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -244,8 +245,13 @@ async def _redispatch_later(task_state: mdl.TaskState) -> None:
 # ----------------------------------------------------------------------
 WAITING_ALERT_PERIOD_S = 5.0
 # resume_waiting_chains: how far back a restart looks for chains it would
-# otherwise drop, and how many rows it reads at most to find them
-RESUME_WINDOW_S = 24 * 3600.0
+# otherwise drop, and how many rows it reads at most to find them. One hour
+# by default (GF_WAITING_RESUME_WINDOW_S): it covers an api-server restart
+# and an upgrade's downtime; a tail older than that belongs to an earlier
+# shift — or, on the first start after this release, was stopped by the old
+# 900 s / 8-hop bounds and already reported lost — and re-dispatching it
+# hours later would surprise the operator more than it would help.
+RESUME_WINDOW_S = float(os.environ.get("GF_WAITING_RESUME_WINDOW_S", "3600"))
 RESUME_SCAN_LIMIT = 5000
 _LIVE_RAW = {"queued", "standby", "uninitialized"}
 
