@@ -28,7 +28,10 @@ from api_server.models.rmf_api.robot_state import Status as RobotStatus
 from api_server.redispatch import (
     CLASS_NO_BID,
     REASON_LABEL,
+    REFUSED_LABEL,
+    Held,
     Redispatcher,
+    Refusal,
     class_of,
     no_bid_since_of,
     no_bid_verdict_of,
@@ -36,6 +39,7 @@ from api_server.redispatch import (
     root_of,
     status_tail,
     supersede,
+    unmark_hand_back,
     unsupersede,
     wants_redispatch,
 )
@@ -63,20 +67,93 @@ alert_repo = AlertRepository(user, task_repo)
 fleet_state_cadence = FleetStateCadence()
 
 
+class _AcceptanceWatch:
+    """F-441: the task repository as the dispatch path sees it, noting the
+    moment the dispatcher ACCEPTED the request — `_dispatch_task_now`
+    saves the state only after a success. An error after that moment
+    (the save itself) is not a refusal: the mission is already with the
+    dispatcher, and sending it again would make a duplicate."""
+
+    def __init__(self, repo: TaskRepository):
+        self._repo = repo
+        self.accepted: Optional[str] = None
+
+    def __getattr__(self, name):
+        return getattr(self._repo, name)
+
+    async def save_task_state(self, task_state: mdl.TaskState) -> None:
+        self.accepted = task_state.booking.id
+        await self._repo.save_task_state(task_state)
+
+
+def _body_of(resp) -> dict:
+    try:
+        body = json.loads(bytes(getattr(resp, "body", b"") or b"{}"))
+    except (TypeError, ValueError):
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
+# the dispatcher's one refusal at submission (rmf_task_ros2 Dispatcher.cpp:
+# the request fails the dispatch_task_request schema)
+_INVALID_REQUEST_CODE = 5
+
+
+def _dispatcher_refusal(body: dict) -> Refusal:
+    """F-441: the dispatcher answered success=false. Its only such answer
+    is a request that fails its schema — deterministic, so the stored
+    request can never be sent again (permanent). Any other shape is read
+    as the site as it is now."""
+    errors = body.get("errors") if isinstance(body.get("errors"), list) else []
+    details = "; ".join(
+        str(e.get("detail") or e.get("category") or e)
+        for e in errors if isinstance(e, dict)) or "no reason given"
+    if any(isinstance(e, dict) and e.get("code") == _INVALID_REQUEST_CODE
+           for e in errors):
+        return Refusal(
+            f"the dispatcher refuses its stored request as invalid: {details}",
+            permanent=True)
+    return Refusal(f"the dispatcher refused it: {details}")
+
+
 async def _redispatch_request(request: mdl.TaskRequest) -> str:
     """FR-12 governor: put a returned mission back on the floor through
     the operator's own dispatch path (F-34 guard, request stored,
-    state saved). Imported lazily: routes.tasks imports this package."""
+    state saved). Imported lazily: routes.tasks imports this package.
+
+    F-441: every outcome is named for the Redispatcher. A guard's or the
+    horizon's HTTP refusal (409, 422) and the dispatcher not answering
+    (500 "rmf service timed out") are Refusals of the moment; the
+    dispatcher's success=false is _dispatcher_refusal; a mission the
+    horizon holds for its start is Held, never a refusal. An error after
+    the dispatcher accepted returns the new id: the mission is out."""
     from api_server.routes.tasks.tasks import post_dispatch_task
 
-    resp = await post_dispatch_task(
-        mdl.DispatchTaskRequest(type="dispatch_task_request", request=request),
-        task_repo,
-    )
-    if not isinstance(resp, mdl.TaskDispatchResponse):
-        raise RuntimeError(
-            f"dispatch refused: {getattr(resp, 'body', b'')[:200]!r}")
-    return resp.root.state.booking.id  # type: ignore[union-attr]
+    watch = _AcceptanceWatch(task_repo)
+    try:
+        resp = await post_dispatch_task(
+            mdl.DispatchTaskRequest(type="dispatch_task_request",
+                                    request=request),
+            watch,  # type: ignore[arg-type]
+        )
+    except HTTPException as exc:
+        raise Refusal(str(exc.detail)) from exc
+    except Exception:
+        if watch.accepted is None:
+            raise
+        logger.exception(
+            "F-441: the dispatcher accepted the re-dispatch as [%s], and it "
+            "could not be recorded — not sent again", watch.accepted)
+        return watch.accepted
+    if isinstance(resp, mdl.TaskDispatchResponse):
+        return resp.root.state.booking.id  # type: ignore[union-attr]
+    body = _body_of(resp)
+    if getattr(resp, "status_code", None) == 202 and body.get("deferred"):
+        deferred = body["deferred"] if isinstance(body["deferred"], dict) \
+            else {}
+        raise Held(deferred.get("id"),
+                   str(body.get("detail") or "held for its start (F-293)"))
+    raise _dispatcher_refusal(body)
 
 
 async def _load_request(task_id: str):
@@ -98,16 +175,17 @@ async def _first_recorded_s(task_id: str) -> Optional[float]:
 
 
 async def _fail_abandoned_reauction(task_id: str, reason: str) -> None:
-    """G ruling 2026-10-01 item 6 (F-410/F-412 class): an attempt that got
-    no bid was recorded as put back on the floor ("auctioned again in
-    N s"), and the re-auction could not be made — the request is not
-    stored, or the dispatch was refused. That mission is not waiting for
-    anything: it failed, and it must not sit in the ledger as a tidy
-    cancel with no successor. The row is amended back to `failed` and the
-    operator is paged with the reason; its broadcast takes the chain out
-    of the waiting registry (F-435)."""
+    """G ruling 2026-10-01 item 6 (F-410/F-412 class), narrowed by F-441
+    (D-86 (4)): an attempt was recorded as put back on the floor — a
+    no-bid ("auctioned again in N s") or a hand-back — and NOTHING can
+    ever be re-sent: the request is not stored, or the dispatcher refuses
+    the stored request itself. (Every other refusal keeps the mission
+    waiting.) That mission is not waiting for anything: it failed, and it
+    must not sit in the ledger as a tidy cancel with no successor. The row
+    is amended to `failed` and the operator is paged with the reason; its
+    broadcast takes the chain out of the waiting registry (F-435)."""
     state = await task_repo.get_task_state(task_id)
-    if state is None or not unsupersede(state):
+    if state is None or not (unsupersede(state) or unmark_hand_back(state)):
         return
     await task_repo.save_task_state(state)
     task_events.task_states.on_next(state)
@@ -127,27 +205,62 @@ async def _fail_abandoned_reauction(task_id: str, reason: str) -> None:
 # F-435 (G ruling 2026-10-01, ruling 2): the missions waiting for a robot
 waiting = waiting_missions.registry
 
-async def _hand_back_lost(task_id: str, reason: str) -> None:
-    """F-435: a hand-back whose re-dispatch could not be made (its request
-    is not stored, or the dispatch was refused) is no longer waiting for a
-    robot — nothing will put it back on the floor until a restart resumes
-    it. Its chain leaves the waiting list and its alert, if raised, is
-    closed; the row stays the marked cancel it is, which the tooling counts
-    as a LOST mission."""
+async def _redispatch_refused(task_id: str, why: str, retry_in_s: float) -> None:
+    """F-441 (G close-out ruling 2026-10-01, D-86 (4)): "a refused
+    re-dispatch never drops a mission; it returns to the waiting queue
+    under F-435." The Redispatcher sends it again after `retry_in_s`; here
+    the mission is shown waiting with the refusal as its reason — in the
+    registry (GET /tasks/waiting, the one alert) and on the attempt's row
+    (REFUSED_LABEL, re-stamped each time, so the ledger says why it still
+    waits and a restart resumes it with that reason)."""
+    reason = waiting_missions.refused_reason(why)
+    state = await task_repo.get_task_state(task_id)
+    marked = state is not None and state.cancellation is not None and \
+        wants_redispatch(state.status, state.cancellation.labels) is not None
+    entry = waiting.find_task(task_id)
+    if entry is None and marked:
+        root_id = root_of(state.booking.labels) or task_id
+        entry = waiting.get(root_id)
+        if entry is None:
+            # the registry never saw this attempt put back (it is rebuilt
+            # at start): a mission whose re-dispatch is being retried IS
+            # waiting, so it is listed
+            entry = waiting.adopt(waiting_missions.WaitingMission(
+                root_id=root_id, task_id=task_id, since_unix=time.time(),
+                reason=reason))
+            asyncio.get_running_loop().create_task(_enrich_waiting(entry))
+    if entry is not None and entry.task_id == task_id:
+        entry.reason = reason
+    logger.warning("F-441: [%s] is still waiting for a robot — %s; sent "
+                   "again in %.0f s", task_id, reason, retry_in_s)
+    if not marked:
+        return
+    state.cancellation.labels = [
+        lab for lab in state.cancellation.labels
+        if not lab.startswith(REFUSED_LABEL)] + [f"{REFUSED_LABEL}{why[:200]}"]
+    await task_repo.save_task_state(state)
+    task_events.task_states.on_next(state)
+
+
+async def _redispatch_held(task_id: str, detail: str) -> None:
+    """F-441: the re-dispatch was accepted and is held for its start by the
+    dispatch horizon (F-293): the mission is not waiting for a robot any
+    more but for its time, and GET /tasks/deferred shows it. The chain
+    leaves the waiting list; its alert, if raised, is closed."""
     entry = waiting.find_task(task_id)
     if entry is None:
         return
     waiting.leave(entry.root_id)
-    logger.error("F-435: mission %s is no longer waiting — its attempt [%s] "
-                 "could not be put back on the floor: %s", entry.root_id,
-                 task_id, reason)
+    logger.warning("F-441: mission %s is held for its start (F-293): %s",
+                   entry.root_id, detail)
     await _resolve_waiting_alert(entry)
 
 
 redispatcher = Redispatcher(
     _redispatch_request, _load_request, logger.getChild("Redispatch"),
     abandon=_fail_abandoned_reauction, first_seen=_first_recorded_s,
-    wanted=waiting.wanted, lost=_hand_back_lost)
+    wanted=waiting.wanted, refused=_redispatch_refused,
+    held=_redispatch_held)
 
 
 _request_labels: Dict[str, Optional[list]] = {}

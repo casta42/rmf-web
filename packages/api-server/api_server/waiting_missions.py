@@ -50,6 +50,7 @@ from typing import Callable, Dict, Iterable, List, NamedTuple, Optional
 
 from api_server.dispatch_reason import no_bid_waiting_reason
 from api_server.redispatch import (
+    REFUSED_LABEL,
     no_bid_verdict_of,
     root_of,
     status_tail,
@@ -154,17 +155,30 @@ def _remember(memory: "OrderedDict[str, object]", key: str, value=None) -> None:
         memory.popitem(last=False)
 
 
+def refused_reason(why: str) -> str:
+    """F-441 (D-86 (4)): the reason a mission waits when its re-dispatch
+    was refused — the refusal itself, in the words the refusing guard or
+    the dispatcher used. It is sent again within a minute, for as long as
+    it waits."""
+    return f"its re-dispatch was refused — {why} — it is sent again within a minute"
+
+
 def waiting_reason(task_state) -> Optional[str]:
     """The operator's reason a superseded attempt is waiting, or None when
-    the state is not a superseded attempt. A no-bid auction says what the
-    fleet answered (dispatch_reason.no_bid_waiting_reason); a hand-back
-    says what the fleet said when it handed the mission back — the same
-    words the History view shows for that row."""
+    the state is not a superseded attempt. A re-dispatch that was refused
+    names the refusal (F-441, REFUSED_LABEL on the row); otherwise a no-bid
+    auction says what the fleet answered
+    (dispatch_reason.no_bid_waiting_reason) and a hand-back says what the
+    fleet said when it handed the mission back — the same words the
+    History view shows for that row."""
     cancellation = getattr(task_state, "cancellation", None)
     labels = cancellation.labels if cancellation is not None else None
     reason = wants_redispatch(task_state.status, labels)
     if reason is None:
         return None
+    for label in labels or []:
+        if label.startswith(REFUSED_LABEL) and label[len(REFUSED_LABEL):]:
+            return refused_reason(label[len(REFUSED_LABEL):])
     if no_bid_verdict_of(task_state) is not None:
         dispatch = task_state.dispatch
         return no_bid_waiting_reason(dispatch.errors if dispatch else None)

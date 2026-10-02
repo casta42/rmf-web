@@ -21,6 +21,7 @@ from api_server import models as mdl
 from api_server.redispatch import (
     NO_BID_ATTEMPT_LABEL,
     REDISPATCH_LABEL,
+    REFUSED_LABEL,
     ROOT_LABEL,
     next_labels,
 )
@@ -31,6 +32,7 @@ from api_server.waiting_missions import (
     alert_id_of,
     alert_message,
     alert_threshold_s,
+    refused_reason,
     waiting_reason,
 )
 
@@ -289,6 +291,41 @@ class LabelsFoldTest(unittest.TestCase):
         change = reg.observe(handed_back("c1", labels))
         self.assertEqual(change.kind, "updated")
         self.assertEqual(change.entry.root_id, ROOT)
+
+
+
+class F441RefusedReasonTest(unittest.TestCase):
+    """F-441 (D-86 (4)): a mission whose re-dispatch was refused waits with
+    the refusal as its reason — read off the attempt's row, so a restart
+    resumes it saying the same thing. On the REAL model (F-343)."""
+
+    F34 = ("destination [j_st2] is occupied by parked robot "
+           "[gentle_fleet/gentle_bot_10] (F-34); dispatch rejected")
+
+    def test_FIRES_a_refused_hand_back_names_the_refusal(self):
+        row = state(ROOT, "canceled", cancellation=[
+            REDISPATCH_LABEL, HOLD, f"{REFUSED_LABEL}{self.F34}"])
+        self.assertEqual(waiting_reason(row), refused_reason(self.F34))
+        self.assertIn(self.F34, waiting_reason(row))
+
+    def test_FIRES_a_refused_no_bid_names_the_refusal_not_the_auction(self):
+        row = state(ROOT, "canceled", errors=[NO_BID], cancellation=[
+            REDISPATCH_LABEL, "no robot answered the auction (attempt 1)",
+            f"{REFUSED_LABEL}rmf service timed out"])
+        self.assertEqual(waiting_reason(row),
+                         refused_reason("rmf service timed out"))
+
+    def test_PASSES_an_attempt_never_refused_keeps_its_own_reason(self):
+        self.assertEqual(waiting_reason(handed_back(ROOT)), HOLD)
+        empty = state(ROOT, "canceled", cancellation=[
+            REDISPATCH_LABEL, HOLD, REFUSED_LABEL])
+        self.assertEqual(waiting_reason(empty), HOLD, "an empty stamp says nothing")
+        operator = state(ROOT, "canceled", cancellation=[
+            "canceled by admin", f"{REFUSED_LABEL}x"])
+        self.assertIsNone(waiting_reason(operator), "not waiting at all")
+
+    def test_the_reason_carries_no_machine_token(self):
+        self.assertNotIn("gf:", refused_reason(self.F34))
 
 
 if __name__ == "__main__":
