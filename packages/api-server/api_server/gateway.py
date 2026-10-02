@@ -234,12 +234,20 @@ class RmfGateway:
         # cannot tell a current pose from one RMF stopped accepting
         # updates for. BEST_EFFORT to match the publisher; this feed is
         # ~10 Hz and a dropped sample costs nothing.
+        from api_server import live_floor as _live_floor  # noqa: PLC0415
         from api_server.routes.fleets import on_fleet_positions  # noqa: PLC0415
+
+        def _on_ros_fleet_state(msg: RmfFleetState) -> None:
+            # F-463: any fleet_states message is proof that this server
+            # hears the fleet core on ROS — without it, "no auction heard"
+            # says nothing
+            _live_floor.DISPATCHER.on_core_heard()
+            on_fleet_positions(msg)
 
         fleet_positions_sub = ros_node().create_subscription(
             RmfFleetState,
             "fleet_states",
-            lambda msg: on_fleet_positions(cast(RmfFleetState, msg)),
+            lambda msg: _on_ros_fleet_state(cast(RmfFleetState, msg)),
             rclpy.qos.QoSProfile(
                 history=rclpy.qos.HistoryPolicy.KEEP_LAST,
                 depth=10,
@@ -414,6 +422,34 @@ class RmfGateway:
             ),
         )
         self._subscriptions.append(core_boot_sub)
+
+        # F-463 / F-458 (G rulings 2026-10-02, second sheet, items 1 and
+        # 3): the dispatcher's own word, for the dispatcher-liveness alarm
+        # and the stale-row reconciliation (live_floor.py) — what it holds
+        # (dispatch_states, every 2 s; reliable and volatile). An auction
+        # is read off that list too. NEVER subscribe to rmf_task/bid_notice
+        # here: the dispatcher counts that topic's subscribers as the
+        # bidders an auction waits for (F-410's early close), and this
+        # server never bids — every auction would run its whole window.
+        from rmf_task_msgs.msg import DispatchStates  # noqa: PLC0415
+
+        from api_server import live_floor  # noqa: PLC0415
+
+        def _on_dispatch_states(msg):
+            live_floor.DISPATCHER.on_dispatch_states(
+                [(s.task_id, s.status) for s in msg.active],
+                [(s.task_id, s.status) for s in msg.finished])
+
+        dispatcher_qos = rclpy.qos.QoSProfile(
+            history=rclpy.qos.HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=rclpy.qos.ReliabilityPolicy.RELIABLE,
+            durability=rclpy.qos.DurabilityPolicy.VOLATILE,
+        )
+        dispatch_states_sub = ros_node().create_subscription(
+            DispatchStates, "dispatch_states", _on_dispatch_states,
+            dispatcher_qos)
+        self._subscriptions.append(dispatch_states_sub)
 
     def _publish_robot_releases(self, fleet: str, payload: dict) -> None:
         self._robot_releases.publish(RosString(data=json.dumps(payload)))

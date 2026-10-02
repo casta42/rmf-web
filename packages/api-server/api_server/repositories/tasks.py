@@ -58,6 +58,17 @@ class TaskRepository:
                 label_name=k,
             )
 
+    async def ensure_task_labels(self, task_id: str, labels) -> None:
+        """F-464: the label rows queries match on are written when a
+        state row is CREATED with labels. A row the dispatcher's first
+        state created has none; give it the ones it was dispatched with."""
+        row = await DbTaskState.get_or_none(id_=task_id)
+        if row is None or not labels:
+            return
+        if await ttm.TaskLabel.filter(state=row).exists():
+            return
+        await self.save_task_labels(row, Labels.from_strings(list(labels)))
+
     async def save_task_state(self, task_state: TaskState) -> None:
         # F-19: update_or_create is get-then-create, and two writers race on
         # first insert - the dispatch_task response handler vs the _internal
@@ -308,7 +319,9 @@ class TaskRepository:
         out on a busy core never gets its task clobbered. Returns the
         closed state, or None when the row does not qualify."""
         from api_server.interrupted_tasks import (
-            INTERRUPTED_LABEL, TERMINAL_STATUSES, status_tail,
+            INTERRUPTED_LABEL,
+            TERMINAL_STATUSES,
+            status_tail,
         )
 
         row = await DbTaskState.get_or_none(id_=task_id)

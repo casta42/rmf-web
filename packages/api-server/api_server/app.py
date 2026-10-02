@@ -235,6 +235,22 @@ async def lifespan(_app: FastIO):
     schedule_loop = loop.create_task(schedule_liveness.maintenance_loop())
     shutdown_cbs.append(schedule_loop.cancel)
 
+    # F-463 (G ruling 2026-10-02, second sheet, item 1): one critical
+    # alert when missions are queued, robots stand idle and the dispatcher
+    # has started no auction for a minute
+    from api_server import dispatcher_liveness  # noqa: PLC0415
+
+    dispatch_loop = loop.create_task(dispatcher_liveness.maintenance_loop())
+    shutdown_cbs.append(dispatch_loop.cancel)
+
+    # F-465 (same sheet, item 2): a dispatcher's answer to a request the
+    # ledger has already closed is a replay's — its task is canceled and
+    # never kept as a mission
+    from api_server import dispatch_ledger  # noqa: PLC0415
+
+    replay_loop = loop.create_task(dispatch_ledger.guard_loop())
+    shutdown_cbs.append(replay_loop.cancel)
+
     # F-454 (G ruling 2026-10-02, item 1): the F-141 restart sweep runs on
     # its own clock and acts only on a new fleet core identity — a real
     # coordination restart — never on how old or quiet a mission's row is
@@ -250,6 +266,8 @@ async def lifespan(_app: FastIO):
         # F-77 (E5 review round 1): fail over tasks orphaned non-terminal
         # by an rmf-core restart, so the D-17 mission guard and every
         # other consumer of "running missions" stops seeing ghosts.
+        # F-458: only rows PROVEN dead against the live fleet state and
+        # the dispatcher's queue — never on age alone (stale_tasks.py).
         asyncio.create_task(_spin_stale_task_janitor())
     scheduled_tasks = await ttm.ScheduledTask.all()
     scheduled = 0
