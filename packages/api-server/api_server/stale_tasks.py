@@ -140,8 +140,10 @@ def judge(
                 f"for {now - last_seen:.0f} s"
             )
         if now - last_seen > FRESH_S:
+            # (no changing number in a verdict that is not DEAD: each is
+            # logged once per row, while it stays the same)
             return KEEP, (
-                f"[{robot}] was listed {now - last_seen:.0f} s "
+                f"[{robot}] was listed less than {ABSENT_FOR_S:.0f} s "
                 "ago: not yet proof that it left"
             )
         current = max(there, key=lambda r: r.last_seen)
@@ -162,8 +164,7 @@ def judge(
         return SKIP, "the dispatcher has not been heard by this server"
     if now - dispatcher.last_heard > FRESH_S:
         return SKIP, (
-            "the dispatcher has not been heard for "
-            f"{now - dispatcher.last_heard:.0f} s"
+            "the dispatcher has not been heard for more than " f"{FRESH_S:.0f} s"
         )
     if task_id in dispatcher.active:
         return KEEP, "it is in the dispatcher's queue"

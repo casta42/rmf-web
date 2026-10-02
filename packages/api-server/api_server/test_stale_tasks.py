@@ -284,6 +284,17 @@ class TestProvenDeadOrLeftAlone(unittest.TestCase):
             SKIP, _judge("patrol.dispatch-9", "queued", None, _floor(heard_for=60))[0]
         )
 
+    def test_a_verdict_that_keeps_or_skips_reads_the_same_every_minute(self):
+        """It is logged once per row while it stays the same: a number that
+        changes with the clock would write a line every pass, for an hour."""
+        clock, fleets, dispatcher = _floor()
+        clock.t += 60  # the dispatcher is frozen: nothing heard
+        first = _judge("patrol.dispatch-9", "queued", None, (clock, fleets, dispatcher))
+        clock.t += 3600
+        later = _judge("patrol.dispatch-9", "queued", None, (clock, fleets, dispatcher))
+        self.assertEqual(SKIP, first[0])
+        self.assertEqual(first, later)
+
     def test_an_unknown_fleet_name_is_a_skip_not_a_guess(self):
         self.assertEqual(
             SKIP,
