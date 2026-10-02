@@ -52,15 +52,18 @@ its own error (code 10, "No fleet adapters offered a bid"), next to
 whatever each fleet answered (rmf_task_ros2 Dispatcher.cpp conclude_bid).
 F-435 splits it by that answer:
 
-  * PERMANENT — some fleet answered "not feasible" (code 9) with the
-    planner's "insufficient battery capacity" detail: no robot can finish
-    the mission on one charge even starting full, so no robot can ever
-    take it. Item 6's rule, exactly: auctioned again after 2, 5, 10,
-    20 s, and the fifth such answer in a row is a failed mission with the
-    reason named (NO_BID_MAX_ATTEMPTS).
-  * TRANSIENT — everything else: silence (code 10 alone), "insufficient
-    initial battery charge" (every robot is too low NOW), any other
-    planner refusal, an internal error. The fleet will change; the
+  * PERMANENT — the fleet named every robot it considered, and the
+    planner's verdict on each is limited capacity: it cannot finish the
+    mission even after a full charge at its charger, so no robot can ever
+    take it (F-442, no_bid_is_permanent; the planner's own "insufficient
+    battery capacity" is the verdict on the robot it judged last, and no
+    longer decides alone). Item 6's rule, exactly: auctioned again after
+    2, 5, 10, 20 s, and the fifth such answer in a row is a failed mission
+    with the reason named — every robot judged, and why
+    (NO_BID_MAX_ATTEMPTS).
+  * TRANSIENT — everything else: silence (code 10 alone), one robot too
+    low NOW or able to take it alone, a refusal that names no robot, any
+    other planner refusal, an internal error. The fleet will change; the
     mission waits. Auctioned again forever, after 2, 5, 10, 20 s and
     then every NO_BID_MAX_BACKOFF_S, and never failed.
 
@@ -159,6 +162,7 @@ Pure helpers first (unit-tested without a server); the async hook at the
 bottom is what routes/internal.py calls after persisting a task state.
 """
 
+import json
 import logging
 import time
 from typing import Iterable, List, NamedTuple, Optional
@@ -190,11 +194,12 @@ _CANCELED = {"canceled", "killed"}
 # adapter's "not feasible" answer (FleetUpdateHandle.cpp make_error_str).
 NO_BID_CODE = 10
 NOT_FEASIBLE_CODE = 9
-# F-435: the one answer that means NO robot can ever take the mission —
-# the planner's limited_capacity error, "insufficient battery capacity to
-# accommodate one or more requests by any of the robots in this fleet"
-# (FleetUpdateHandle.cpp). Byte-identical to dispatch_reason
-# _LIMITED_CAPACITY (test_redispatch pins the two together).
+# F-435: the planner's limited_capacity error, "insufficient battery
+# capacity to accommodate one or more requests by any of the robots in this
+# fleet" (FleetUpdateHandle.cpp). Byte-identical to dispatch_reason
+# _LIMITED_CAPACITY (test_redispatch pins the two together). Since F-442 it
+# alone never makes a no-bid permanent: it is the verdict on the robot the
+# planner judged last (no_bid_is_permanent).
 PERMANENT_NO_BID_DETAIL = "insufficient battery capacity"
 # G ruling 2026-10-01 item 6 (F-410/F-412 class), kept for the PERMANENT
 # answer only by F-435: how many such auctions in a row a mission gets
@@ -245,16 +250,105 @@ def _detail_of(err) -> str:
     return str(detail) if detail else ""
 
 
+def _category_of(err) -> str:
+    category = err.get("category") if isinstance(err, dict) else \
+        getattr(err, "category", None)
+    return str(category) if category else ""
+
+
+# F-442 (G close-out ruling 2026-10-01, D-86 (4)): "'no robot can ever take
+# it' names every robot considered and why each was refused." The planner's
+# own error is the verdict on the robot it judged LAST (rmf_task
+# Candidates::make), so the fleet adapter names every robot beside it
+# (deploy/patches/f442-rmf-fleet-adapter-robot-judgements.patch): one more
+# "not feasible" error, this category, its detail a JSON object
+#   {"fleet": ..., "task_id": ..., "robots": [{"name": ..., "judgement": ...}]}
+# where each judgement is the planner's verdict on the new request planned
+# alone against that robot: limited_capacity (it cannot finish it even
+# after a full charge at its charger), low_battery (too low to reach its
+# charger now), feasible (it could take it alone — the fleet's plan failed
+# on another request), no_solution, not_commissioned (not planned for),
+# unknown or error.
+JUDGEMENTS_CATEGORY = "Robot judgements"
+PERMANENT_JUDGEMENT = "limited_capacity"
+NOT_CONSIDERED_JUDGEMENTS = frozenset({"not_commissioned"})
+
+
+class RobotJudgement(NamedTuple):
+    fleet: str
+    robot: str
+    judgement: str
+
+
+def is_judgements(err) -> bool:
+    return _code_of(err) == NOT_FEASIBLE_CODE and \
+        _category_of(err) == JUDGEMENTS_CATEGORY
+
+
+def robot_judgements(dispatch_errors: Optional[Iterable]
+                     ) -> Optional[List[RobotJudgement]]:
+    """F-442: every robot the answering fleets named, with the planner's
+    verdict on it, in the order they were named. None when no fleet named
+    its robots — and when a naming cannot be read: cannot see, so cannot
+    convict."""
+    named = [err for err in dispatch_errors or [] if is_judgements(err)]
+    if not named:
+        return None
+    out: List[RobotJudgement] = []
+    for err in named:
+        try:
+            body = json.loads(_detail_of(err))
+        except ValueError:
+            return None
+        robots = body.get("robots") if isinstance(body, dict) else None
+        if not isinstance(robots, list):
+            return None
+        fleet = str(body.get("fleet") or "")
+        for robot in robots:
+            if not isinstance(robot, dict) or \
+                    not isinstance(robot.get("name"), str) or \
+                    not isinstance(robot.get("judgement"), str):
+                return None
+            out.append(RobotJudgement(fleet, robot["name"], robot["judgement"]))
+    return out
+
+
 def no_bid_is_permanent(dispatch_errors: Optional[Iterable]) -> bool:
-    """F-435: did some fleet answer that NO robot can ever take this
-    mission? Only the planner's limited-capacity refusal says that; every
-    other answer — silence, every robot too low right now, any other
-    refusal, an internal error — describes the fleet as it is NOW."""
-    for err in dispatch_errors or []:
-        if _code_of(err) == NOT_FEASIBLE_CODE and \
-                PERMANENT_NO_BID_DETAIL in _detail_of(err):
-            return True
-    return False
+    """F-435, made precise by F-442: can NO robot ever take this mission?
+    Only when the fleet named the robots it considered and the planner's
+    verdict on every one of them is limited capacity — it cannot finish the
+    mission even after a full charge at its charger. One robot that is low
+    now, could take it alone, or got no verdict makes the answer transient:
+    the fleet will change, and the mission waits.
+
+    So it is NOT permanent when no robot is named — the planner's own
+    "insufficient battery capacity" (PERMANENT_NO_BID_DETAIL) is the verdict
+    on the LAST robot only, and absence of the rest is not evidence — nor
+    when some fleet refused without naming its robots (as many planner
+    refusals as namings, or one fleet's robots are unseen), nor beside any
+    answer that is not a planner refusal. Robots that were not considered
+    (not commissioned) are named but do not count."""
+    errors = list(dispatch_errors or [])
+    judged = robot_judgements(errors)
+    if not judged:
+        return False
+    considered = [j for j in judged
+                  if j.judgement not in NOT_CONSIDERED_JUDGEMENTS]
+    if not considered or any(j.judgement != PERMANENT_JUDGEMENT
+                             for j in considered):
+        return False
+    namings = refusals = 0
+    for err in errors:
+        code = _code_of(err)
+        if code == NO_BID_CODE:
+            continue
+        if is_judgements(err):
+            namings += 1
+        elif code == NOT_FEASIBLE_CODE:
+            refusals += 1
+        else:
+            return False
+    return refusals == namings
 
 
 class NoBid(NamedTuple):
@@ -835,8 +929,9 @@ class Redispatcher:
             self.no_bid_exhausted += 1
             self._logger.error(
                 "re-auction: [%s] — the fleet answered %d auctions in a row "
-                "that no robot can ever take this mission (insufficient "
-                "battery capacity); the mission failed (F-435)",
+                "that no robot can ever take this mission (every robot it "
+                "considered cannot finish it on one battery charge); the "
+                "mission failed (F-435, F-442)",
                 task_id, verdict.run)
             return None
         closed_at = self._clock()

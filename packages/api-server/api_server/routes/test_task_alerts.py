@@ -176,6 +176,24 @@ LIMITED = {
 }
 
 
+def judged(*verdicts):
+    """F-442: the fleet adapter's naming of every robot it judged, as the
+    patch writes it (nlohmann::json::dump: keys sorted)."""
+    robots = ",".join(
+        f'{{"judgement":"{v}","name":"gentle_bot_{i + 1}"}}'
+        for i, v in enumerate(verdicts)
+    )
+    return {
+        "code": 9,
+        "category": "Robot judgements",
+        "detail": f'{{"fleet":"gentle_fleet","robots":[{robots}],"task_id":"t"}}',
+    }
+
+
+# F-442: every robot the fleet considered cannot finish it even starting full
+JUDGED = judged("limited_capacity", "limited_capacity")
+
+
 def auction_state(attempt=1, errors=None, since=None, cancellation=None, permanent=0):
     """The dispatcher's state for an auction that closed, as the real
     model: nobody is assigned, and the attempt rides in the booking labels
@@ -209,7 +227,7 @@ def final_permanent(**kwargs):
     """The fifth answer in a row that no robot can ever take the mission."""
     return auction_state(
         NO_BID_MAX_ATTEMPTS,
-        errors=[LIMITED, NO_BID_ERROR],
+        errors=[LIMITED, JUDGED, NO_BID_ERROR],
         permanent=NO_BID_MAX_ATTEMPTS - 1,
         **kwargs,
     )
@@ -235,7 +253,7 @@ class TestNoBidAlerts(unittest.IsolatedAsyncioTestCase):
         cases = [auction_state(a) for a in range(1, 9)]
         cases += [auction_state(6, errors=[REFUSAL, NO_BID_ERROR])]
         cases += [
-            auction_state(k + 1, errors=[LIMITED, NO_BID_ERROR], permanent=k)
+            auction_state(k + 1, errors=[LIMITED, JUDGED, NO_BID_ERROR], permanent=k)
             for k in range(NO_BID_MAX_ATTEMPTS - 1)
         ]
         for state in cases:
@@ -277,7 +295,9 @@ class TestNoBidAlerts(unittest.IsolatedAsyncioTestCase):
             "no robot offered to take this mission at 5 auctions in a row over "
             "77 s — no robot can finish this mission on one battery charge, even "
             "starting full — shorten it (fewer rounds or stops) or split it into "
-            "smaller missions",
+            "smaller missions. Every robot judged: gentle_bot_1, gentle_bot_2 "
+            "(cannot finish it on one battery charge, even starting full from its "
+            "charger)",
         )
         alert = await self.ingest(state, repo)
         self.assertEqual(state.status, mdl.TaskStatus.failed)
@@ -290,6 +310,27 @@ class TestNoBidAlerts(unittest.IsolatedAsyncioTestCase):
             alert.message,
         )
         self.assertIn("one battery charge", alert.message)
+
+    async def test_F442_a_fifth_answer_that_names_no_robot_or_a_capable_one_waits(
+        self,
+    ):
+        """F-442 (D-86 (4)): the planner's "insufficient battery capacity"
+        is the verdict on its LAST robot. A fifth such answer with no robot
+        named, or with one robot that is only low now, is not "no robot can
+        ever take it": the mission waits, and nothing rings."""
+        for errors in (
+            [LIMITED, NO_BID_ERROR],
+            [LIMITED, judged("limited_capacity", "low_battery"), NO_BID_ERROR],
+            [LIMITED, judged("limited_capacity", "feasible"), NO_BID_ERROR],
+        ):
+            state = auction_state(
+                NO_BID_MAX_ATTEMPTS, errors=errors, permanent=NO_BID_MAX_ATTEMPTS - 1
+            )
+            repo = Repo()
+            self.assertIsNone(no_bid_final_reason(state, now_s=1077.4))
+            self.assertIsNone(await self.ingest(state, repo))
+            self.assertEqual(state.status, mdl.TaskStatus.canceled)
+            self.assertEqual(repo.creates, 0)
 
     async def test_F435_a_fifth_transient_answer_is_not_a_failure_any_more(self):
         """THE CONTRACT CHANGED (F-435). This test used to read "FIRES a
@@ -340,7 +381,9 @@ class TestNoBidAlerts(unittest.IsolatedAsyncioTestCase):
             "no robot offered to take this mission at 5 auctions in a row — no "
             "robot can finish this mission on one battery charge, even starting "
             "full — shorten it (fewer rounds or stops) or split it into smaller "
-            "missions",
+            "missions. Every robot judged: gentle_bot_1, gentle_bot_2 (cannot "
+            "finish it on one battery charge, even starting full from its "
+            "charger)",
         )
 
 

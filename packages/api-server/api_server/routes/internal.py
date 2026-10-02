@@ -13,7 +13,11 @@ from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisco
 from api_server import models as mdl
 from api_server import phantom_completion, waiting_missions
 from api_server.app_config import app_config
-from api_server.dispatch_reason import dispatch_failure_reason, no_bid_failure_reason
+from api_server.dispatch_reason import (
+    dispatch_failure_reason,
+    no_bid_failure_reason,
+    no_bid_judged_failure_reason,
+)
 from api_server.fleet_state_cadence import FleetStateCadence
 from api_server.internal_tasks import pages_operator
 from api_server.interrupted_tasks import (
@@ -327,8 +331,10 @@ async def _redispatch_later(task_state: mdl.TaskState) -> None:
         errors = None
         if task_state.dispatch is not None and task_state.dispatch.errors:
             # F-435: the detail is what tells a permanent answer ("no robot
-            # can ever take it") from a transient one
-            errors = [{"code": e.code, "detail": e.detail}
+            # can ever take it") from a transient one; F-442: the category
+            # is what marks the fleet's naming of every robot
+            errors = [{"code": e.code, "category": e.category,
+                       "detail": e.detail}
                       for e in task_state.dispatch.errors]
         task_id = task_state.booking.id
         new_id = await redispatcher.maybe_redispatch(
@@ -798,7 +804,11 @@ def no_bid_final_reason(
     over how long, and whether the fleet was silent or answered with a
     refusal. None for every other state, including a no-bid attempt that
     still has auctions left (supersede() has recorded that one as put
-    back on the floor, and it raises no failure)."""
+    back on the floor, and it raises no failure).
+
+    F-442 (D-86 (4)): the last auction is the fifth in a row on which the
+    fleet named every robot it considered as unable ever to take it, and
+    the reason names each of them and why."""
     verdict = no_bid_verdict_of(task_state)
     if verdict is None or not verdict.final or task_state.dispatch is None:
         return None
@@ -806,8 +816,9 @@ def no_bid_final_reason(
     over_s = None
     if since is not None:
         over_s = (time.time() if now_s is None else now_s) - since
-    return no_bid_failure_reason(
-        task_state.dispatch.errors, verdict.attempt, over_s)
+    return no_bid_judged_failure_reason(
+        task_state.dispatch.errors, verdict.attempt, over_s
+    ) or no_bid_failure_reason(task_state.dispatch.errors, verdict.attempt, over_s)
 
 
 async def alert_on_task_state(task_state: mdl.TaskState, repo):

@@ -308,8 +308,19 @@ class NoBidReauctionRouteTest(AppFixture):
             f"[{task_id}] due to insufficient battery capacity to accommodate "
             "one or more requests by any of the robots in this fleet.",
         }
+        # F-442: the fleet named every robot it considered
+        named = {
+            "code": 9,
+            "category": "Robot judgements",
+            "detail": '{"fleet":"gentle_fleet","robots":['
+            '{"judgement":"limited_capacity","name":"gentle_bot_1"},'
+            '{"judgement":"limited_capacity","name":"gentle_bot_2"}],'
+            f'"task_id":"{task_id}"}}',
+        }
         (row, alert), mock = self.ingest(
-            closed_auction(task_id, labels=labels, errors=[limited, no_bid_error(task_id)]),
+            closed_auction(
+                task_id, labels=labels, errors=[limited, named, no_bid_error(task_id)]
+            ),
             expect_dispatch=False,
         )
         mock.assert_not_called()
@@ -321,7 +332,9 @@ class NoBidReauctionRouteTest(AppFixture):
             rf"^Task {task_id} failed: no robot offered to take this mission at 5 "
             r"auctions in a row over 6\d s — no robot can finish this mission on "
             r"one battery charge, even starting full — shorten it \(fewer rounds "
-            r"or stops\) or split it into smaller missions$",
+            r"or stops\) or split it into smaller missions\. Every robot judged: "
+            r"gentle_bot_1, gentle_bot_2 \(cannot finish it on one battery charge, "
+            r"even starting full from its charger\)$",
         )
         self.assertEqual(internal.redispatcher.no_bid_exhausted, before + 1)
 

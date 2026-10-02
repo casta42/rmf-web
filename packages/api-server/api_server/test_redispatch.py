@@ -64,6 +64,7 @@ from api_server.redispatch import (
     Held,
     Redispatcher,
     Refusal,
+    RobotJudgement,
     class_of,
     generation_of,
     hand_back_backoff,
@@ -79,6 +80,7 @@ from api_server.redispatch import (
     no_bid_verdict_of,
     origin_of,
     refusal_backoff,
+    robot_judgements,
     root_of,
     supersede,
     transient_no_bid_backoff,
@@ -116,6 +118,24 @@ PLANNER = {"code": 9, "category": "Not feasible",
            "detail": "[TaskPlanner] Failed to compute assignments for task_id "
                      "[patrol.dispatch-1]"}
 INTERNAL = {"code": 13, "category": "Internal bug", "detail": "boom"}
+
+
+def judged(*verdicts, fleet="gentle_fleet", task="patrol.dispatch-1",
+           first=1):
+    """F-442: the fleet adapter's naming of every robot it judged, byte for
+    byte as the patch writes it (make_error_str of nlohmann::json::dump,
+    whose objects keep their keys sorted)."""
+    robots = ",".join(
+        f'{{"judgement":"{v}","name":"gentle_bot_{first + i}"}}'
+        for i, v in enumerate(verdicts))
+    return {"code": 9, "category": "Robot judgements",
+            "detail": f'{{"fleet":"{fleet}","robots":[{robots}],'
+                      f'"task_id":"{task}"}}'}
+
+
+# every robot the fleet considered cannot finish it even starting full
+JUDGED_LIMITED = judged("limited_capacity", "limited_capacity",
+                        "limited_capacity")
 
 
 class FakeRequest(BaseModel):
@@ -433,7 +453,9 @@ NO_BID = [{"code": NO_BID_CODE}]
 # the real persisted shape when the fleet adapter answered with a refusal:
 # its own error first, then the dispatcher's code 10 (Dispatcher.cpp)
 ANSWERED = [{"code": 9}, {"code": NO_BID_CODE}]
-PERMANENT = [LIMITED, {"code": NO_BID_CODE}]
+# the planner's refusal, the fleet's naming of every robot, the
+# dispatcher's code 10 — the persisted order (Dispatcher.cpp conclude_bid)
+PERMANENT = [LIMITED, JUDGED_LIMITED, {"code": NO_BID_CODE}]
 
 
 def permanent_labels(before: int, attempt: Optional[int] = None) -> List[str]:
@@ -456,12 +478,72 @@ class PermanenceTest(unittest.TestCase):
                          dispatch_reason._LIMITED_CAPACITY)  # noqa: SLF001
         self.assertIn(PERMANENT_NO_BID_DETAIL, LIMITED["detail"])
 
-    def test_FIRES_on_limited_capacity_alone_or_beside_others(self):
-        self.assertTrue(no_bid_is_permanent([LIMITED]))
-        self.assertTrue(no_bid_is_permanent(PERMANENT))
-        self.assertTrue(no_bid_is_permanent([LOW, LIMITED, NO_BID[0]]))
+    def test_FIRES_when_every_robot_considered_has_limited_capacity(self):
         from api_server.models.rmf_api.error import Error
-        self.assertTrue(no_bid_is_permanent([Error(**LIMITED)]))
+        self.assertTrue(no_bid_is_permanent([LIMITED, JUDGED_LIMITED]))
+        self.assertTrue(no_bid_is_permanent(PERMANENT))
+        self.assertTrue(no_bid_is_permanent(
+            [Error(**LIMITED), Error(**JUDGED_LIMITED), Error(**NO_BID[0])]),
+            "the real model, as the state carries it")
+        # a robot that was not commissioned was not considered: named, and
+        # it does not count either way
+        self.assertTrue(no_bid_is_permanent(
+            [LIMITED, judged("limited_capacity", "not_commissioned")]))
+        # two fleets, each refusing and naming its robots
+        self.assertTrue(no_bid_is_permanent(
+            [LIMITED, judged("limited_capacity"), LOW,
+             judged("limited_capacity", fleet="other", first=7), NO_BID[0]]),
+            "every robot of every refusing fleet, whatever each planner said "
+            "of its last one")
+
+    def test_F442_the_planner_s_last_robot_alone_no_longer_decides(self):
+        """THE CONTRACT CHANGED (F-442, D-86 (4)): this used to FIRE on the
+        planner's "insufficient battery capacity" alone. That is the verdict
+        on the robot the planner judged LAST; without the rest named, it
+        cannot convict the mission."""
+        from api_server.models.rmf_api.error import Error
+        for errors in ([LIMITED], [LIMITED, NO_BID[0]], [Error(**LIMITED)],
+                       [LOW, LIMITED, NO_BID[0]]):
+            self.assertFalse(no_bid_is_permanent(errors), errors)
+
+    def test_PASSES_one_robot_that_could_take_it_some_day(self):
+        for verdict in ("low_battery", "feasible", "no_solution", "unknown",
+                        "error", "something new"):
+            errors = [LIMITED, judged("limited_capacity", verdict,
+                                      "limited_capacity"), NO_BID[0]]
+            self.assertFalse(no_bid_is_permanent(errors), verdict)
+
+    def test_PASSES_what_cannot_be_seen_never_convicts(self):
+        unseen = [
+            # nobody considered at all
+            [LIMITED, judged("not_commissioned"), NO_BID[0]],
+            [LIMITED, judged(), NO_BID[0]],
+            # a second fleet refused without naming its robots
+            [LIMITED, LIMITED, JUDGED_LIMITED, NO_BID[0]],
+            # a naming beside an answer that is not a planner refusal
+            [LIMITED, JUDGED_LIMITED, INTERNAL, NO_BID[0]],
+            # a naming that cannot be read
+            [LIMITED, {**JUDGED_LIMITED, "detail": "not json"}],
+            [LIMITED, {**JUDGED_LIMITED, "detail": '{"robots": "x"}'}],
+            [LIMITED, {**JUDGED_LIMITED,
+                       "detail": '{"robots": [{"judgement": "limited_capacity"}]}'}],
+            [LIMITED, {**JUDGED_LIMITED, "detail": None}],
+            # the naming's shape without its category, or under another code
+            [LIMITED, {k: v for k, v in JUDGED_LIMITED.items()
+                       if k != "category"}],
+            [LIMITED, {**JUDGED_LIMITED, "code": 13}],
+        ]
+        for errors in unseen:
+            self.assertFalse(no_bid_is_permanent(errors), errors)
+
+    def test_robot_judgements_read_the_patch_s_detail(self):
+        self.assertEqual(
+            robot_judgements([LIMITED, judged("limited_capacity", "low_battery"),
+                              NO_BID[0]]),
+            [RobotJudgement("gentle_fleet", "gentle_bot_1", "limited_capacity"),
+             RobotJudgement("gentle_fleet", "gentle_bot_2", "low_battery")])
+        self.assertIsNone(robot_judgements([LIMITED, NO_BID[0]]))
+        self.assertIsNone(robot_judgements(None))
 
     def test_PASSES_every_transient_answer(self):
         for errors in ([], None, NO_BID, [LOW, NO_BID[0]],
@@ -1125,7 +1207,7 @@ class SupersedeRealModelTest(unittest.TestCase):
 
     def test_FIRES_a_permanent_answer_is_put_back_while_answers_remain(self):
         state = real_state(labels=permanent_labels(1, 2),
-                           errors=[LIMITED, NO_BID_ERROR])
+                           errors=[LIMITED, JUDGED_LIMITED, NO_BID_ERROR])
         verdict = supersede(state)
         self.assertTrue(verdict.permanent)
         self.assertEqual(state.status, mdl.TaskStatus.canceled)
@@ -1145,7 +1227,7 @@ class SupersedeRealModelTest(unittest.TestCase):
         state = real_state(
             labels=permanent_labels(NO_BID_MAX_ATTEMPTS - 1,
                                     NO_BID_MAX_ATTEMPTS),
-            errors=[LIMITED, NO_BID_ERROR])
+            errors=[LIMITED, JUDGED_LIMITED, NO_BID_ERROR])
         verdict = supersede(state)
         self.assertTrue(verdict.final)
         self.assertEqual(state.status, mdl.TaskStatus.failed)
