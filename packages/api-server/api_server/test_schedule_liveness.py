@@ -123,6 +123,83 @@ class ScheduleLivenessTest(unittest.TestCase):
         self.assertEqual(self.repo.creates, 1)
         self.assertEqual(self.repo.open(), [])
 
+    # -- the shapes measured on the stack's DDS, 2026-10-02 (a reader's
+    # liveliness events when the schedule node goes and a new one starts
+    # 2 s later; ops/e6/evidence/f4/stress-d85/f454-liveliness-on-kill/) --
+
+    def test_a_crash_and_fast_restart_never_reads_zero_and_is_still_one_alert(self):
+        """SIGSEGV / SIGKILL: the dead writer is only dropped when its
+        lease runs out, so the count reads 1 -> 2 -> 1. Before this the
+        watcher raised only on 0: the crash it exists for raised nothing."""
+        self.state.on_liveliness(1, 1)
+        self.drain()
+        self.state.on_liveliness(2, 1)        # the restarted node matches
+        self.assertEqual(self.drain(), [sl.RAISE, sl.RESOLVE, None, None])
+        self.state.on_liveliness(1, -1)       # the dead writer is dropped
+        self.assertEqual(self.drain(), [None] * 4)
+        self.assertEqual(self.repo.creates, 1, "ONE alert for the outage")
+        self.assertEqual(self.repo.open(), [])
+        self.assertEqual(self.state.outages, 1)
+
+    def test_a_clean_stop_and_restart_reads_zero_and_is_one_alert(self):
+        """SIGTERM (docker restart, a site-config apply): 1 -> 0 -> 1."""
+        self.state.on_liveliness(1, 1)
+        self.drain()
+        self.state.on_liveliness(0, -1)
+        self.assertEqual(self.drain(), [sl.RAISE, None, None, None])
+        self.state.on_liveliness(1, 1)
+        self.assertEqual(self.drain(), [sl.RESOLVE, None, None, None])
+        self.assertEqual(self.repo.creates, 1)
+        self.assertEqual(self.state.outages, 1)
+
+    def test_a_stall_past_the_lease_then_the_restart_is_one_alert(self):
+        """SIGSTOP past the lease (F-453): 1 -> 0, the adapter restarts
+        rmf-core, the new writer is alive, the stalled one is dropped."""
+        self.state.on_liveliness(1, 1)
+        self.drain()
+        self.state.on_liveliness(0, -1)
+        self.assertEqual(self.drain(), [sl.RAISE, None, None, None])
+        self.state.on_liveliness(1, 1)
+        self.state.on_liveliness(1, 0)        # the stalled writer's removal
+        self.assertEqual(self.drain(), [sl.RESOLVE, None, None, None])
+        self.assertEqual(self.repo.creates, 1)
+
+    def test_PASSES_a_boot_that_finds_two_writers_raises_nothing(self):
+        """The api-server starting inside a crash's overlap window: it never
+        saw the schedule alive before, so nothing was lost on its watch."""
+        self.state.on_liveliness(2, 2)
+        self.state.on_liveliness(1, -1)
+        self.assertEqual(self.drain(), [sl.SWEEP, None, None, None])
+        self.assertEqual(self.repo.creates, 0)
+        self.assertEqual(self.state.outages, 0)
+
+    def test_PASSES_repeated_events_of_one_live_writer_raise_nothing(self):
+        self.state.on_liveliness(1, 1)
+        for _ in range(5):
+            self.state.on_liveliness(1, 0)
+        self.assertEqual(self.drain(), [sl.SWEEP, None, None, None])
+        self.assertEqual(self.repo.creates, 0)
+
+    def test_the_alerts_id_is_the_shape_the_runbook_keys_on(self):
+        """F3.2: the id is built at the emit site from a literal prefix
+        (the alert catalogue's guard reads it there) and is the shape
+        alert_id_of() and the start-of-life sweep's prefix use."""
+        self.state.on_liveliness(1, 1)
+        self.drain()
+        self.clock.t = 1_790_000_123.9
+        self.state.on_liveliness(0, -1)
+        self.drain()
+        (alert,) = self.repo.open()
+        self.assertEqual(alert.id, sl.alert_id_of(1, 1_790_000_123.9))
+        self.assertEqual(alert.id, "traffic_schedule_lost__1790000123_1")
+        self.assertTrue(alert.id.startswith(sl.ALERT_PREFIX))
+
+    def test_the_gateway_hands_the_change_count_through(self):
+        import pathlib
+
+        gateway = (pathlib.Path(sl.__file__).parent / "gateway.py").read_text()
+        self.assertIn("event.alive_count, event.alive_count_change", gateway)
+
     def test_a_second_outage_is_a_second_alert(self):
         self.state.on_liveliness(1)
         self.drain()

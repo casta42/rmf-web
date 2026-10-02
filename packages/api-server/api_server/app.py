@@ -235,6 +235,13 @@ async def lifespan(_app: FastIO):
     schedule_loop = loop.create_task(schedule_liveness.maintenance_loop())
     shutdown_cbs.append(schedule_loop.cancel)
 
+    # F-454 (G ruling 2026-10-02, item 1): the F-141 restart sweep runs on
+    # its own clock and acts only on a new fleet core identity — a real
+    # coordination restart — never on how old or quiet a mission's row is
+    restart_sweep_loop = loop.create_task(
+        routes.internal.interrupted_tasks_loop())
+    shutdown_cbs.append(restart_sweep_loop.cancel)
+
     logger.info("starting scheduler")
     asyncio.create_task(_spin_scheduler())
     # F-293: missions held for their start are released on this clock

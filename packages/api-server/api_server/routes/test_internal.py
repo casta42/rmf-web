@@ -707,18 +707,12 @@ class TestFleetStateCadenceWiring(unittest.IsolatedAsyncioTestCase):
                 "time",
                 "process_robot_alerts",
                 "reap_charge_ghosts",
-                "reap_interrupted_tasks",
-                "sweep_stale_tasks",
-                "_run_boundary",
             )
         }
         internal.fleet_state_cadence = FleetStateCadence()
         internal.time = types.SimpleNamespace(monotonic=self.clock.monotonic)
         internal.process_robot_alerts = counted
         internal.reap_charge_ghosts = quiet
-        internal.reap_interrupted_tasks = quiet
-        internal.sweep_stale_tasks = quiet
-        internal._run_boundary = types.SimpleNamespace(observe=lambda *_a: None)
         self.emitted, self.heartbeats = [], []
         self._subs = [
             fleet_events.fleet_states.subscribe(self.emitted.append),

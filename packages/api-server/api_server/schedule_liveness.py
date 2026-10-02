@@ -16,7 +16,10 @@ its heartbeat_period; it never publishes there, so no deadline is
 requested). The gateway feeds `on_liveliness` from its ROS thread; the
 async loop below raises and resolves the alert on the app's loop.
 
-One alert per OUTAGE: the schedule seen alive, then lost. A fresh boot
+One alert per OUTAGE: the schedule seen alive, then lost — its alive count
+at 0 (a clean stop, a stall past the lease), or its writer REPLACED while
+the dead one still counted (a crash and a restart faster than the lease:
+the count reads 1 -> 2 -> 1 and never 0). A fresh boot
 (api-server and rmf-core coming up in any order) raises nothing; the
 rmf-core healthcheck (FR-39/FR-39a) covers a core that never comes up. The
 alert resolves when the schedule is alive again. A schedule that drops
@@ -74,9 +77,24 @@ class ScheduleLiveness:
         self._alerted: Optional[str] = None
         self._swept = False
 
-    def on_liveliness(self, alive_count: int) -> None:
+    def on_liveliness(self, alive_count: int, alive_count_change: int = 0) -> None:
         alive = int(alive_count) > 0
         with self._lock:
+            if (alive and self._alive and int(alive_count_change) > 0
+                    and int(alive_count) >= 2):
+                # REPLACED: a second schedule writer while the first still
+                # counts as alive. A node that crashes (SIGSEGV, SIGKILL)
+                # disposes nothing, so its writer stays "alive" until its
+                # lease runs out; the restarted node matches seconds later
+                # and the count reads 1 -> 2 -> 1, never 0 (measured
+                # 2026-10-02, f454-liveliness-on-kill). That IS an outage,
+                # shorter than the lease: one alert, raised now and
+                # resolved on the next pass (the schedule is alive). The
+                # dead writer's later drop (2 -> 1) is the same outage.
+                self._outages += 1
+                if self._alerted is None and self._pending_lost is None:
+                    self._pending_lost = (self._outages, self._clock())
+                return
             if alive == self._alive:
                 return
             self._alive = alive
@@ -92,15 +110,16 @@ class ScheduleLiveness:
                 self._pending_lost = (self._outages, self._lost_at)
 
     def due(self) -> Optional[Tuple[str, str, Optional[float]]]:
-        """(RAISE, alert_id, lost_at) for an outage not yet alerted;
+        """(RAISE, outage number, lost_at) for an outage not yet alerted;
         (RESOLVE, alert_id, None) for a raised alert whose schedule is
-        back; None otherwise."""
+        back; (SWEEP, prefix, None) once, when the schedule is first seen
+        alive; None otherwise."""
         with self._lock:
             if self._alive and not self._swept:
                 return (SWEEP, ALERT_PREFIX, None)
             if self._pending_lost is not None:
                 outage, lost_at = self._pending_lost
-                return (RAISE, alert_id_of(outage, lost_at), lost_at)
+                return (RAISE, str(outage), lost_at)
             if self._alive and self._alerted is not None:
                 return (RESOLVE, self._alerted, None)
             return None
@@ -143,11 +162,17 @@ async def process(state: ScheduleLiveness, alert_repo, alert_events,
         state.mark_swept()
         return SWEEP
     if kind == RAISE:
+        # the id is built HERE, from a literal: the alert catalogue's guard
+        # (F3.2, test_alert_catalogue.py) reads every alert's key off its
+        # emit site, and the runbook's row for this alert is keyed on it.
+        # Same shape as alert_id_of(): the prefix the SWEEP resolves by.
+        lost_at = lost_at or time.time()
+        alert_id = f"traffic_schedule_lost__{int(lost_at)}_{alert_id}"
         alert = await alert_repo.create_alert(
             alert_id,
             ALERT_CATEGORY,
             severity=severity_critical,
-            message=alert_message(lost_at or time.time()),
+            message=alert_message(lost_at),
         )
         state.mark_raised(alert_id)
         if alert is not None:
