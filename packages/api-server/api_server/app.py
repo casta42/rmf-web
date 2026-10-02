@@ -227,6 +227,14 @@ async def lifespan(_app: FastIO):
     waiting_loop = loop.create_task(routes.internal.waiting_maintenance_loop())
     shutdown_cbs.append(waiting_loop.cancel)
 
+    # FR-39a (G close-out ruling 2026-10-01, 3a; D-86): one critical alert
+    # when traffic coordination is lost, resolved when it is back — raised
+    # here, outside the rmf-core container the loss restarts
+    from api_server import schedule_liveness  # noqa: PLC0415
+
+    schedule_loop = loop.create_task(schedule_liveness.maintenance_loop())
+    shutdown_cbs.append(schedule_loop.cancel)
+
     logger.info("starting scheduler")
     asyncio.create_task(_spin_scheduler())
     # F-293: missions held for their start are released on this clock

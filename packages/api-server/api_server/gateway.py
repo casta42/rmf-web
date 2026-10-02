@@ -336,6 +336,36 @@ class RmfGateway:
         # on its own dock by the LIVE pose and its SoC rising. The
         # dashboard's Charging chip reads this, never the task or the
         # reported position. Latched at 1 Hz by the adapter.
+        # FR-39a (G close-out ruling 2026-10-01, 3a; D-86; F-445/F-446):
+        # the traffic schedule's DDS liveliness, for the ONE critical alert
+        # raised outside rmf-core when traffic coordination is lost. The
+        # schedule offers liveliness AUTOMATIC and never publishes here: no
+        # deadline is requested, and the reader's lease stays infinite (a
+        # shorter requested lease never matches).
+        from rclpy.qos_event import SubscriptionEventCallbacks  # noqa: PLC0415
+        from rmf_traffic_msgs.msg import Heartbeat  # noqa: PLC0415
+
+        from api_server import schedule_liveness  # noqa: PLC0415
+
+        heartbeat_sub = ros_node().create_subscription(
+            Heartbeat,
+            "rmf_traffic/heartbeat",
+            lambda _msg: None,
+            rclpy.qos.QoSProfile(
+                history=rclpy.qos.HistoryPolicy.KEEP_LAST,
+                depth=1,
+                reliability=rclpy.qos.ReliabilityPolicy.RELIABLE,
+                durability=rclpy.qos.DurabilityPolicy.VOLATILE,
+                liveliness=rclpy.qos.LivelinessPolicy.AUTOMATIC,
+            ),
+            event_callbacks=SubscriptionEventCallbacks(
+                liveliness=lambda event: schedule_liveness.STATE.on_liveliness(
+                    event.alive_count
+                )
+            ),
+        )
+        self._subscriptions.append(heartbeat_sub)
+
         from api_server import charging_truth  # noqa: PLC0415
 
         charging_sub = ros_node().create_subscription(
