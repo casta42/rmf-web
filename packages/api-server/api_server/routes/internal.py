@@ -11,7 +11,7 @@ from typing import Any, Dict, Optional, Tuple
 from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 
 from api_server import models as mdl
-from api_server import phantom_completion, waiting_missions
+from api_server import core_incarnation, phantom_completion, waiting_missions
 from api_server.app_config import app_config
 from api_server.dispatch_reason import (
     dispatch_failure_reason,
@@ -21,14 +21,16 @@ from api_server.dispatch_reason import (
 from api_server.fleet_state_cadence import FleetStateCadence
 from api_server.internal_tasks import pages_operator
 from api_server.interrupted_tasks import (
-    ACTIVE_STATUSES,
+    CLOSE_CANCELED,
+    FAIL_LONG_OUTAGE,
+    FAIL_NOT_STORED,
     INTERRUPTED_LABEL,
     INTERRUPTED_REASON,
-    RunBoundary,
-    current_tasks_by_robot,
-    is_interrupted_row,
-    queued_verdict,
-    tasks_named_by,
+    LEAVE_TO_CHARGE_REAPER,
+    SEND_AGAIN,
+    TERMINAL_STATUSES,
+    away_for,
+    decide,
 )
 from api_server.logger import logger as base_logger
 from api_server.models import tortoise_models as ttm
@@ -1589,206 +1591,285 @@ async def reap_charge_ghosts(fleet_state: mdl.FleetState) -> None:
             )
 
 
-_run_boundary = RunBoundary()
-INTERRUPTED_CLOSE_LIMIT = 200
+# a pass that failed (the database went away) is tried again after this
+SWEEP_RETRY_S = 10.0
+# F-454: the core incarnation this api-server life has settled (compared,
+# swept if it was a restart, stored), and when the core's last word was
+# last written to the database
+_core_settled: Dict[str, Any] = {"boot_id": None, "heard_persisted": None}
 
 
-async def reap_interrupted_tasks() -> None:
-    """F-141 (E6 run-2 blocker 3): after a fleet coordination restart,
-    close every task row the restarted core no longer knows — the
-    ledger keeps missions that terminate honestly, never 'Executing'
-    phantoms that nothing can cancel. Fires once per outage epoch, a
-    grace period after the fleet stream resumes (everything the core
-    still knows has re-announced by then)."""
-    now_mono = time.monotonic()
-    if not _run_boundary.due(now_mono):
-        return
-    _run_boundary.mark_reaped()
-    epoch = _run_boundary.epoch_started_wall
-    assert epoch is not None
-    await _close_interrupted_rows(epoch)
+async def reap_interrupted_tasks() -> Optional[str]:
+    """F-141 (E6 run-2 blocker 3), under F-454 (G ruling 2026-10-02, item
+    1): put back on the floor the missions a REAL coordination restart
+    interrupted — each once — and touch nothing otherwise.
 
+    The restart is a stated fact, never an inference: the fleet core's boot
+    identity (core_incarnation.py), compared with the one stored in the
+    database. No record, or the same identity: nothing is swept, however
+    old or silent a row is (on f1-n66 a rolling "untouched for 300 s" pass
+    re-dispatched healthy queued missions 946 times in 3 h with no restart
+    at all). A different identity: every non-terminal row created before
+    the new core started is handled (_close_interrupted_rows), and only
+    then is the new identity stored — a pass that dies midway runs again,
+    and a closed row is terminal, so none is handled twice.
 
-# F-141 addendum (Act-3 stress, 2026-08-26): a coordination restart
-# FASTER than FLEET_SILENCE_GAP leaves no detectable outage boundary
-# (the in-container drill-2 respawns in ~4 s), yet the new core still
-# knows nothing about the old rows — four missions starved as
-# un-cancelable 'underway' phantoms. Class rule: fleet states are
-# FLOWING while a non-terminal row goes untouched this long — the core
-# is talking, just not about this task.
-STALE_TASK_SWEEP_AGE = 300.0
-_stale_sweep_last = {"t": 0.0}
-
-
-async def sweep_stale_tasks() -> None:
-    """Close non-terminal rows no live core is updating (see the F-141
-    addendum note above). Same honest provenance as the boundary reap;
-    auto ChargeBattery ghosts stay the F-12 reaper's job."""
-    now_mono = time.monotonic()
-    if now_mono - _stale_sweep_last["t"] < 60.0:
-        return
-    _stale_sweep_last["t"] = now_mono
-    epoch = datetime.now(timezone.utc) - timedelta(
-        seconds=STALE_TASK_SWEEP_AGE)
-    await _close_interrupted_rows(epoch)
-
-
-async def _fleet_state_rows() -> Optional[list]:
-    """Every stored fleet state's data; None when they cannot be read."""
-    try:
-        rows = await ttm.FleetState.all()
-    except Exception:  # noqa: BLE001 — cannot see
+    Returns the verdict it settled (core_incarnation.FIRST / SAME /
+    RESTARTED), or None when there was nothing new to settle."""
+    seen = core_incarnation.STATE.latest()
+    if seen is None:
+        return None  # the core has not said who it is: cannot see, so nothing
+    if seen.boot_id == _core_settled["boot_id"]:
+        await _persist_core_heard()
         return None
-    return [row.data if isinstance(row.data, dict) else {} for row in rows]
+    known = await ttm.CoreBoot.get_or_none(id=1)
+    what = core_incarnation.verdict(known.boot_id if known else None, seen)
+    in_future = seen.started_at > datetime.now(timezone.utc) + timedelta(seconds=5)
+    if what == core_incarnation.RESTARTED:
+        assert known is not None
+        outage = core_incarnation.outage_s(
+            [known.last_heard_at, *core_incarnation.STATE.heard_stamps()], seen)
+        if in_future:
+            # a start in the future is a clock disagreement: nothing can be
+            # said about which rows predate this core
+            logger.error(
+                f"F-141: the fleet core restarted ({known.boot_id[:8]} -> "
+                f"{seen.boot_id[:8]}) but says it started in the future "
+                f"({seen.started_at.isoformat()}) — the clocks disagree, so "
+                "what it interrupted cannot be told: NOTHING swept")
+        else:
+            logger.warning(
+                f"F-141: the fleet core restarted ({known.boot_id[:8]} -> "
+                f"{seen.boot_id[:8]}, started {seen.started_at.isoformat()}, "
+                f"away {away_for(outage)}) — handling what it interrupted")
+            await _close_interrupted_rows(seen.started_at, outage)
+    elif what == core_incarnation.FIRST:
+        # No stored identity: a first run, an upgrade from a release that
+        # stored none, a database restored from before F-454. There is no
+        # old identity to compare, but the boundary needs none: a row
+        # created before THIS core started was never this core's (on a
+        # first run, and whenever the floor was idle, there is no such
+        # row). When its core went is unknown, so it is closed and named,
+        # never sent again.
+        if in_future:
+            logger.error(
+                f"F-141: first fleet core identity seen ({seen.boot_id[:8]}) "
+                f"but it says it started in the future "
+                f"({seen.started_at.isoformat()}) — NOTHING swept")
+        else:
+            logger.info(
+                f"F-141: first fleet core identity seen ({seen.boot_id[:8]}, "
+                f"started {seen.started_at.isoformat()}) — nothing to compare "
+                "it with; closing only what was left from before this core "
+                "started")
+            await _close_interrupted_rows(seen.started_at, None)
+    else:
+        logger.info(
+            f"F-141: the fleet core is the one already known "
+            f"({seen.boot_id[:8]}) — no coordination restart, nothing swept")
+    await ttm.CoreBoot.update_or_create(
+        id=1, defaults={"boot_id": seen.boot_id, "started_at": seen.started_at})
+    _core_settled["boot_id"] = seen.boot_id
+    return what
 
 
-async def _tasks_named_by_fleet_states() -> set:
-    return tasks_named_by(await _fleet_state_rows() or [])
+async def _persist_core_heard() -> None:
+    """Keep the time the fleet core was last heard in the database, to
+    within HEARD_PERSIST_S — after an api-server restart it is the only way
+    to tell how long the core was away. Written only while the running core
+    is the settled one, and only a stamp HEARD_SETTLE_S old: the new
+    core's fleet states can reach the gateway before its boot record does,
+    and a fresh stamp stored in that gap would pass for the old core's
+    last word."""
+    heard = core_incarnation.STATE.settled_heard(datetime.now(timezone.utc))
+    if heard is None or heard == _core_settled["heard_persisted"]:
+        return
+    await ttm.CoreBoot.filter(id=1).update(last_heard_at=heard)
+    _core_settled["heard_persisted"] = heard
 
 
-# F-141 under D-86 (3a)/(4): per robot, the old core's last word on an
-# active task found lost — a queued row on that robot from no later than
-# that belongs to the queue that was lost with it (interrupted_tasks.py)
-_lost_active: Dict[Tuple[str, str], datetime] = {}
-# rows already reported as left alone, so the sweep says it once
-_left_alone: Dict[str, str] = {}
+async def interrupted_tasks_loop() -> None:
+    """The restart sweep's clock (started with the app): one pass a second.
+    A pass with nothing new to settle reads one in-memory record."""
+    while True:
+        wait = 1.0
+        try:
+            await reap_interrupted_tasks()
+        except Exception:  # pylint: disable=broad-except
+            logger.exception(
+                "F-141: the restart sweep failed — it runs again in "
+                f"{SWEEP_RETRY_S:.0f} s; the core identity is stored only "
+                "after a whole pass, and a closed row is never handled twice")
+            wait = SWEEP_RETRY_S
+        await asyncio.sleep(wait)
 
 
-def _assigned(task_state: mdl.TaskState) -> Optional[Tuple[str, str]]:
-    who = task_state.assigned_to
-    if who is None or not who.group or not who.name:
-        return None
-    return (str(who.group), str(who.name))
+async def _warn_interrupted_failures(done: Dict[str, list],
+                                     outage: Optional[float]) -> None:
+    """ONE Warning naming the missions a coordination restart closed as
+    failed, and why each group could not be sent again."""
+    def shown(ids):
+        return ", ".join(ids[:6]) + (
+            f" and {len(ids) - 6} more" if len(ids) > 6 else "")
+
+    parts = []
+    if done[FAIL_NOT_STORED]:
+        parts.append(
+            f"{len(done[FAIL_NOT_STORED])} could not be sent again because "
+            "their requests are not stored (not dispatched through "
+            f"GentleFleet): {shown(done[FAIL_NOT_STORED])}.")
+    if done[FAIL_LONG_OUTAGE]:
+        how_long = (
+            "nobody can say how long the fleet core was away" if outage is None
+            else f"the fleet core was away {away_for(outage)}, longer than "
+                 f"the {int(RESUME_WINDOW_S // 60)} min resume window")
+        parts.append(
+            f"{len(done[FAIL_LONG_OUTAGE])} were not sent again because "
+            f"{how_long}: {shown(done[FAIL_LONG_OUTAGE])}.")
+    if parts:
+        failed = len(done[FAIL_NOT_STORED]) + len(done[FAIL_LONG_OUTAGE])
+        alert = await alert_repo.create_alert(
+            f"interrupted__{round(datetime.now().timestamp() * 1e3)}",
+            "fleet",
+            severity=ttm.Alert.Severity.Warning,
+            message=(
+                f"{failed} mission(s) running before the fleet "
+                "coordination restart did not resume and were closed as "
+                "failed. " + " ".join(parts) + " Re-dispatch what is still "
+                "needed."
+            ),
+        )
+        if alert is not None:
+            alert_events.alerts.on_next(alert)
 
 
-async def _close_interrupted_rows(epoch) -> None:
-    """F-141, under D-86 (3a)/(4): close every row the restarted core no
-    longer knows — and put each such mission back on the floor. A row with
-    a stored request is closed like a hand-back (canceled, the marker, the
-    reason; the gf:interrupted booking label kept) and re-dispatched as the
-    next attempt of its chain, waiting for a robot until it is placed; a row
-    with nothing re-sendable is closed failed, its reason named in one
-    Warning. A queued row is closed only on evidence the core lost it
-    (interrupted_tasks.queued_verdict) — sending again a mission the core
-    still holds would run it twice."""
-    # exclude terminal rows IN the query: updated_at__lt alone matches
-    # every historic row, and the unordered LIMIT then never reaches
-    # the live ghosts (found in the Act-3 stress: 4 starved rows,
-    # 200-row page full of old completed missions). The column stores
+async def _close_interrupted_rows(boundary: datetime,
+                                  outage: Optional[float]) -> Dict[str, list]:
+    """F-141, under D-86 (3a)/(4) and F-454: handle every non-terminal row
+    the core that is gone held — the rows CREATED BEFORE `boundary`, the
+    start of the core that replaced it. Called only on a real restart
+    (reap_interrupted_tasks). What happens to each is
+    interrupted_tasks.decide: sent again like a hand-back; closed canceled
+    when somebody had asked for that; closed failed, with the reason in one
+    Warning, when nothing can be re-sent or the core was away too long for
+    anyone to say the mission is still wanted (`outage`, seconds; None:
+    unknown). Returns the ids by outcome."""
+    # exclude terminal rows IN the query: the unordered LIMIT otherwise
+    # never reaches the live ghosts (found in the Act-3 stress: 4 starved
+    # rows, 200-row page full of old completed missions). The column stores
     # the enum repr ('Status.underway'), so match both spellings.
     terminal = [spelling
                 for s in ("completed", "failed", "canceled",
                           "killed", "skipped")
                 for spelling in (s, f"Status.{s}")]
-    rows = await ttm.TaskState.filter(
-        updated_at__lt=epoch).exclude(
-        status__in=terminal).limit(INTERRUPTED_CLOSE_LIMIT)
-    # F-343 (f1-n33): a running task whose next stop has no route goes
-    # SILENT — the fleet re-broadcasts only on change — and this sweep
-    # closed it as "fleet coordination restarted; the core no longer
-    # tracks it" while the robot's own fleet state still named it as its
-    # current task. The claim is checked before it is written.
-    fleet_states = await _fleet_state_rows()
-    tracked = tasks_named_by(fleet_states or [])
-    current = current_tasks_by_robot(fleet_states or [])
-    # the active rows first: a robot's lost active task tells on its queue
-    rows = sorted(rows, key=lambda r: status_tail(r.status) not in ACTIVE_STATUSES)
+    from tortoise.expressions import Q
+    from api_server.models.rmf_api.task_state import Cancellation
+
     now_ms = round(time.time() * 1e3)
-    failed, requeued = [], []
-    for row in rows:
-        if str(row.id_).startswith("Charge"):
-            continue  # F-12 reaper's jurisdiction
-        if not is_interrupted_row(row.status, row.updated_at, epoch):
-            continue
-        if str(row.id_) in tracked:
-            continue  # the core DOES track it: not interrupted, just quiet
-        try:
-            task_state = mdl.TaskState(**row.data)
-        except Exception:  # noqa: BLE001 — a corrupt row must not stop the sweep
-            logger.error(f"F-141: cannot parse task row {row.id_}")
-            continue
-        assigned = _assigned(task_state)
-        if status_tail(row.status) in ACTIVE_STATUSES:
-            if assigned is not None and row.updated_at is not None:
-                seen = row.updated_at
-                if seen.tzinfo is None:
-                    seen = seen.replace(tzinfo=timezone.utc)
-                if assigned not in _lost_active or _lost_active[assigned] < seen:
-                    _lost_active[assigned] = seen
-                    while len(_lost_active) > 4096:
-                        _lost_active.pop(next(iter(_lost_active)))
-        else:
-            lost, why = queued_verdict(
-                assigned, task_state.unix_millis_start_time, row.updated_at,
-                current, _lost_active)
-            if not lost:
-                if _left_alone.get(str(row.id_)) != why:
-                    _left_alone[str(row.id_)] = why
-                    while len(_left_alone) > 4096:
-                        _left_alone.pop(next(iter(_left_alone)))
-                    logger.info(f"F-141: {row.id_} is silent but left alone — {why}")
+    done: Dict[str, list] = {SEND_AGAIN: [], CLOSE_CANCELED: [],
+                             FAIL_NOT_STORED: [], FAIL_LONG_OUTAGE: [],
+                             LEAVE_TO_CHARGE_REAPER: [], "unreadable": []}
+    # The ids first, then each row by its id: what is in flight at a
+    # restart is a handful of rows, and a page-by-offset walk would skip a
+    # row whenever somebody else (an operator's cancel, the F-77 janitor)
+    # closed one in between. created_at NULL: a row older than the F-37
+    # columns — older than any core that can be running.
+    ids = await ttm.TaskState.filter(
+        Q(created_at__lt=boundary) | Q(created_at__isnull=True)).exclude(
+        status__in=terminal).order_by("created_at", "id_").values_list(
+        "id_", flat=True)
+    try:
+        for task_id in [str(i) for i in ids]:
+            row = await ttm.TaskState.get_or_none(id_=task_id)
+            if row is None or status_tail(row.status) in TERMINAL_STATUSES:
+                continue  # ended by somebody else since the ids were read
+            try:
+                task_state = mdl.TaskState(**row.data)
+            except Exception:  # noqa: BLE001 — a corrupt row must not stop the sweep
+                logger.error(f"F-141: cannot parse task row {task_id}")
+                done["unreadable"].append(task_id)
                 continue
-        labels = list(task_state.booking.labels or [])
-        if INTERRUPTED_LABEL not in labels:
-            labels.append(INTERRUPTED_LABEL)
-        task_state.booking.labels = labels
-        if task_cancellation.requested(str(row.id_)):
-            task_cancellation.apply(task_state)
-            if task_state.cancellation is not None and wants_redispatch(
-                    "canceled", task_state.cancellation.labels) is None:
+            cancel_requested = False
+            if task_cancellation.requested(task_id):
+                task_cancellation.apply(task_state)
+                # a cancellation that itself asks for a re-dispatch (a
+                # hand-back under way when the core went) is not "stop"
+                cancel_requested = (
+                    task_state.cancellation is not None and wants_redispatch(
+                        "canceled", task_state.cancellation.labels) is None)
+            leave = task_id.startswith("Charge")
+            stored = leave or cancel_requested or (
+                await task_repo.get_task_request(task_id) is not None)
+            what = decide(task_id, cancel_requested, stored, outage,
+                          RESUME_WINDOW_S)
+            if what == LEAVE_TO_CHARGE_REAPER:
+                done[what].append(task_id)
+                continue  # F-12 reaper's jurisdiction
+            labels = list(task_state.booking.labels or [])
+            if INTERRUPTED_LABEL not in labels:
+                labels.append(INTERRUPTED_LABEL)
+            task_state.booking.labels = labels
+            if what == CLOSE_CANCELED:
                 # somebody asked for it to stop before the restart: it
                 # ended canceled, and is never sent again
                 task_state.status = mdl.TaskStatus.canceled
                 await task_repo.save_task_state(task_state)
                 task_events.task_states.on_next(task_state)
                 logger.warning(
-                    f"F-141: {row.id_} was interrupted by a coordination "
+                    f"F-141: {task_id} was interrupted by a coordination "
                     "restart after its cancellation was requested — closed "
                     "canceled, not sent again")
-                continue
-        if await task_repo.get_task_request(str(row.id_)) is None:
-            # nothing can ever be re-sent: the failure it is, reason named
-            task_state.status = mdl.TaskStatus.failed
-            await task_repo.save_task_state(task_state)
-            task_events.task_states.on_next(task_state)
-            failed.append(row.id_)
-            logger.warning(
-                f"F-141: closed interrupted mission {row.id_} as failed "
-                "(fleet coordination restarted; the core no longer tracks "
-                "it, and its request is not stored, so it cannot be sent "
-                "again)")
-            continue
-        from api_server.models.rmf_api.task_state import Cancellation
+            elif what == FAIL_NOT_STORED:
+                # nothing can ever be re-sent: the failure it is, reason named
+                task_state.status = mdl.TaskStatus.failed
+                await task_repo.save_task_state(task_state)
+                task_events.task_states.on_next(task_state)
+                logger.warning(
+                    f"F-141: closed interrupted mission {task_id} as failed "
+                    "(fleet coordination restarted; the core no longer tracks "
+                    "it, and its request is not stored, so it cannot be sent "
+                    "again)")
+            elif what == FAIL_LONG_OUTAGE:
+                task_state.status = mdl.TaskStatus.failed
+                await task_repo.save_task_state(task_state)
+                task_events.task_states.on_next(task_state)
+                logger.warning(
+                    f"F-141: closed interrupted mission {task_id} as failed "
+                    "(fleet coordination restarted after being away "
+                    f"{away_for(outage)} — longer than the "
+                    f"{int(RESUME_WINDOW_S // 60)} min resume window, or for "
+                    "a time nobody can tell; not sent again)")
+            else:
+                task_state.status = mdl.TaskStatus.canceled
+                task_state.cancellation = Cancellation(
+                    unix_millis_request_time=now_ms,
+                    labels=[REDISPATCH_LABEL, INTERRUPTED_REASON])
+                await task_repo.save_task_state(task_state)
+                task_events.task_states.on_next(task_state)
+                asyncio.get_running_loop().create_task(
+                    _redispatch_later(task_state))
+                logger.warning(
+                    f"F-141: {task_id} was interrupted by a coordination restart "
+                    "(the core no longer tracks it) — back on the floor, waiting for "
+                    "a robot (D-86 (4))")
+            # counted only once it is closed: a pass that dies on this row
+            # reports what it did, and the next pass does the rest
+            done[what].append(task_id)
+    finally:
+        # also when the pass dies midway: the rows it closed failed are
+        # terminal, the next pass will not see them, and an operator must
+        # still be told
+        await _warn_interrupted_failures(done, outage)
+    logger.warning(
+        "F-141: coordination restart handled — "
+        f"{len(done[SEND_AGAIN])} mission(s) sent again, "
+        f"{len(done[CLOSE_CANCELED])} closed canceled as requested, "
+        f"{len(done[FAIL_NOT_STORED])} failed (request not stored), "
+        f"{len(done[FAIL_LONG_OUTAGE])} failed (the core was away too long); "
+        f"{len(done[LEAVE_TO_CHARGE_REAPER])} of the fleet's own charge "
+        f"tasks left to their reaper, {len(done['unreadable'])} unreadable")
 
-        task_state.status = mdl.TaskStatus.canceled
-        task_state.cancellation = Cancellation(
-            unix_millis_request_time=now_ms,
-            labels=[REDISPATCH_LABEL, INTERRUPTED_REASON])
-        await task_repo.save_task_state(task_state)
-        task_events.task_states.on_next(task_state)
-        asyncio.get_running_loop().create_task(_redispatch_later(task_state))
-        requeued.append(row.id_)
-        logger.warning(
-            f"F-141: {row.id_} was interrupted by a coordination restart "
-            "(the core no longer tracks it) — back on the floor, waiting for "
-            "a robot (D-86 (4))")
-    if failed:
-        shown = ", ".join(failed[:6]) + (
-            f" and {len(failed) - 6} more" if len(failed) > 6 else "")
-        alert = await alert_repo.create_alert(
-            f"interrupted__{round(datetime.now().timestamp() * 1e3)}",
-            "fleet",
-            severity=ttm.Alert.Severity.Warning,
-            message=(
-                f"{len(failed)} mission(s) running before the fleet "
-                "coordination restart did not resume and were closed as "
-                "failed: their requests are not stored (not dispatched "
-                f"through GentleFleet), so they cannot be sent again: {shown}. "
-                "Re-dispatch what is still needed."
-            ),
-        )
-        if alert is not None:
-            alert_events.alerts.on_next(alert)
+    return done
 
 
 async def process_msg(msg: Dict[str, Any], fleet_repo: FleetRepository) -> None:
@@ -1880,16 +1961,18 @@ async def process_msg(msg: Dict[str, Any], fleet_repo: FleetRepository) -> None:
         if not full:
             fleet_events.fleet_states.on_next(fleet_state)
             return
+        # F-454: the core's last word, for "how long was it away" at its
+        # next restart — stamped before anything below can raise. The
+        # restart sweep itself runs on its own clock
+        # (interrupted_tasks_loop) and only on a new core identity — never
+        # from here, and never on how quiet a row is.
+        core_incarnation.STATE.heard(datetime.now(timezone.utc))
         await fleet_repo.save_fleet_state(fleet_state)
         fleet_events.fleet_states.on_next(fleet_state)
         # feeds the health watchdog's robot heartbeats (FR-17 robot offline)
         rmf_events.fleet_states.on_next(fleet_state)
         await process_robot_alerts(fleet_state)
         await reap_charge_ghosts(fleet_state)
-        _run_boundary.observe(time.monotonic(),
-                              datetime.now(timezone.utc))
-        await reap_interrupted_tasks()
-        await sweep_stale_tasks()
 
     elif payload_type == "fleet_log_update":
         fleet_log = mdl.FleetLog(**msg["data"])

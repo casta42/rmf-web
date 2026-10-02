@@ -3,6 +3,7 @@ from .alerts import *
 from .authorization import *
 from .beacons import *
 from .building_map import BuildingMap
+from .core_boot import CoreBoot
 from .deferred_dispatch import DeferredDispatch
 from .dispenser_state import DispenserState
 from .door_state import DoorState

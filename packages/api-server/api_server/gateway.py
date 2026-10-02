@@ -394,6 +394,27 @@ class RmfGateway:
         )
         self._subscriptions.append(chargers_sub)
 
+        # F-454 (G ruling 2026-10-02, item 1): the fleet core's boot
+        # identity — ONE latched record per adapter process life. A new
+        # identity is a real coordination restart, the only thing the F-141
+        # restart sweep acts on (core_incarnation.py). Latched, so an
+        # api-server that starts after the core still reads it; the same
+        # record seen again changes nothing.
+        from api_server import core_incarnation  # noqa: PLC0415
+
+        core_boot_sub = ros_node().create_subscription(
+            RosString,
+            core_incarnation.TOPIC,
+            lambda msg: core_incarnation.STATE.on_boot(msg.data),
+            rclpy.qos.QoSProfile(
+                history=rclpy.qos.HistoryPolicy.KEEP_LAST,
+                depth=10,
+                reliability=rclpy.qos.ReliabilityPolicy.RELIABLE,
+                durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL,
+            ),
+        )
+        self._subscriptions.append(core_boot_sub)
+
     def _publish_robot_releases(self, fleet: str, payload: dict) -> None:
         self._robot_releases.publish(RosString(data=json.dumps(payload)))
 
