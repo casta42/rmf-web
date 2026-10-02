@@ -5,6 +5,7 @@ from .beacons import *
 from .building_map import BuildingMap
 from .core_boot import CoreBoot
 from .deferred_dispatch import DeferredDispatch
+from .dispatch_request import DispatchRequest
 from .dispenser_state import DispenserState
 from .door_state import DoorState
 from .fleets import FleetLog, FleetLogLog, FleetLogRobots, FleetLogRobotsLog, FleetState

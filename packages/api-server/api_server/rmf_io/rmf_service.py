@@ -9,6 +9,7 @@ import rclpy.qos
 from fastapi import HTTPException
 from rmf_task_msgs.msg import ApiRequest, ApiResponse
 
+from api_server import dispatch_ledger
 from api_server.logger import logger
 from api_server.ros import ros_node as default_ros_node
 
@@ -61,8 +62,11 @@ class RmfService:
         self._api_sub.destroy()
         self._api_pub.destroy()
 
-    async def call(self, payload: str, timeout: float = 5) -> str:
-        req_id = str(uuid4())
+    async def call(self, payload: str, timeout: float = 5,
+                   request_id: Optional[str] = None) -> str:
+        # F-465: the dispatch path names its request id, so that the
+        # ledger holds it before the request is on the (latched) topic
+        req_id = request_id or str(uuid4())
         msg = ApiRequest(request_id=req_id, json_msg=payload)
         fut = Future()
         self._requests[req_id] = fut
@@ -80,6 +84,12 @@ class RmfService:
         self._logger.info(f"got response '{msg.request_id}'")
         self._logger.debug(msg)
         fut = self._requests.get(msg.request_id)
+        if fut is None or fut.done():
+            # F-465: an answer nobody is waiting for. A dispatcher that
+            # restarted is handed this server's last requests again (the
+            # topic is latched) and answers a dispatch among them with a
+            # NEW task: the ledger decides whether this is one of those.
+            dispatch_ledger.on_unclaimed_response(msg.request_id, msg.json_msg)
         if fut is None:
             self._logger.warning(
                 f"Received response for unknown request id: {msg.request_id}"

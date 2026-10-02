@@ -8,9 +8,17 @@ from fastapi import Body, Depends, HTTPException, Path, Query
 from fastapi.responses import JSONResponse
 from reactivex import operators as rxops
 
-from api_server import cordon, dispatch_horizon, hold_guard
+from api_server import (
+    booking_labels,
+    cordon,
+    dispatch_horizon,
+    dispatch_ledger,
+    hold_guard,
+)
 from api_server import models as mdl
-from api_server import waiting_missions
+from api_server import (
+    waiting_missions,
+)
 from api_server.app_config import app_config
 from api_server.cancel_route import (
     ROUTE_ALREADY_CANCELED,
@@ -579,14 +587,55 @@ async def _dispatch_task_now(request: mdl.DispatchTaskRequest,
                              task_repo: TaskRepository) -> mdl.TaskDispatchResponse:
     await guard_patrol_destination(request.request, task_repo)
     await guard_cordon(request.request)
-    resp = mdl.TaskDispatchResponse.model_validate_json(
-        await tasks_service().call(request.model_dump_json(exclude_none=True))
-    )
+    # F-465: the request id goes into the ledger BEFORE the request goes
+    # onto the latched topic, and is closed with what came of it — an
+    # answer to a closed request id is a replay's, never a mission.
+    request_id = dispatch_ledger.new_request_id()
+    recorded = await _ledger(dispatch_ledger.opened(request_id))
+    try:
+        answer = await tasks_service().call(
+            request.model_dump_json(exclude_none=True),
+            request_id=request_id)
+    except Exception as exc:
+        if recorded:
+            await _ledger(dispatch_ledger.closed(
+                request_id, f"no answer: {getattr(exc, 'detail', exc)}"))
+        raise
+    resp = mdl.TaskDispatchResponse.model_validate_json(answer)
     if resp.root.success:
         task_state = cast(mdl.TaskDispatchResponse1, resp.root).state
+        if recorded:
+            await _ledger(dispatch_ledger.answered(
+                request_id, task_state.booking.id))
+        # F-464: the labels the mission was dispatched with are known
+        # HERE, before anything is stored — remembered for every later
+        # state of this task, and stamped onto the row saved now (the
+        # dispatcher's own first state reached the ledger before this
+        # answer did, and carried none).
+        labels = list(request.request.labels or [])
+        booking_labels.remember(task_state.booking.id, labels)
+        if labels and not task_state.booking.labels:
+            task_state.booking.labels = labels
         await task_repo.save_task_state(task_state)
         await task_repo.save_task_request(task_state.booking.id, request.request)
+        if labels:
+            await task_repo.ensure_task_labels(task_state.booking.id, labels)
+    elif recorded:
+        await _ledger(dispatch_ledger.closed(request_id, "refused"))
     return resp
+
+
+async def _ledger(write) -> bool:
+    """F-465: a ledger write that fails must not fail the dispatch (the
+    mission goes out unguarded against a replay, and the log says so)."""
+    try:
+        await write
+        return True
+    except Exception:  # noqa: BLE001
+        logger.exception("F-465: the dispatch-request ledger could not be "
+                         "written — this dispatch is not guarded against "
+                         "a replay")
+        return False
 
 
 async def _robot_task_now(request: mdl.RobotTaskRequest,

@@ -10,8 +10,17 @@ from typing import Any, Dict, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 
+from api_server import (
+    booking_labels,
+    core_incarnation,
+    dispatch_ledger,
+    live_floor,
+)
 from api_server import models as mdl
-from api_server import core_incarnation, phantom_completion, waiting_missions
+from api_server import (
+    phantom_completion,
+    waiting_missions,
+)
 from api_server.app_config import app_config
 from api_server.dispatch_reason import (
     dispatch_failure_reason,
@@ -274,20 +283,12 @@ redispatcher = Redispatcher(
     held=_redispatch_held)
 
 
-_request_labels: Dict[str, Optional[list]] = {}
-
-
 async def _preserve_booking_labels(task_state: mdl.TaskState) -> None:
-    task_id = task_state.booking.id
+    # F-464: a miss is not cached while the task is new (booking_labels)
     if task_state.booking.labels:
         return
-    if task_id not in _request_labels:
-        if len(_request_labels) > 8192:
-            _request_labels.clear()
-        request = await task_repo.get_task_request(task_id)
-        _request_labels[task_id] = list(request.labels) if request and \
-            request.labels else None
-    labels = _request_labels.get(task_id)
+    labels = await booking_labels.lookup(
+        task_state.booking.id, task_repo.get_task_request)
     if labels:
         task_state.booking.labels = list(labels)
 
@@ -1763,6 +1764,7 @@ async def _close_interrupted_rows(boundary: datetime,
                           "killed", "skipped")
                 for spelling in (s, f"Status.{s}")]
     from tortoise.expressions import Q
+
     from api_server.models.rmf_api.task_state import Cancellation
 
     now_ms = round(time.time() * 1e3)
@@ -1872,6 +1874,16 @@ async def _close_interrupted_rows(boundary: datetime,
     return done
 
 
+def _note_live_fleet(data) -> None:
+    try:
+        name = data.get("name")
+        robots = data.get("robots")
+        if isinstance(name, str) and isinstance(robots, dict):
+            live_floor.FLEETS.on_fleet_state(name, robots)
+    except Exception:  # noqa: BLE001 — never hold up the fleet feed
+        logger.exception("F-458: the live fleet view could not be fed")
+
+
 async def process_msg(msg: Dict[str, Any], fleet_repo: FleetRepository) -> None:
     if "type" not in msg:
         logger.warn(msg)
@@ -1885,6 +1897,10 @@ async def process_msg(msg: Dict[str, Any], fleet_repo: FleetRepository) -> None:
 
     if payload_type == "task_state_update":
         task_state = mdl.TaskState(**msg["data"])
+        # F-465: a task the dispatcher made from a REPLAYED request is not
+        # a mission — it is canceled and its states are not kept
+        if task_state.booking.id in dispatch_ledger.REFUSED:
+            return
         # F-71(2): latch/stamp cancellation provenance BEFORE persisting so
         # stored rows and broadcasts agree (the canceled-vs-completed race
         # on the dead-robot path can wipe RMF's own field)
@@ -1954,6 +1970,10 @@ async def process_msg(msg: Dict[str, Any], fleet_repo: FleetRepository) -> None:
         # cap; a change an operator can see goes to the dashboards at once,
         # and the database, the heartbeat, the alert rules and the reapers
         # keep the 1 s cycle they had when the adapter pushed once a second.
+        # F-458/F-463: who is in the fleet and what each is doing, from
+        # every message — the live word the stale-row reconciliation and
+        # the dispatcher-liveness alarm rule on
+        _note_live_fleet(msg["data"])
         emit, full = fleet_state_cadence.decide(msg["data"], time.monotonic())
         if not emit:
             return
