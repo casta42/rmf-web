@@ -222,6 +222,51 @@ class TestProvenDeadOrLeftAlone(unittest.TestCase):
             _judge("patrol.dispatch-9", "queued", None, (clock, fleets, dispatcher))[0],
         )
 
+    def test_a_row_the_previous_fleet_core_left_is_dead(self):
+        """KNOWN BAD, seen live on f1-n69: after a fleet-core restart the
+        OLD core's queued charge tasks name robots that are all still in
+        the fleet — "may be waiting in its queue" kept all nine, for good
+        (the first janitor cleared them by age). A core starts with
+        nothing: a row not written since the running core started is the
+        old core's."""
+        clock, fleets, dispatcher = _floor()
+        args = (dispatcher.snapshot(), fleets.fleets(), clock.t)
+        verdict, why = judge(
+            "Charge6138bd",
+            "queued",
+            "gentle_fleet",
+            "gentle_bot_2",
+            *args,
+            updated=1_790_969_942.8,
+            core_started=1_790_969_945.0,
+        )
+        self.assertEqual(DEAD, verdict)
+        self.assertIn("orphaned by a fleet-core restart", why)
+        # KNOWN GOOD: the running core's own queued charge task, written
+        # after it started — kept, however long it has been silent
+        verdict, why = judge(
+            "Charge6138bd",
+            "queued",
+            "gentle_fleet",
+            "gentle_bot_2",
+            *args,
+            updated=1_790_969_950.0,
+            core_started=1_790_969_945.0,
+        )
+        self.assertEqual(KEEP, verdict)
+        # and with no boot record (an older core, a server that has not
+        # read it yet) nothing is concluded from the row's age
+        verdict, why = judge(
+            "Charge6138bd",
+            "queued",
+            "gentle_fleet",
+            "gentle_bot_2",
+            *args,
+            updated=1_790_969_942.8,
+            core_started=None,
+        )
+        self.assertEqual(KEEP, verdict)
+
     def test_a_row_nobody_holds_is_dead(self):
         verdict, why = _judge("patrol.dispatch-9", "queued", None, _floor())
         self.assertEqual(DEAD, verdict)
@@ -397,6 +442,56 @@ class TestStaleTaskJanitor(AppFixture):
             # nothing new about the rows it keeps
             with self.assertNoLogs(logger, level="INFO"):
                 self.assertEqual(0, portal.call(sweep))
+        finally:
+            self._cleanup(portal)
+
+    def test_the_old_cores_rows_are_closed_and_the_running_cores_are_kept(self):
+        """Through the database: two queued charge rows on a robot that is
+        in the fleet, both silent. One was last written before the running
+        fleet core started, one ten minutes ago."""
+        import time as _time
+        from datetime import datetime, timedelta, timezone
+
+        from api_server import core_incarnation
+
+        portal = self.get_portal()
+        logger = logging.getLogger("test-janitor")
+        clock, fleets, dispatcher = _floor()
+        self._prepare(
+            portal,
+            [
+                ("f458-ghost-charge", "queued", "gentle_bot_1"),
+                ("f458-waiting-61min", "queued", "gentle_bot_1"),
+            ],
+        )
+        ten_minutes_ago = (datetime.now(timezone.utc) - timedelta(minutes=10)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+
+        async def touch():
+            await Tortoise.get_connection("default").execute_query(
+                f"UPDATE taskstate SET updated_at = '{ten_minutes_ago}' "
+                "WHERE id = 'f458-waiting-61min'"
+            )
+
+        portal.call(touch)
+        core = core_incarnation.BootRecord("boot-now", _time.time() - 3600)
+
+        async def sweep():
+            return await fail_over_stale_tasks(1800, logger, dispatcher, fleets, core)
+
+        async def status(task_id):
+            return (await DbTaskState.get(id_=task_id)).data["status"]
+
+        try:
+            stale_tasks._said.clear()
+            with self.assertLogs(logger, level="INFO") as logs:
+                self.assertEqual(1, portal.call(sweep))
+            self.assertEqual("failed", portal.call(lambda: status("f458-ghost-charge")))
+            self.assertEqual(
+                "queued", portal.call(lambda: status("f458-waiting-61min"))
+            )
+            self.assertIn("orphaned by a fleet-core restart", "\n".join(logs.output))
         finally:
             self._cleanup(portal)
 

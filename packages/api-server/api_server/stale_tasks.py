@@ -19,6 +19,11 @@ Age now only nominates: a non-terminal row not updated for NOMINATE_S
 (five minutes) is looked at. It is closed only on one of these
 proofs, each read from the fleet core's own live word (live_floor.py):
 
+  orphaned        the row was last written before the RUNNING fleet core
+                  started (its boot record, F-454): a core starts with
+                  nothing, so the row is the old core's — its queued and
+                  running charge tasks, which the restart sweep leaves
+                  to this janitor;
   robot gone      the row is assigned to a robot the fleet has not listed
                   for ABSENT_FOR_S, while the fleet itself is being heard
                   (the ghost charge rows of robots that left the fleet);
@@ -46,7 +51,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Tuple
 
-from . import live_floor
+from . import core_incarnation, live_floor
 from .models import TaskStatus
 from .models.tortoise_models import TaskState as DbTaskState
 
@@ -102,9 +107,24 @@ def judge(
     dispatcher: live_floor.DispatcherSnapshot,
     fleets: Dict[str, live_floor.FleetSeen],
     now: float,
+    updated: Optional[float] = None,
+    core_started: Optional[float] = None,
 ) -> Tuple[str, str]:
     """(KEEP | DEAD | SKIP, why) for one nominated row, from the live
-    views alone. Pure."""
+    views alone. Pure. `updated` is when the row was last written and
+    `core_started` when the running fleet core started (both unix s)."""
+    if core_started is not None and updated is not None and updated < core_started:
+        # the fleet core starts with nothing: no queue, no task of the core
+        # before it. A row nobody has written since this core started is
+        # the old core's, whatever robot it names.
+        return DEAD, (
+            "orphaned by a fleet-core restart: last written before the "
+            "running core started ("
+            + datetime.fromtimestamp(core_started, timezone.utc).strftime(
+                "%H:%M:%S UTC"
+            )
+            + ")"
+        )
     if robot:
         candidates = (
             [fleets[fleet]]
@@ -193,6 +213,7 @@ async def fail_over_stale_tasks(
     logger: logging.Logger,
     dispatcher: Optional[live_floor.DispatcherView] = None,
     fleets: Optional[live_floor.FleetView] = None,
+    core: Optional[core_incarnation.BootRecord] = None,
 ) -> int:
     """Close the nominated rows that are PROVEN dead; returns how many."""
     if timeout_seconds <= 0:
@@ -211,6 +232,8 @@ async def fail_over_stale_tasks(
     snapshot = dispatcher.snapshot()
     seen = fleets.fleets()
     now = fleets.now()
+    boot = core_incarnation.STATE.latest() if core is None else core
+    core_started = boot.started_unix if boot is not None else None
     closed = 0
     current = set()
     for row in stale:
@@ -220,7 +243,17 @@ async def fail_over_stale_tasks(
         fleet, robot = _assignment(data)
         robot = robot or (row.assigned_to or None)
         status = _raw_status(row.status)
-        verdict, why = judge(row.id_, status, fleet, robot, snapshot, seen, now)
+        verdict, why = judge(
+            row.id_,
+            status,
+            fleet,
+            robot,
+            snapshot,
+            seen,
+            now,
+            row.updated_at.timestamp() if row.updated_at else None,
+            core_started,
+        )
         current.add(row.id_)
         if verdict != DEAD:
             if _said.get(row.id_) != f"{verdict}: {why}":
