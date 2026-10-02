@@ -42,8 +42,13 @@ FAILED_TO_ASSIGN = 4
 CANCELED_IN_FLIGHT = 5
 
 
+# a source not heard for this long has stopped being heard: what is
+# missing from its next message has been missing only since then
+GAP_S = 15.0
+
+
 class DispatcherSnapshot(NamedTuple):
-    first_heard: Optional[float]  # first dispatch_states of this life
+    first_heard: Optional[float]  # start of the current unbroken hearing
     last_heard: Optional[float]  # newest dispatch_states
     active: Dict[str, int]  # task id -> status, newest message
     finished: Dict[str, int]
@@ -76,7 +81,9 @@ class DispatcherView:
         finished = {str(tid): int(status) for tid, status in finished}
         with self._lock:
             now = self._clock()
-            if self._first is None:
+            if self._first is None or now - (self._last or now) > GAP_S:
+                # first word, or first word after a silence (a restarted
+                # fleet core): "heard for N seconds" starts again
                 self._first = now
             self._last = now
             # a task queued in the last message and not queued in this one
@@ -124,7 +131,7 @@ class RobotSeen(NamedTuple):
 
 
 class FleetSeen(NamedTuple):
-    first_heard: float
+    first_heard: float  # start of the current unbroken hearing
     last_heard: float
     robots: Dict[str, RobotSeen]
 
@@ -154,8 +161,9 @@ class FleetView:
                     before.task_since if before and before.task_id == task_id else now
                 )
                 known[name] = RobotSeen(now, task_id, status, since)
+            unbroken = seen is not None and now - seen.last_heard <= GAP_S
             self._fleets[fleet] = FleetSeen(
-                seen.first_heard if seen else now, now, known
+                seen.first_heard if unbroken else now, now, known
             )
 
     def fleet(self, name: str) -> Optional[FleetSeen]:

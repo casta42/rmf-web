@@ -57,19 +57,17 @@ def _floor(
         if robots is None
         else robots
     )
-    if fleet_heard:
-        fleets.on_fleet_state("gentle_fleet", robots)
-    if dispatcher_heard:
-        dispatcher.on_dispatch_states(
-            list((active or {}).items()), list((finished or {}).items())
-        )
-    clock.t += heard_for
-    if fleet_heard:
-        fleets.on_fleet_state("gentle_fleet", robots)
-    if dispatcher_heard:
-        dispatcher.on_dispatch_states(
-            list((active or {}).items()), list((finished or {}).items())
-        )
+    # heard WITHOUT A BREAK for `heard_for`: a message every ten seconds
+    steps = max(1, int(heard_for // 10))
+    for step in range(steps + 1):
+        if step:
+            clock.t += heard_for / steps
+        if fleet_heard:
+            fleets.on_fleet_state("gentle_fleet", robots)
+        if dispatcher_heard:
+            dispatcher.on_dispatch_states(
+                list((active or {}).items()), list((finished or {}).items())
+            )
     return clock, fleets, dispatcher
 
 
@@ -123,11 +121,12 @@ class TestProvenDeadOrLeftAlone(unittest.TestCase):
             "gentle_fleet",
             {"gentle_bot_1": {"task_id": "patrol.dispatch-2", "status": "working"}},
         )
-        clock.t += 30
-        fleets.on_fleet_state(
-            "gentle_fleet",
-            {"gentle_bot_1": {"task_id": "patrol.dispatch-2", "status": "working"}},
-        )
+        for _ in range(3):  # 30 s on the new task
+            clock.t += 10
+            fleets.on_fleet_state(
+                "gentle_fleet",
+                {"gentle_bot_1": {"task_id": "patrol.dispatch-2", "status": "working"}},
+            )
         self.assertEqual(
             KEEP,
             _judge(
@@ -153,8 +152,8 @@ class TestProvenDeadOrLeftAlone(unittest.TestCase):
             }
         )
         left = {"gentle_bot_1": {"task_id": "", "status": "idle"}}
-        for _ in range(4):
-            clock.t += 20
+        for _ in range(8):
+            clock.t += 10
             fleets.on_fleet_state("gentle_fleet", left)
         self.assertEqual(
             KEEP,
@@ -166,14 +165,62 @@ class TestProvenDeadOrLeftAlone(unittest.TestCase):
             )[0],
             "80 s: not yet proof that it left",
         )
-        for _ in range(3):
-            clock.t += 20
+        for _ in range(6):
+            clock.t += 10
             fleets.on_fleet_state("gentle_fleet", left)
         verdict, why = _judge(
             "ChargeBattery-7", "underway", "gentle_bot_7", (clock, fleets, dispatcher)
         )
         self.assertEqual(DEAD, verdict)
         self.assertIn("has not listed [gentle_bot_7] for 140 s", why)
+
+    def test_a_robot_not_yet_back_after_a_core_restart_is_not_gone(self):
+        """Absence counts only while the fleet is being heard. The fleet
+        core restarts: silence, then the fleet again with its robots
+        joining one by one. A robot not listed yet has been missing since
+        the fleet came BACK, not since before it went."""
+        clock, fleets, dispatcher = _floor(
+            robots={
+                "gentle_bot_1": {"task_id": "", "status": "idle"},
+                "gentle_bot_7": {"task_id": "ChargeBattery-7", "status": "charging"},
+            }
+        )
+        clock.t += 200  # the core is away: nothing is heard
+        back = {"gentle_bot_1": {"task_id": "", "status": "idle"}}
+        for _ in range(10):  # heard again, 100 s, gentle_bot_7 not listed yet
+            clock.t += 10
+            fleets.on_fleet_state("gentle_fleet", back)
+        verdict, why = _judge(
+            "ChargeBattery-7", "underway", "gentle_bot_7", (clock, fleets, dispatcher)
+        )
+        self.assertEqual(SKIP, verdict, why)
+        self.assertIn("robots may still be joining", why)
+        for _ in range(3):  # 130 s of being heard, and it never came
+            clock.t += 10
+            fleets.on_fleet_state("gentle_fleet", back)
+        verdict, why = _judge(
+            "ChargeBattery-7", "underway", "gentle_bot_7", (clock, fleets, dispatcher)
+        )
+        self.assertEqual(DEAD, verdict, why)
+
+    def test_a_dispatcher_just_back_from_a_restart_is_not_yet_proof(self):
+        clock, fleets, dispatcher = _floor()
+        clock.t += 200  # the core is away
+        for _ in range(10):
+            clock.t += 10
+            dispatcher.on_dispatch_states([], [])
+            fleets.on_fleet_state("gentle_fleet", {})
+        self.assertEqual(
+            SKIP,
+            _judge("patrol.dispatch-9", "queued", None, (clock, fleets, dispatcher))[0],
+        )
+        for _ in range(3):
+            clock.t += 10
+            dispatcher.on_dispatch_states([], [])
+        self.assertEqual(
+            DEAD,
+            _judge("patrol.dispatch-9", "queued", None, (clock, fleets, dispatcher))[0],
+        )
 
     def test_a_row_nobody_holds_is_dead(self):
         verdict, why = _judge("patrol.dispatch-9", "queued", None, _floor())

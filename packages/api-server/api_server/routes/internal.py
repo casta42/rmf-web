@@ -1958,6 +1958,8 @@ async def process_msg(msg: Dict[str, Any], fleet_repo: FleetRepository) -> None:
 
     elif payload_type == "task_log_update":
         task_log = mdl.TaskEventLog(**msg["data"])
+        if task_log.task_id in dispatch_ledger.REFUSED:
+            return  # F-465: a replay's task is not a mission; nor is its log
         await task_repo.save_task_log(task_log)
         task_events.task_event_logs.on_next(task_log)
 

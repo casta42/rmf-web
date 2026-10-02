@@ -234,6 +234,54 @@ class TestDispatchReplay(AppFixture):
         self.assertIsNotNone(self._row(task_id))
         self.assertIn("not guarded against a replay", logs.output[0])
 
+    def test_the_ledger_never_forgets_what_may_still_be_latched(self):
+        """The latched topic replays by COUNT (its last ten requests, for
+        as long as the server lives), so pruning by age alone would forget
+        a week-old dispatch a quiet site can still be handed again."""
+        from tortoise import Tortoise
+
+        ids = [f"old-{uuid4().hex[:8]}" for _ in range(5)]
+
+        async def prepare():
+            await ttm.DispatchRequest.all().delete()
+            for i, request_id in enumerate(ids):
+                await ttm.DispatchRequest.create(
+                    request_id=request_id,
+                    outcome=dispatch_ledger.ANSWERED,
+                    task_id=f"patrol.dispatch-{i}",
+                )
+                await Tortoise.get_connection("default").execute_query(
+                    "UPDATE dispatchrequest SET sent_at = "
+                    f"'2026-01-0{i + 1} 00:00:00' WHERE request_id = "
+                    f"'{request_id}'"
+                )
+
+        async def left():
+            return sorted([r.request_id for r in await ttm.DispatchRequest.all()])
+
+        portal = self.get_portal()
+        portal.call(prepare)
+        # all five are months old; the three newest are kept whatever their age
+        self.assertEqual(2, portal.call(dispatch_ledger.prune, 3600.0, 3))
+        self.assertEqual(sorted(ids[2:]), portal.call(left))
+        self.assertEqual(0, portal.call(dispatch_ledger.prune, 3600.0, 3))
+        self.assertEqual(3, portal.call(dispatch_ledger.prune, 3600.0, 0))
+
+    def test_the_log_of_a_refused_replay_is_not_kept_either(self):
+        phantom = f"patrol.dispatch-{uuid4().hex[:8]}"
+        dispatch_ledger.REFUSED.add(phantom, "req")
+        try:
+            self._ingest(
+                {"type": "task_log_update", "data": {"task_id": phantom, "log": []}}
+            )
+
+            async def logs():
+                return await ttm.TaskEventLog.filter(task_id=phantom).count()
+
+            self.assertEqual(0, self.get_portal().call(logs))
+        finally:
+            dispatch_ledger.REFUSED.discard(phantom)
+
     # ------------------------------------------------------------- F-464
     def test_a_row_made_before_its_request_is_stored_still_gets_its_labels(self):
         task_id = f"patrol.dispatch-{uuid4().hex[:8]}"

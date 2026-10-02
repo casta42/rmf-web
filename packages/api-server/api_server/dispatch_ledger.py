@@ -56,6 +56,10 @@ REPLAY = "replay"
 # how long the ledger keeps a request: far longer than a latched topic can
 # replay one (its last ten requests, within one life of this server)
 KEEP_S = 7 * 24 * 3600.0
+# ... and how many of the newest it keeps WHATEVER their age: the latched
+# topic replays by count, not by age (its last ten requests, for as long as
+# this server lives) — on a quiet site a week-old dispatch is still there.
+KEEP_NEWEST = 200
 CANCEL_TRIES = 4
 PENDING_RECHECK_S = 1.0
 CANCEL_RETRY_S = 0.5
@@ -152,12 +156,23 @@ async def closed(request_id: str, why: str) -> None:
     )
 
 
-async def prune(keep_s: float = KEEP_S) -> int:
+async def prune(keep_s: float = KEEP_S, keep_newest: int = KEEP_NEWEST) -> int:
     # pylint: disable=import-outside-toplevel
     from api_server.models.tortoise_models import DispatchRequest
 
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=keep_s)
-    return await DispatchRequest.filter(sent_at__lt=cutoff).delete()
+    newest = (
+        await DispatchRequest.all()
+        .order_by("-sent_at")
+        .limit(keep_newest)
+        .values_list("request_id", flat=True)
+        if keep_newest > 0
+        else []
+    )
+    old = DispatchRequest.filter(sent_at__lt=cutoff)
+    if newest:
+        old = old.exclude(request_id__in=list(newest))
+    return await old.delete()
 
 
 async def _row(request_id: str) -> Tuple[Optional[str], Optional[str]]:
@@ -237,10 +252,6 @@ async def handle_unclaimed(
         )
         return "replay-not-canceled"
     removed = await remove_row(task_id)
-    # its first state may have been on its way into the ledger when the
-    # id was refused: look once more, after any such write has landed
-    await sleep(CANCEL_RETRY_S)
-    removed += await remove_row(task_id)
     await note(request_id, task_id)
     logger.warning(
         "F-465: the dispatcher made task [%s] from a REPLAYED request [%s] "
@@ -252,6 +263,15 @@ async def handle_unclaimed(
         how,
         "its row removed" if removed else "no row had been written",
     )
+    # its first state may have been on its way into the ledger when the id
+    # was refused: look once more, after any such write has landed
+    await sleep(CANCEL_RETRY_S)
+    if await remove_row(task_id):
+        logger.warning(
+            "F-465: a state of the replay's task [%s] was written while it "
+            "was being refused — removed",
+            task_id,
+        )
     return REPLAY
 
 
@@ -331,6 +351,18 @@ async def _remove_row(task_id: str) -> int:
     return await ttm.TaskState.filter(id_=task_id).delete()
 
 
+_judging: set = set()
+
+
+async def _judge(request_id: str, json_msg: str) -> None:
+    try:
+        await handle_unclaimed(request_id, json_msg, _cancel_anywhere, _remove_row)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # pylint: disable=broad-except
+        logger.exception("F-465: judging an unclaimed dispatch answer failed")
+
+
 async def guard_loop() -> None:
     """Started with the app: every unclaimed dispatch answer is judged
     against the ledger; once an hour old rows are pruned."""
@@ -345,9 +377,12 @@ async def guard_loop() -> None:
             except asyncio.TimeoutError:
                 request_id = None
             if request_id is not None:
-                await handle_unclaimed(
-                    request_id, json_msg, _cancel_anywhere, _remove_row
-                )
+                # each answer on its own: a replay's cancel must not wait
+                # behind another replay's retries (a fleet that is up
+                # answers an auction within a fraction of a second)
+                task = asyncio.create_task(_judge(request_id, json_msg))
+                _judging.add(task)
+                task.add_done_callback(_judging.discard)
             now = asyncio.get_running_loop().time()
             if now - last_prune > 3600:
                 last_prune = now
