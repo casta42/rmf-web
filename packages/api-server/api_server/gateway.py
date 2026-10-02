@@ -360,7 +360,7 @@ class RmfGateway:
             ),
             event_callbacks=SubscriptionEventCallbacks(
                 liveliness=lambda event: schedule_liveness.STATE.on_liveliness(
-                    event.alive_count
+                    event.alive_count, event.alive_count_change
                 )
             ),
         )
