@@ -20,11 +20,15 @@ an operator's cancel and a finished chain are left alone, nothing older
 than the window is touched, and an empty ledger does nothing.
 """
 
+import asyncio
 import json
+import threading
 import time
 from contextlib import contextmanager
 from unittest.mock import patch
 from uuid import uuid4
+
+from fastapi import HTTPException
 
 from api_server import models as mdl
 from api_server import redispatch, waiting_missions
@@ -33,6 +37,7 @@ from api_server.redispatch import (
     CLASS_LABEL,
     ORIGIN_LABEL,
     REDISPATCH_LABEL,
+    REFUSED_LABEL,
     ROOT_LABEL,
     origin_of,
     root_of,
@@ -180,24 +185,59 @@ class WaitingMissionsRouteTest(AppFixture):
         self.ingest(task_msg(child, "underway", assigned="gentle_bot_2"))
         self.assertEqual(self.waiting_for(root), [])
 
-    def test_FIRES_a_hand_back_that_cannot_go_back_is_not_shown_waiting(self):
-        """The fleet refuses the re-dispatch: nothing will put the mission
-        back on the floor, so it must not sit in the list as waiting."""
+    def test_FIRES_a_refused_re_dispatch_keeps_the_mission_waiting(self):
+        """F-441 (G close-out ruling 2026-10-01, D-86 (4)): the dispatcher
+        refuses the re-dispatch, then does not answer. The mission is NOT
+        dropped: it stays on the waiting list with the refusal as its
+        reason, its row says so, and it is sent again until it is placed.
+        (Before F-441 it left the list and its row was LOST.)"""
         root = self.dispatch()
+        child = self.new_id()
         refusal = (
             '{ "success": false, "errors": [ { "code": 1, "category": "x", '
             '"detail": "dispatcher shutting down" } ] }'
         )
-        with short_waits(), patch.object(tasks_service(), "call") as mock:
-            mock.return_value = refusal
+        release = threading.Event()
+        answers = [refusal, HTTPException(500, "rmf service timed out")]
+
+        async def dispatcher(*_args, **_kwargs):
+            if answers:
+                answer = answers.pop(0)
+                if isinstance(answer, Exception):
+                    raise answer
+                return answer
+            while not release.is_set():
+                await asyncio.sleep(0.02)
+            return ok_reply(child)
+
+        with short_waits(0.1), patch.object(tasks_service(), "call") as mock:
+            mock.side_effect = dispatcher
             self.ingest(hand_back_msg(root))
-            self.assertEqual(len(self.waiting_for(root)), 1)
-            self.assertTrue(self.wait_for(lambda: mock.called))
-            self.assertTrue(self.wait_for(lambda: not self.waiting_for(root)))
-        # the ledger keeps the marked cancel: a LOST mission, as counted
-        stored = self.client.get(f"/tasks/{root}/state").json()
-        self.assertEqual(stored["status"], "canceled")
-        self.assertEqual(stored["cancellation"]["labels"][0], REDISPATCH_LABEL)
+            self.assertTrue(self.wait_for(lambda: mock.call_count >= 3))
+            (row,) = self.waiting_for(root)
+            self.assertEqual(row["task_id"], root, "still waiting on the refused attempt")
+            self.assertEqual(
+                row["reason"],
+                "its re-dispatch was refused — rmf service timed out — it is "
+                "sent again within a minute",
+            )
+            stored = self.client.get(f"/tasks/{root}/state").json()
+            self.assertEqual(stored["status"], "canceled")
+            self.assertEqual(
+                stored["cancellation"]["labels"],
+                [REDISPATCH_LABEL, HOLD, f"{REFUSED_LABEL}rmf service timed out"],
+                "the row says why the mission still waits — one refusal, the latest",
+            )
+            self.assertIsNone(self.alert(root), "a refusal is not a failure")
+            release.set()
+            self.assertTrue(
+                self.wait_for(
+                    lambda: getattr(internal.waiting.get(root), "task_id", None)
+                    == child
+                )
+            )
+        sent = self.client.get(f"/tasks/{child}/request").json()
+        self.assertEqual(origin_of(sent["labels"]), root)
 
     # -- the one alert ---------------------------------------------------------
 

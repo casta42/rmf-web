@@ -211,19 +211,57 @@ class NoBidReauctionRouteTest(AppFixture):
         self.assertEqual(alert["severity"], "critical")
         self.assertIn(f"Task {task_id} failed: no robot answered", alert["message"])
         self.assertIn("its request is not stored", alert["message"])
-        # (2) the fleet refuses the re-auction
+        # (2) F-441: the dispatcher refuses the stored request itself — the
+        # one refusal that means nothing can ever be re-sent
         task_id = self.dispatch()
         _, mock = self.ingest(
             closed_auction(task_id),
-            reply='{ "success": false, "errors": [ { "code": 1, '
-            '"category": "x", "detail": "dispatcher shutting down" } ] }',
+            reply='{ "success": false, "errors": [ { "code": 5, '
+            '"category": "Invalid request format", "detail": "bad schema" } ] }',
         )
-        self.assertEqual(mock.call_count, 1)
+        self.assertEqual(mock.call_count, 1, "a permanent refusal is not retried")
         row, alert = self.state(task_id), self.alert(task_id)
         self.assertEqual(row["status"], "failed")
         self.assertIsNone(row.get("cancellation"))
         self.assertEqual(alert["severity"], "critical")
-        self.assertIn("could not be auctioned again", alert["message"])
+        self.assertIn(
+            "could not be auctioned again: the dispatcher refuses its stored "
+            "request as invalid: bad schema",
+            alert["message"],
+        )
+
+    def test_FIRES_a_refused_re_auction_waits_and_is_auctioned_again(self):
+        """F-441 (D-86 (4)): any other refusal — here the dispatcher shutting
+        down — keeps the mission waiting, and it is auctioned again."""
+        task_id = self.dispatch()
+        child = self.new_id()
+        refusal = (
+            '{ "success": false, "errors": [ { "code": 1, '
+            '"category": "x", "detail": "dispatcher shutting down" } ] }'
+        )
+        with patch.object(redispatch, "NO_BID_BACKOFF_S", FAST), patch.object(
+            redispatch, "HAND_BACK_BACKOFF_STEP_S", 0.05
+        ), patch.object(redispatch, "HAND_BACK_MAX_BACKOFF_S", 0.05), patch.object(
+            tasks_service(), "call"
+        ) as mock:
+            mock.side_effect = [refusal, refusal, ok_reply(child)]
+            self.get_portal().call(internal.process_msg, closed_auction(task_id), None)
+            deadline = time.time() + 5.0
+            while time.time() < deadline and internal.waiting.find_task(child) is None:
+                time.sleep(0.05)
+        self.assertEqual(mock.call_count, 3)
+        self.assertIsNotNone(internal.waiting.find_task(child), "placed at last")
+        row = self.state(task_id)
+        self.assertEqual(row["status"], "canceled", "never failed")
+        self.assertIn(
+            f"{redispatch.REFUSED_LABEL}the dispatcher refused it: dispatcher "
+            "shutting down",
+            row["cancellation"]["labels"],
+        )
+        self.assertIsNone(self.alert(task_id))
+        sent = self.client.get(f"/tasks/{child}/request").json()
+        self.assertEqual(origin_of(sent["labels"]), task_id)
+        self.assertEqual(class_of(sent["labels"]), CLASS_NO_BID)
 
     # -- known good: must stay as it was -------------------------------------
 
@@ -270,8 +308,19 @@ class NoBidReauctionRouteTest(AppFixture):
             f"[{task_id}] due to insufficient battery capacity to accommodate "
             "one or more requests by any of the robots in this fleet.",
         }
+        # F-442: the fleet named every robot it considered
+        named = {
+            "code": 9,
+            "category": "Robot judgements",
+            "detail": '{"fleet":"gentle_fleet","robots":['
+            '{"judgement":"limited_capacity","name":"gentle_bot_1"},'
+            '{"judgement":"limited_capacity","name":"gentle_bot_2"}],'
+            f'"task_id":"{task_id}"}}',
+        }
         (row, alert), mock = self.ingest(
-            closed_auction(task_id, labels=labels, errors=[limited, no_bid_error(task_id)]),
+            closed_auction(
+                task_id, labels=labels, errors=[limited, named, no_bid_error(task_id)]
+            ),
             expect_dispatch=False,
         )
         mock.assert_not_called()
@@ -283,7 +332,9 @@ class NoBidReauctionRouteTest(AppFixture):
             rf"^Task {task_id} failed: no robot offered to take this mission at 5 "
             r"auctions in a row over 6\d s — no robot can finish this mission on "
             r"one battery charge, even starting full — shorten it \(fewer rounds "
-            r"or stops\) or split it into smaller missions$",
+            r"or stops\) or split it into smaller missions\. Every robot judged: "
+            r"gentle_bot_1, gentle_bot_2 \(cannot finish it on one battery charge, "
+            r"even starting full from its charger\)$",
         )
         self.assertEqual(internal.redispatcher.no_bid_exhausted, before + 1)
 

@@ -13,13 +13,21 @@ from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisco
 from api_server import models as mdl
 from api_server import phantom_completion, waiting_missions
 from api_server.app_config import app_config
-from api_server.dispatch_reason import dispatch_failure_reason, no_bid_failure_reason
+from api_server.dispatch_reason import (
+    dispatch_failure_reason,
+    no_bid_failure_reason,
+    no_bid_judged_failure_reason,
+)
 from api_server.fleet_state_cadence import FleetStateCadence
 from api_server.internal_tasks import pages_operator
 from api_server.interrupted_tasks import (
+    ACTIVE_STATUSES,
     INTERRUPTED_LABEL,
+    INTERRUPTED_REASON,
     RunBoundary,
+    current_tasks_by_robot,
     is_interrupted_row,
+    queued_verdict,
     tasks_named_by,
 )
 from api_server.logger import logger as base_logger
@@ -28,7 +36,11 @@ from api_server.models.rmf_api.robot_state import Status as RobotStatus
 from api_server.redispatch import (
     CLASS_NO_BID,
     REASON_LABEL,
+    REDISPATCH_LABEL,
+    REFUSED_LABEL,
+    Held,
     Redispatcher,
+    Refusal,
     class_of,
     no_bid_since_of,
     no_bid_verdict_of,
@@ -36,6 +48,7 @@ from api_server.redispatch import (
     root_of,
     status_tail,
     supersede,
+    unmark_hand_back,
     unsupersede,
     wants_redispatch,
 )
@@ -63,20 +76,93 @@ alert_repo = AlertRepository(user, task_repo)
 fleet_state_cadence = FleetStateCadence()
 
 
+class _AcceptanceWatch:
+    """F-441: the task repository as the dispatch path sees it, noting the
+    moment the dispatcher ACCEPTED the request — `_dispatch_task_now`
+    saves the state only after a success. An error after that moment
+    (the save itself) is not a refusal: the mission is already with the
+    dispatcher, and sending it again would make a duplicate."""
+
+    def __init__(self, repo: TaskRepository):
+        self._repo = repo
+        self.accepted: Optional[str] = None
+
+    def __getattr__(self, name):
+        return getattr(self._repo, name)
+
+    async def save_task_state(self, task_state: mdl.TaskState) -> None:
+        self.accepted = task_state.booking.id
+        await self._repo.save_task_state(task_state)
+
+
+def _body_of(resp) -> dict:
+    try:
+        body = json.loads(bytes(getattr(resp, "body", b"") or b"{}"))
+    except (TypeError, ValueError):
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
+# the dispatcher's one refusal at submission (rmf_task_ros2 Dispatcher.cpp:
+# the request fails the dispatch_task_request schema)
+_INVALID_REQUEST_CODE = 5
+
+
+def _dispatcher_refusal(body: dict) -> Refusal:
+    """F-441: the dispatcher answered success=false. Its only such answer
+    is a request that fails its schema — deterministic, so the stored
+    request can never be sent again (permanent). Any other shape is read
+    as the site as it is now."""
+    errors = body.get("errors") if isinstance(body.get("errors"), list) else []
+    details = "; ".join(
+        str(e.get("detail") or e.get("category") or e)
+        for e in errors if isinstance(e, dict)) or "no reason given"
+    if any(isinstance(e, dict) and e.get("code") == _INVALID_REQUEST_CODE
+           for e in errors):
+        return Refusal(
+            f"the dispatcher refuses its stored request as invalid: {details}",
+            permanent=True)
+    return Refusal(f"the dispatcher refused it: {details}")
+
+
 async def _redispatch_request(request: mdl.TaskRequest) -> str:
     """FR-12 governor: put a returned mission back on the floor through
     the operator's own dispatch path (F-34 guard, request stored,
-    state saved). Imported lazily: routes.tasks imports this package."""
+    state saved). Imported lazily: routes.tasks imports this package.
+
+    F-441: every outcome is named for the Redispatcher. A guard's or the
+    horizon's HTTP refusal (409, 422) and the dispatcher not answering
+    (500 "rmf service timed out") are Refusals of the moment; the
+    dispatcher's success=false is _dispatcher_refusal; a mission the
+    horizon holds for its start is Held, never a refusal. An error after
+    the dispatcher accepted returns the new id: the mission is out."""
     from api_server.routes.tasks.tasks import post_dispatch_task
 
-    resp = await post_dispatch_task(
-        mdl.DispatchTaskRequest(type="dispatch_task_request", request=request),
-        task_repo,
-    )
-    if not isinstance(resp, mdl.TaskDispatchResponse):
-        raise RuntimeError(
-            f"dispatch refused: {getattr(resp, 'body', b'')[:200]!r}")
-    return resp.root.state.booking.id  # type: ignore[union-attr]
+    watch = _AcceptanceWatch(task_repo)
+    try:
+        resp = await post_dispatch_task(
+            mdl.DispatchTaskRequest(type="dispatch_task_request",
+                                    request=request),
+            watch,  # type: ignore[arg-type]
+        )
+    except HTTPException as exc:
+        raise Refusal(str(exc.detail)) from exc
+    except Exception:
+        if watch.accepted is None:
+            raise
+        logger.exception(
+            "F-441: the dispatcher accepted the re-dispatch as [%s], and it "
+            "could not be recorded — not sent again", watch.accepted)
+        return watch.accepted
+    if isinstance(resp, mdl.TaskDispatchResponse):
+        return resp.root.state.booking.id  # type: ignore[union-attr]
+    body = _body_of(resp)
+    if getattr(resp, "status_code", None) == 202 and body.get("deferred"):
+        deferred = body["deferred"] if isinstance(body["deferred"], dict) \
+            else {}
+        raise Held(deferred.get("id"),
+                   str(body.get("detail") or "held for its start (F-293)"))
+    raise _dispatcher_refusal(body)
 
 
 async def _load_request(task_id: str):
@@ -98,16 +184,17 @@ async def _first_recorded_s(task_id: str) -> Optional[float]:
 
 
 async def _fail_abandoned_reauction(task_id: str, reason: str) -> None:
-    """G ruling 2026-10-01 item 6 (F-410/F-412 class): an attempt that got
-    no bid was recorded as put back on the floor ("auctioned again in
-    N s"), and the re-auction could not be made — the request is not
-    stored, or the dispatch was refused. That mission is not waiting for
-    anything: it failed, and it must not sit in the ledger as a tidy
-    cancel with no successor. The row is amended back to `failed` and the
-    operator is paged with the reason; its broadcast takes the chain out
-    of the waiting registry (F-435)."""
+    """G ruling 2026-10-01 item 6 (F-410/F-412 class), narrowed by F-441
+    (D-86 (4)): an attempt was recorded as put back on the floor — a
+    no-bid ("auctioned again in N s") or a hand-back — and NOTHING can
+    ever be re-sent: the request is not stored, or the dispatcher refuses
+    the stored request itself. (Every other refusal keeps the mission
+    waiting.) That mission is not waiting for anything: it failed, and it
+    must not sit in the ledger as a tidy cancel with no successor. The row
+    is amended to `failed` and the operator is paged with the reason; its
+    broadcast takes the chain out of the waiting registry (F-435)."""
     state = await task_repo.get_task_state(task_id)
-    if state is None or not unsupersede(state):
+    if state is None or not (unsupersede(state) or unmark_hand_back(state)):
         return
     await task_repo.save_task_state(state)
     task_events.task_states.on_next(state)
@@ -127,27 +214,62 @@ async def _fail_abandoned_reauction(task_id: str, reason: str) -> None:
 # F-435 (G ruling 2026-10-01, ruling 2): the missions waiting for a robot
 waiting = waiting_missions.registry
 
-async def _hand_back_lost(task_id: str, reason: str) -> None:
-    """F-435: a hand-back whose re-dispatch could not be made (its request
-    is not stored, or the dispatch was refused) is no longer waiting for a
-    robot — nothing will put it back on the floor until a restart resumes
-    it. Its chain leaves the waiting list and its alert, if raised, is
-    closed; the row stays the marked cancel it is, which the tooling counts
-    as a LOST mission."""
+async def _redispatch_refused(task_id: str, why: str, retry_in_s: float) -> None:
+    """F-441 (G close-out ruling 2026-10-01, D-86 (4)): "a refused
+    re-dispatch never drops a mission; it returns to the waiting queue
+    under F-435." The Redispatcher sends it again after `retry_in_s`; here
+    the mission is shown waiting with the refusal as its reason — in the
+    registry (GET /tasks/waiting, the one alert) and on the attempt's row
+    (REFUSED_LABEL, re-stamped each time, so the ledger says why it still
+    waits and a restart resumes it with that reason)."""
+    reason = waiting_missions.refused_reason(why)
+    state = await task_repo.get_task_state(task_id)
+    marked = state is not None and state.cancellation is not None and \
+        wants_redispatch(state.status, state.cancellation.labels) is not None
+    entry = waiting.find_task(task_id)
+    if entry is None and marked:
+        root_id = root_of(state.booking.labels) or task_id
+        entry = waiting.get(root_id)
+        if entry is None:
+            # the registry never saw this attempt put back (it is rebuilt
+            # at start): a mission whose re-dispatch is being retried IS
+            # waiting, so it is listed
+            entry = waiting.adopt(waiting_missions.WaitingMission(
+                root_id=root_id, task_id=task_id, since_unix=time.time(),
+                reason=reason))
+            asyncio.get_running_loop().create_task(_enrich_waiting(entry))
+    if entry is not None and entry.task_id == task_id:
+        entry.reason = reason
+    logger.warning("F-441: [%s] is still waiting for a robot — %s; sent "
+                   "again in %.0f s", task_id, reason, retry_in_s)
+    if not marked:
+        return
+    state.cancellation.labels = [
+        lab for lab in state.cancellation.labels
+        if not lab.startswith(REFUSED_LABEL)] + [f"{REFUSED_LABEL}{why[:200]}"]
+    await task_repo.save_task_state(state)
+    task_events.task_states.on_next(state)
+
+
+async def _redispatch_held(task_id: str, detail: str) -> None:
+    """F-441: the re-dispatch was accepted and is held for its start by the
+    dispatch horizon (F-293): the mission is not waiting for a robot any
+    more but for its time, and GET /tasks/deferred shows it. The chain
+    leaves the waiting list; its alert, if raised, is closed."""
     entry = waiting.find_task(task_id)
     if entry is None:
         return
     waiting.leave(entry.root_id)
-    logger.error("F-435: mission %s is no longer waiting — its attempt [%s] "
-                 "could not be put back on the floor: %s", entry.root_id,
-                 task_id, reason)
+    logger.warning("F-441: mission %s is held for its start (F-293): %s",
+                   entry.root_id, detail)
     await _resolve_waiting_alert(entry)
 
 
 redispatcher = Redispatcher(
     _redispatch_request, _load_request, logger.getChild("Redispatch"),
     abandon=_fail_abandoned_reauction, first_seen=_first_recorded_s,
-    wanted=waiting.wanted, lost=_hand_back_lost)
+    wanted=waiting.wanted, refused=_redispatch_refused,
+    held=_redispatch_held)
 
 
 _request_labels: Dict[str, Optional[list]] = {}
@@ -214,8 +336,10 @@ async def _redispatch_later(task_state: mdl.TaskState) -> None:
         errors = None
         if task_state.dispatch is not None and task_state.dispatch.errors:
             # F-435: the detail is what tells a permanent answer ("no robot
-            # can ever take it") from a transient one
-            errors = [{"code": e.code, "detail": e.detail}
+            # can ever take it") from a transient one; F-442: the category
+            # is what marks the fleet's naming of every robot
+            errors = [{"code": e.code, "category": e.category,
+                       "detail": e.detail}
                       for e in task_state.dispatch.errors]
         task_id = task_state.booking.id
         new_id = await redispatcher.maybe_redispatch(
@@ -685,7 +809,11 @@ def no_bid_final_reason(
     over how long, and whether the fleet was silent or answered with a
     refusal. None for every other state, including a no-bid attempt that
     still has auctions left (supersede() has recorded that one as put
-    back on the floor, and it raises no failure)."""
+    back on the floor, and it raises no failure).
+
+    F-442 (D-86 (4)): the last auction is the fifth in a row on which the
+    fleet named every robot it considered as unable ever to take it, and
+    the reason names each of them and why."""
     verdict = no_bid_verdict_of(task_state)
     if verdict is None or not verdict.final or task_state.dispatch is None:
         return None
@@ -693,8 +821,9 @@ def no_bid_final_reason(
     over_s = None
     if since is not None:
         over_s = (time.time() if now_s is None else now_s) - since
-    return no_bid_failure_reason(
-        task_state.dispatch.errors, verdict.attempt, over_s)
+    return no_bid_judged_failure_reason(
+        task_state.dispatch.errors, verdict.attempt, over_s
+    ) or no_bid_failure_reason(task_state.dispatch.errors, verdict.attempt, over_s)
 
 
 async def alert_on_task_state(task_state: mdl.TaskState, repo):
@@ -1504,16 +1633,44 @@ async def sweep_stale_tasks() -> None:
     await _close_interrupted_rows(epoch)
 
 
-async def _tasks_named_by_fleet_states() -> set:
+async def _fleet_state_rows() -> Optional[list]:
+    """Every stored fleet state's data; None when they cannot be read."""
     try:
         rows = await ttm.FleetState.all()
-        return tasks_named_by(
-            row.data if isinstance(row.data, dict) else {} for row in rows)
-    except Exception:  # noqa: BLE001 — cannot see, so cannot exempt
-        return set()
+    except Exception:  # noqa: BLE001 — cannot see
+        return None
+    return [row.data if isinstance(row.data, dict) else {} for row in rows]
+
+
+async def _tasks_named_by_fleet_states() -> set:
+    return tasks_named_by(await _fleet_state_rows() or [])
+
+
+# F-141 under D-86 (3a)/(4): per robot, the old core's last word on an
+# active task found lost — a queued row on that robot from no later than
+# that belongs to the queue that was lost with it (interrupted_tasks.py)
+_lost_active: Dict[Tuple[str, str], datetime] = {}
+# rows already reported as left alone, so the sweep says it once
+_left_alone: Dict[str, str] = {}
+
+
+def _assigned(task_state: mdl.TaskState) -> Optional[Tuple[str, str]]:
+    who = task_state.assigned_to
+    if who is None or not who.group or not who.name:
+        return None
+    return (str(who.group), str(who.name))
 
 
 async def _close_interrupted_rows(epoch) -> None:
+    """F-141, under D-86 (3a)/(4): close every row the restarted core no
+    longer knows — and put each such mission back on the floor. A row with
+    a stored request is closed like a hand-back (canceled, the marker, the
+    reason; the gf:interrupted booking label kept) and re-dispatched as the
+    next attempt of its chain, waiting for a robot until it is placed; a row
+    with nothing re-sendable is closed failed, its reason named in one
+    Warning. A queued row is closed only on evidence the core lost it
+    (interrupted_tasks.queued_verdict) — sending again a mission the core
+    still holds would run it twice."""
     # exclude terminal rows IN the query: updated_at__lt alone matches
     # every historic row, and the unordered LIMIT then never reaches
     # the live ghosts (found in the Act-3 stress: 4 starved rows,
@@ -1526,13 +1683,18 @@ async def _close_interrupted_rows(epoch) -> None:
     rows = await ttm.TaskState.filter(
         updated_at__lt=epoch).exclude(
         status__in=terminal).limit(INTERRUPTED_CLOSE_LIMIT)
-    closed = []
     # F-343 (f1-n33): a running task whose next stop has no route goes
     # SILENT — the fleet re-broadcasts only on change — and this sweep
     # closed it as "fleet coordination restarted; the core no longer
     # tracks it" while the robot's own fleet state still named it as its
     # current task. The claim is checked before it is written.
-    tracked = await _tasks_named_by_fleet_states()
+    fleet_states = await _fleet_state_rows()
+    tracked = tasks_named_by(fleet_states or [])
+    current = current_tasks_by_robot(fleet_states or [])
+    # the active rows first: a robot's lost active task tells on its queue
+    rows = sorted(rows, key=lambda r: status_tail(r.status) not in ACTIVE_STATUSES)
+    now_ms = round(time.time() * 1e3)
+    failed, requeued = [], []
     for row in rows:
         if str(row.id_).startswith("Charge"):
             continue  # F-12 reaper's jurisdiction
@@ -1545,30 +1707,84 @@ async def _close_interrupted_rows(epoch) -> None:
         except Exception:  # noqa: BLE001 — a corrupt row must not stop the sweep
             logger.error(f"F-141: cannot parse task row {row.id_}")
             continue
-        task_state.status = mdl.TaskStatus.failed
+        assigned = _assigned(task_state)
+        if status_tail(row.status) in ACTIVE_STATUSES:
+            if assigned is not None and row.updated_at is not None:
+                seen = row.updated_at
+                if seen.tzinfo is None:
+                    seen = seen.replace(tzinfo=timezone.utc)
+                if assigned not in _lost_active or _lost_active[assigned] < seen:
+                    _lost_active[assigned] = seen
+                    while len(_lost_active) > 4096:
+                        _lost_active.pop(next(iter(_lost_active)))
+        else:
+            lost, why = queued_verdict(
+                assigned, task_state.unix_millis_start_time, row.updated_at,
+                current, _lost_active)
+            if not lost:
+                if _left_alone.get(str(row.id_)) != why:
+                    _left_alone[str(row.id_)] = why
+                    while len(_left_alone) > 4096:
+                        _left_alone.pop(next(iter(_left_alone)))
+                    logger.info(f"F-141: {row.id_} is silent but left alone — {why}")
+                continue
         labels = list(task_state.booking.labels or [])
         if INTERRUPTED_LABEL not in labels:
             labels.append(INTERRUPTED_LABEL)
         task_state.booking.labels = labels
+        if task_cancellation.requested(str(row.id_)):
+            task_cancellation.apply(task_state)
+            if task_state.cancellation is not None and wants_redispatch(
+                    "canceled", task_state.cancellation.labels) is None:
+                # somebody asked for it to stop before the restart: it
+                # ended canceled, and is never sent again
+                task_state.status = mdl.TaskStatus.canceled
+                await task_repo.save_task_state(task_state)
+                task_events.task_states.on_next(task_state)
+                logger.warning(
+                    f"F-141: {row.id_} was interrupted by a coordination "
+                    "restart after its cancellation was requested — closed "
+                    "canceled, not sent again")
+                continue
+        if await task_repo.get_task_request(str(row.id_)) is None:
+            # nothing can ever be re-sent: the failure it is, reason named
+            task_state.status = mdl.TaskStatus.failed
+            await task_repo.save_task_state(task_state)
+            task_events.task_states.on_next(task_state)
+            failed.append(row.id_)
+            logger.warning(
+                f"F-141: closed interrupted mission {row.id_} as failed "
+                "(fleet coordination restarted; the core no longer tracks "
+                "it, and its request is not stored, so it cannot be sent "
+                "again)")
+            continue
+        from api_server.models.rmf_api.task_state import Cancellation
+
+        task_state.status = mdl.TaskStatus.canceled
+        task_state.cancellation = Cancellation(
+            unix_millis_request_time=now_ms,
+            labels=[REDISPATCH_LABEL, INTERRUPTED_REASON])
         await task_repo.save_task_state(task_state)
         task_events.task_states.on_next(task_state)
-        closed.append(row.id_)
+        asyncio.get_running_loop().create_task(_redispatch_later(task_state))
+        requeued.append(row.id_)
         logger.warning(
-            f"F-141: closed interrupted mission {row.id_} "
-            "(fleet coordination restarted; the core no longer tracks "
-            "it)")
-    if closed:
-        shown = ", ".join(closed[:6]) + (
-            f" and {len(closed) - 6} more" if len(closed) > 6 else "")
+            f"F-141: {row.id_} was interrupted by a coordination restart "
+            "(the core no longer tracks it) — back on the floor, waiting for "
+            "a robot (D-86 (4))")
+    if failed:
+        shown = ", ".join(failed[:6]) + (
+            f" and {len(failed) - 6} more" if len(failed) > 6 else "")
         alert = await alert_repo.create_alert(
             f"interrupted__{round(datetime.now().timestamp() * 1e3)}",
             "fleet",
             severity=ttm.Alert.Severity.Warning,
             message=(
-                f"{len(closed)} mission(s) running before the fleet "
-                "coordination restart did not resume and were closed "
-                f"as failed: {shown}. Re-dispatch what is still "
-                "needed."
+                f"{len(failed)} mission(s) running before the fleet "
+                "coordination restart did not resume and were closed as "
+                "failed: their requests are not stored (not dispatched "
+                f"through GentleFleet), so they cannot be sent again: {shown}. "
+                "Re-dispatch what is still needed."
             ),
         )
         if alert is not None:

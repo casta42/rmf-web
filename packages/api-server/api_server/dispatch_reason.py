@@ -14,9 +14,10 @@
 # unrecognized detail falls back to the generic planner wording plus the
 # raw detail, so a pin bump degrades to honest-but-verbose, never silent.
 
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from api_server.models.rmf_api.error import Error
+from api_server.redispatch import robot_judgements
 
 # Pinned upstream detail substrings (rmf_fleet_adapter FleetUpdateHandle.cpp)
 _LIMITED_CAPACITY = "insufficient battery capacity"
@@ -116,10 +117,14 @@ def no_bid_failure_reason(
 def no_bid_waiting_reason(errors: Optional[List[Error]]) -> str:
     """Why a mission whose last auction got no bid is waiting, in an
     operator's words, from what the fleet answered (code 10 alone: it did
-    not answer)."""
+    not answer). When the fleet named its robots (F-442), every one of
+    them and the planner's verdict on it."""
     said = [e for e in errors or [] if e.code != _NO_BID_CODE]
     if not said:
         return "no robot answered its last auction"
+    named = robots_judged(said)
+    if named is not None:
+        return f"no robot can take it now — {named}"
     details = [(e.code, e.detail or "") for e in said]
     if any(code == 9 and _LIMITED_CAPACITY in d for code, d in details):
         return "no robot can finish it on one battery charge, even starting full"
@@ -130,3 +135,65 @@ def no_bid_waiting_reason(errors: Optional[List[Error]]) -> str:
     if any(code == 13 for code, _ in details):
         return "fleet coordination hit an internal error on its last auction"
     return "no robot offered to take it at its last auction"
+
+
+# G close-out ruling 2026-10-01, D-86 (4) (F-442): "'no robot can ever take
+# it' names every robot considered and why each was refused." The fleet
+# adapter names every robot with the planner's own verdict on it
+# (redispatch.robot_judgements); these are those verdicts in an operator's
+# words, grouped, in this order.
+_JUDGEMENT_WORDS = {
+    "limited_capacity": (
+        "cannot finish it on one battery charge, even starting full from its "
+        "charger"
+    ),
+    "low_battery": "too low on battery to reach its charger now",
+    "feasible": (
+        "could take it on its own; the fleet's plan failed on another mission "
+        "in its queues"
+    ),
+    "no_solution": "the planner found no plan for it",
+    "not_commissioned": "not commissioned, so not considered",
+}
+_NO_VERDICT = "no verdict from the planner"
+
+
+def robots_judged(errors) -> Optional[str]:
+    """Every robot the answering fleets named, grouped by the planner's
+    verdict on it — "gentle_bot_1, gentle_bot_2 (cannot finish it on one
+    battery charge, even starting full from its charger); gentle_bot_3
+    (too low on battery to reach its charger now)". A robot is written
+    fleet/robot when more than one fleet answered. None when no fleet
+    named its robots."""
+    judged = robot_judgements(errors)
+    if not judged:
+        return None
+    fleets = {j.fleet for j in judged}
+    groups: Dict[str, List[str]] = {}
+    for j in judged:
+        name = f"{j.fleet}/{j.robot}" if len(fleets) > 1 and j.fleet else j.robot
+        groups.setdefault(_JUDGEMENT_WORDS.get(j.judgement, _NO_VERDICT), []).append(
+            name
+        )
+    order = [*_JUDGEMENT_WORDS.values(), _NO_VERDICT]
+    return "; ".join(
+        f"{', '.join(groups[words])} ({words})" for words in order if words in groups
+    )
+
+
+def no_bid_judged_failure_reason(
+    errors: Optional[List[Error]], auctions: int, over_s: Optional[float] = None
+) -> Optional[str]:
+    """F-442: the reason a mission failed because no robot can ever take it
+    — the F-435 reason, then every robot the planner judged and why. None
+    when no fleet named its robots (such an answer never fails a mission:
+    redispatch.no_bid_is_permanent)."""
+    named = robots_judged(errors)
+    if named is None:
+        return None
+    # the verdict every considered robot shared, in the F-95 words
+    limited = Error(code=9, category="Not feasible", detail=_LIMITED_CAPACITY)
+    return (
+        f"{no_bid_failure_reason([limited], auctions, over_s)}. "
+        f"Every robot judged: {named}"
+    )

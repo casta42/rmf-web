@@ -4,7 +4,9 @@ import unittest
 from api_server.dispatch_reason import (
     dispatch_failure_reason,
     no_bid_failure_reason,
+    no_bid_judged_failure_reason,
     no_bid_waiting_reason,
+    robots_judged,
 )
 from api_server.models.rmf_api.error import Error
 
@@ -178,6 +180,108 @@ class TestNoBidWaitingReason(unittest.TestCase):
             reason = no_bid_waiting_reason(errors)
             self.assertNotIn("dispatch again", reason)
             self.assertNotIn("dispatching again", reason)
+
+
+
+def judged(*robots, fleet="gentle_fleet"):
+    """F-442: the fleet adapter's naming of every robot, as the patch
+    writes it (nlohmann::json::dump: keys sorted). `robots` are
+    (name, judgement) pairs."""
+    listed = ",".join(f'{{"judgement":"{j}","name":"{n}"}}' for n, j in robots)
+    return Error(
+        code=9,
+        category="Robot judgements",
+        detail=f'{{"fleet":"{fleet}","robots":[{listed}],"task_id":"t"}}',
+    )
+
+
+ALL_LIMITED = judged(
+    ("gentle_bot_1", "limited_capacity"),
+    ("gentle_bot_2", "limited_capacity"),
+    ("gentle_bot_3", "not_commissioned"),
+)
+ONE_LOW = judged(
+    ("gentle_bot_1", "limited_capacity"),
+    ("gentle_bot_2", "low_battery"),
+    ("gentle_bot_3", "limited_capacity"),
+)
+
+
+class TestRobotsJudged(unittest.TestCase):
+    """G close-out ruling 2026-10-01, D-86 (4) (F-442): "'no robot can ever
+    take it' names every robot considered and why each was refused." """
+
+    def test_FIRES_every_robot_is_named_with_the_planner_s_verdict(self):
+        self.assertEqual(
+            robots_judged([LIMITED_CAPACITY, ONE_LOW, NO_BID]),
+            "gentle_bot_1, gentle_bot_3 (cannot finish it on one battery charge, "
+            "even starting full from its charger); gentle_bot_2 (too low on "
+            "battery to reach its charger now)",
+        )
+        every = judged(
+            ("a", "feasible"),
+            ("b", "no_solution"),
+            ("c", "not_commissioned"),
+            ("d", "error"),
+            ("e", "limited_capacity"),
+        )
+        named = robots_judged([every])
+        for robot in "abcde":
+            self.assertIn(robot, named)
+        self.assertTrue(named.startswith("e (cannot finish"), "limits first")
+        self.assertTrue(named.endswith("d (no verdict from the planner)"))
+
+    def test_FIRES_more_than_one_fleet_names_its_robots_by_fleet(self):
+        named = robots_judged(
+            [
+                judged(("gentle_bot_1", "limited_capacity")),
+                judged(("forklift_1", "limited_capacity"), fleet="forks"),
+            ]
+        )
+        self.assertEqual(
+            named,
+            "gentle_fleet/gentle_bot_1, forks/forklift_1 (cannot finish it on one "
+            "battery charge, even starting full from its charger)",
+        )
+
+    def test_PASSES_nothing_named_says_nothing(self):
+        for errors in (None, [], [NO_BID], [LIMITED_CAPACITY, NO_BID], [judged()]):
+            self.assertIsNone(robots_judged(errors), errors)
+            self.assertIsNone(no_bid_judged_failure_reason(errors, 5))
+
+    def test_FIRES_the_failure_names_every_robot_and_why(self):
+        self.assertEqual(
+            no_bid_judged_failure_reason([LIMITED_CAPACITY, ALL_LIMITED, NO_BID], 5, 77.4),
+            "no robot offered to take this mission at 5 auctions in a row over 77 s "
+            "— no robot can finish this mission on one battery charge, even "
+            "starting full — shorten it (fewer rounds or stops) or split it into "
+            "smaller missions. Every robot judged: gentle_bot_1, gentle_bot_2 "
+            "(cannot finish it on one battery charge, even starting full from its "
+            "charger); gentle_bot_3 (not commissioned, so not considered)",
+        )
+
+    def test_FIRES_the_waiting_reason_names_every_robot(self):
+        self.assertEqual(
+            no_bid_waiting_reason([LIMITED_CAPACITY, ONE_LOW, NO_BID]),
+            "no robot can take it now — gentle_bot_1, gentle_bot_3 (cannot "
+            "finish it on one battery charge, even starting full from its "
+            "charger); gentle_bot_2 (too low on battery to reach its charger now)",
+        )
+
+    def test_PASSES_without_names_the_waiting_reason_is_unchanged(self):
+        self.assertEqual(
+            no_bid_waiting_reason([LIMITED_CAPACITY, NO_BID]),
+            "no robot can finish it on one battery charge, even starting full",
+        )
+
+    def test_no_machine_token_reaches_the_operator(self):
+        for text in (
+            robots_judged([ONE_LOW]),
+            no_bid_waiting_reason([LIMITED_CAPACITY, ONE_LOW, NO_BID]),
+            no_bid_judged_failure_reason([ALL_LIMITED], 5),
+        ):
+            for token in ("limited_capacity", "low_battery", "not_commissioned", "{"):
+                self.assertNotIn(token, text)
 
 
 if __name__ == "__main__":

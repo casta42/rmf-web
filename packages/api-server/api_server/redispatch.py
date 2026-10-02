@@ -52,15 +52,18 @@ its own error (code 10, "No fleet adapters offered a bid"), next to
 whatever each fleet answered (rmf_task_ros2 Dispatcher.cpp conclude_bid).
 F-435 splits it by that answer:
 
-  * PERMANENT — some fleet answered "not feasible" (code 9) with the
-    planner's "insufficient battery capacity" detail: no robot can finish
-    the mission on one charge even starting full, so no robot can ever
-    take it. Item 6's rule, exactly: auctioned again after 2, 5, 10,
-    20 s, and the fifth such answer in a row is a failed mission with the
-    reason named (NO_BID_MAX_ATTEMPTS).
-  * TRANSIENT — everything else: silence (code 10 alone), "insufficient
-    initial battery charge" (every robot is too low NOW), any other
-    planner refusal, an internal error. The fleet will change; the
+  * PERMANENT — the fleet named every robot it considered, and the
+    planner's verdict on each is limited capacity: it cannot finish the
+    mission even after a full charge at its charger, so no robot can ever
+    take it (F-442, no_bid_is_permanent; the planner's own "insufficient
+    battery capacity" is the verdict on the robot it judged last, and no
+    longer decides alone). Item 6's rule, exactly: auctioned again after
+    2, 5, 10, 20 s, and the fifth such answer in a row is a failed mission
+    with the reason named — every robot judged, and why
+    (NO_BID_MAX_ATTEMPTS).
+  * TRANSIENT — everything else: silence (code 10 alone), one robot too
+    low NOW or able to take it alone, a refusal that names no robot, any
+    other planner refusal, an internal error. The fleet will change; the
     mission waits. Auctioned again forever, after 2, 5, 10, 20 s and
     then every NO_BID_MAX_BACKOFF_S, and never failed.
 
@@ -89,11 +92,27 @@ never as a failure. The dispatcher's own verdict (`dispatch.status`,
 `dispatch.errors`) stays on the row as provenance, and it is also what
 tells this module that the row is a no-bid attempt and not a hand-back,
 so the rewritten row leads to exactly one re-auction and never to a
-hand-back hop as well. If the re-auction then cannot be made (the request
-is not stored, the dispatch is refused) the promise on the row was false:
-the row is amended back to `failed` and the reason is named in a Critical
-alert — a refused re-auction is a failed mission, never a silently
-dropped one.
+hand-back hop as well.
+
+A REFUSED RE-DISPATCH NEVER DROPS A MISSION (G close-out ruling
+2026-10-01, D-86 (4), F-441): "a refused re-dispatch never drops a
+mission; it returns to the waiting queue under F-435." Every re-dispatch
+— a hand-back's or a no-bid's — goes through the operator's own dispatch
+path, and that path can refuse it: a guard (F-34 a parked robot on the
+destination, F-111 a place a zone has isolated, F-332/F-338 a cordon),
+the dispatch horizon (F-293), the dispatcher not answering while
+rmf-core restarts, an answer of no known shape, or a stored request that
+cannot be read. Each of those describes the site as it is NOW, so the
+mission keeps waiting: the refusal becomes its reason ("Waiting for a
+robot"), the attempt's row carries it (REFUSED_LABEL), and the same
+request is sent again after the waiting backoff — refusal k waits
+hand_back_backoff(generation + k), 15 s more each time, capped at 60 s —
+for as long as the mission is wanted. A mission is failed, with the
+reason named, only when NOTHING can ever be re-sent: its request is not
+stored (it was not dispatched through GentleFleet), or the dispatcher
+refuses the stored request itself as invalid (Refusal.permanent). A
+dispatch the horizon HOLDS for its start (F-293) was accepted, not
+refused: the chain leaves the waiting list and is never sent twice.
 
 The wait between attempts is an in-process sleep. An api-server restart
 during it would drop the pending attempt, so the api-server RESUMES at
@@ -132,8 +151,9 @@ of its LAST row, the one no other row names in `gf:redispatch-of`.
 Every earlier row is `canceled` with `gf:redispatch` in its cancellation
 labels: a superseded attempt, not a canceled mission, and not counted.
 A chain whose last row is itself a marked cancel has no successor — its
-re-dispatch was refused or is pending (in flight) — and counts as LOST
-once it is old enough not to be pending, not as canceled. (A chain
+re-dispatch is pending (in flight), or was refused and is being sent
+again (F-441: the row then carries REFUSED_LABEL, re-stamped at every
+refusal) — and GET /tasks/waiting lists it; it is not canceled. (A chain
 already in flight when this was deployed has no root label on its early
 rows; its later rows name, as their root, the row that was live at that
 moment.)
@@ -142,6 +162,7 @@ Pure helpers first (unit-tested without a server); the async hook at the
 bottom is what routes/internal.py calls after persisting a task state.
 """
 
+import json
 import logging
 import time
 from typing import Iterable, List, NamedTuple, Optional
@@ -173,11 +194,12 @@ _CANCELED = {"canceled", "killed"}
 # adapter's "not feasible" answer (FleetUpdateHandle.cpp make_error_str).
 NO_BID_CODE = 10
 NOT_FEASIBLE_CODE = 9
-# F-435: the one answer that means NO robot can ever take the mission —
-# the planner's limited_capacity error, "insufficient battery capacity to
-# accommodate one or more requests by any of the robots in this fleet"
-# (FleetUpdateHandle.cpp). Byte-identical to dispatch_reason
-# _LIMITED_CAPACITY (test_redispatch pins the two together).
+# F-435: the planner's limited_capacity error, "insufficient battery
+# capacity to accommodate one or more requests by any of the robots in this
+# fleet" (FleetUpdateHandle.cpp). Byte-identical to dispatch_reason
+# _LIMITED_CAPACITY (test_redispatch pins the two together). Since F-442 it
+# alone never makes a no-bid permanent: it is the verdict on the robot the
+# planner judged last (no_bid_is_permanent).
 PERMANENT_NO_BID_DETAIL = "insufficient battery capacity"
 # G ruling 2026-10-01 item 6 (F-410/F-412 class), kept for the PERMANENT
 # answer only by F-435: how many such auctions in a row a mission gets
@@ -193,6 +215,11 @@ NO_BID_MAX_BACKOFF_S = 60.0
 NO_BID_ATTEMPT_LABEL = "gf:redispatch-nobid-attempt="
 NO_BID_SINCE_LABEL = "gf:redispatch-nobid-since="
 NO_BID_PERMANENT_LABEL = "gf:redispatch-nobid-permanent="
+# F-441: the last refusal of an attempt's re-dispatch, in its CANCELLATION
+# labels (after the marker and the fleet's reason; the `gf:` prefix keeps
+# wants_redispatch reading the fleet's reason first). Re-stamped at every
+# refusal, so the row says why the mission still waits.
+REFUSED_LABEL = "gf:redispatch-refused="
 # Chain folding (see COUNTING MISSIONS in the module docstring).
 ROOT_LABEL = "gf:redispatch-root="
 CLASS_LABEL = "gf:redispatch-class="
@@ -223,16 +250,105 @@ def _detail_of(err) -> str:
     return str(detail) if detail else ""
 
 
+def _category_of(err) -> str:
+    category = err.get("category") if isinstance(err, dict) else \
+        getattr(err, "category", None)
+    return str(category) if category else ""
+
+
+# F-442 (G close-out ruling 2026-10-01, D-86 (4)): "'no robot can ever take
+# it' names every robot considered and why each was refused." The planner's
+# own error is the verdict on the robot it judged LAST (rmf_task
+# Candidates::make), so the fleet adapter names every robot beside it
+# (deploy/patches/f442-rmf-fleet-adapter-robot-judgements.patch): one more
+# "not feasible" error, this category, its detail a JSON object
+#   {"fleet": ..., "task_id": ..., "robots": [{"name": ..., "judgement": ...}]}
+# where each judgement is the planner's verdict on the new request planned
+# alone against that robot: limited_capacity (it cannot finish it even
+# after a full charge at its charger), low_battery (too low to reach its
+# charger now), feasible (it could take it alone — the fleet's plan failed
+# on another request), no_solution, not_commissioned (not planned for),
+# unknown or error.
+JUDGEMENTS_CATEGORY = "Robot judgements"
+PERMANENT_JUDGEMENT = "limited_capacity"
+NOT_CONSIDERED_JUDGEMENTS = frozenset({"not_commissioned"})
+
+
+class RobotJudgement(NamedTuple):
+    fleet: str
+    robot: str
+    judgement: str
+
+
+def is_judgements(err) -> bool:
+    return _code_of(err) == NOT_FEASIBLE_CODE and \
+        _category_of(err) == JUDGEMENTS_CATEGORY
+
+
+def robot_judgements(dispatch_errors: Optional[Iterable]
+                     ) -> Optional[List[RobotJudgement]]:
+    """F-442: every robot the answering fleets named, with the planner's
+    verdict on it, in the order they were named. None when no fleet named
+    its robots — and when a naming cannot be read: cannot see, so cannot
+    convict."""
+    named = [err for err in dispatch_errors or [] if is_judgements(err)]
+    if not named:
+        return None
+    out: List[RobotJudgement] = []
+    for err in named:
+        try:
+            body = json.loads(_detail_of(err))
+        except ValueError:
+            return None
+        robots = body.get("robots") if isinstance(body, dict) else None
+        if not isinstance(robots, list):
+            return None
+        fleet = str(body.get("fleet") or "")
+        for robot in robots:
+            if not isinstance(robot, dict) or \
+                    not isinstance(robot.get("name"), str) or \
+                    not isinstance(robot.get("judgement"), str):
+                return None
+            out.append(RobotJudgement(fleet, robot["name"], robot["judgement"]))
+    return out
+
+
 def no_bid_is_permanent(dispatch_errors: Optional[Iterable]) -> bool:
-    """F-435: did some fleet answer that NO robot can ever take this
-    mission? Only the planner's limited-capacity refusal says that; every
-    other answer — silence, every robot too low right now, any other
-    refusal, an internal error — describes the fleet as it is NOW."""
-    for err in dispatch_errors or []:
-        if _code_of(err) == NOT_FEASIBLE_CODE and \
-                PERMANENT_NO_BID_DETAIL in _detail_of(err):
-            return True
-    return False
+    """F-435, made precise by F-442: can NO robot ever take this mission?
+    Only when the fleet named the robots it considered and the planner's
+    verdict on every one of them is limited capacity — it cannot finish the
+    mission even after a full charge at its charger. One robot that is low
+    now, could take it alone, or got no verdict makes the answer transient:
+    the fleet will change, and the mission waits.
+
+    So it is NOT permanent when no robot is named — the planner's own
+    "insufficient battery capacity" (PERMANENT_NO_BID_DETAIL) is the verdict
+    on the LAST robot only, and absence of the rest is not evidence — nor
+    when some fleet refused without naming its robots (as many planner
+    refusals as namings, or one fleet's robots are unseen), nor beside any
+    answer that is not a planner refusal. Robots that were not considered
+    (not commissioned) are named but do not count."""
+    errors = list(dispatch_errors or [])
+    judged = robot_judgements(errors)
+    if not judged:
+        return False
+    considered = [j for j in judged
+                  if j.judgement not in NOT_CONSIDERED_JUDGEMENTS]
+    if not considered or any(j.judgement != PERMANENT_JUDGEMENT
+                             for j in considered):
+        return False
+    namings = refusals = 0
+    for err in errors:
+        code = _code_of(err)
+        if code == NO_BID_CODE:
+            continue
+        if is_judgements(err):
+            namings += 1
+        elif code == NOT_FEASIBLE_CODE:
+            refusals += 1
+        else:
+            return False
+    return refusals == namings
 
 
 class NoBid(NamedTuple):
@@ -425,6 +541,36 @@ def hand_back_backoff(generation: int) -> float:
     return min(HAND_BACK_MAX_BACKOFF_S, step)
 
 
+def refusal_backoff(refusals: int, generation: int = 0) -> float:
+    """F-441: wait this long after the `refusals`-th refusal in a row of
+    a re-dispatch before sending it again — the waiting backoff, one step
+    further for every refusal, capped like every other wait."""
+    return hand_back_backoff(max(0, generation) + max(1, refusals))
+
+
+class Refusal(Exception):
+    """F-441: the dispatch path refused a re-dispatch before the dispatcher
+    accepted it. `permanent` only when the same request can never be
+    accepted — nothing can ever be re-sent; every other refusal describes
+    the site as it is now, and the mission keeps waiting."""
+
+    def __init__(self, reason: str, permanent: bool = False):
+        super().__init__(reason)
+        self.reason = reason
+        self.permanent = permanent
+
+
+class Held(Exception):
+    """F-441: the re-dispatch was ACCEPTED and held for its start time by
+    the dispatch horizon (F-293). It reaches the fleet later as its own
+    attempt, carrying the chain's labels; it is never sent again."""
+
+    def __init__(self, held_id: Optional[str], detail: str):
+        super().__init__(detail)
+        self.held_id = held_id
+        self.detail = detail
+
+
 def generation_of(labels: Optional[Iterable[str]]) -> int:
     generation = _label_int(labels, GENERATION_LABEL)
     return 0 if generation is None else generation
@@ -600,26 +746,66 @@ def unsupersede(task_state) -> bool:
         return False
 
 
+def unmark_hand_back(task_state) -> bool:
+    """F-441: a handed-back attempt whose mission can never be re-sent DID
+    fail, and the row must say so: `canceled` with the marker becomes
+    `failed`, the fleet's own reason kept as provenance and the marker
+    removed, so nothing reads it as waiting or resumes it. Touches only a
+    marked hand-back (never a no-bid row — unsupersede() owns those); True
+    when it changed the state."""
+    try:
+        status, booking_labels, errors, cancel_labels = _state_parts(task_state)
+        if wants_redispatch(status, cancel_labels) is None:
+            return False
+        if no_bid_verdict(status, booking_labels, errors,
+                          cancel_labels) is not None:
+            return False
+        task_state.status = type(task_state.status)("failed")
+        task_state.cancellation.labels = [
+            lab for lab in cancel_labels if lab != REDISPATCH_LABEL]
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+class _Sent(NamedTuple):
+    """One send of a re-dispatch: `new_id` when the dispatcher took it,
+    `held` when the horizon holds it, else the refusal and whether it is
+    permanent."""
+    new_id: Optional[str] = None
+    held: bool = False
+    why: str = ""
+    permanent: bool = False
+
+
+NOT_STORED = ("its request is not stored (it was not dispatched through "
+              "GentleFleet)")
+
+
 class Redispatcher:
     """Acts once per terminal task id; the dispatch call is injected so
     the class is testable without a server.
 
     Counters, per class, since this process started. Hand-backs:
-    `redispatched` (back on the floor) and `refused` (request not stored,
-    dispatch refused). No-bid auctions: `reauctioned` (auctioned again),
-    `no_bid_exhausted` (the last permanent answer — the mission failed)
-    and `no_bid_abandoned` (the re-auction could not be made — the
-    mission failed). Both: `withdrawn` (an operator canceled the mission
-    while it waited, so it was not dispatched again)."""
+    `redispatched` (back on the floor) and `hand_back_abandoned` (nothing
+    can ever be re-sent — the mission failed). No-bid auctions:
+    `reauctioned` (auctioned again), `no_bid_exhausted` (the last permanent
+    answer — the mission failed) and `no_bid_abandoned` (nothing can ever
+    be re-sent — the mission failed). Both: `refused` (a re-dispatch was
+    refused and is sent again — F-441), `held` (accepted and held for its
+    start, F-293) and `withdrawn` (an operator canceled the mission while
+    it waited, so it was not dispatched again)."""
 
     def __init__(self, dispatch, load_request, logger: logging.Logger,
                  cap: int = 2048, abandon=None, first_seen=None,
-                 clock=time.time, wanted=None, lost=None):
-        self._dispatch = dispatch          # async (request) -> new task id
+                 clock=time.time, wanted=None, refused=None, held=None):
+        # async (request) -> new task id; raises Refusal, Held, or anything
+        # else for an answer of no known shape
+        self._dispatch = dispatch
         self._load_request = load_request  # async (task_id) -> TaskRequest
         self._logger = logger
-        # async (task_id, reason): the re-auction promised on a
-        # superseded row cannot be made — fail the row, page the operator
+        # async (task_id, reason): the mission can never be re-sent — fail
+        # the row with the reason named and page the operator
         self._abandon = abandon
         # async (task_id) -> unix s the ledger first recorded the task
         self._first_seen = first_seen
@@ -627,13 +813,18 @@ class Redispatcher:
         # (task_id) -> bool: is the mission still wanted after the wait?
         # False when an operator canceled it in the meantime (F-435)
         self._wanted = wanted
-        # async (task_id, reason): a hand-back could not be put back on the
-        # floor — the mission is not waiting any more (F-435 registry)
-        self._lost = lost
+        # async (task_id, why, retry_in_s): the re-dispatch was refused and
+        # will be sent again — the mission is still waiting, and this is
+        # its reason now (F-441)
+        self._refused = refused
+        # async (task_id, detail): accepted and held for its start (F-293)
+        self._held = held
         self._seen: List[str] = []
         self._cap = cap
         self.redispatched = 0
         self.refused = 0
+        self.held = 0
+        self.hand_back_abandoned = 0
         self.reauctioned = 0
         self.no_bid_exhausted = 0
         self.no_bid_abandoned = 0
@@ -661,94 +852,150 @@ class Redispatcher:
                 "waited for a robot — not dispatched again", task_id)
         return wanted
 
-    async def _hand_back_lost(self, task_id: str, reason: str) -> None:
-        self.refused += 1
-        if self._lost is None:
-            return
-        try:
-            await self._lost(task_id, reason)
-        except Exception:  # pylint: disable=broad-except
-            self._logger.exception(
-                "re-dispatch: [%s] lost, and could not be recorded", task_id)
-
     async def _give_up(self, task_id: str, reason: str) -> None:
-        """The row says "auctioned again" and it will not be: hand it to
-        the caller to be recorded as the failure it is."""
-        self._logger.error("re-auction: [%s] %s", task_id, reason)
+        """Nothing can ever be re-sent: hand the attempt to the caller to
+        be recorded as the failure it is, with the reason named."""
+        self._logger.error("re-dispatch: [%s] failed — %s", task_id, reason)
         if self._abandon is None:
             return
         try:
             await self._abandon(task_id, reason)
         except Exception:  # pylint: disable=broad-except
             self._logger.exception(
-                "re-auction: [%s] could not be recorded as failed", task_id)
+                "re-dispatch: [%s] could not be recorded as failed", task_id)
+
+    async def _send(self, task_id: str, request) -> _Sent:
+        """One send of a re-dispatch through the operator's dispatch path.
+        Never raises: an answer of no known shape is a refusal that is not
+        permanent — cannot see, so cannot convict."""
+        try:
+            return _Sent(new_id=await self._dispatch(request))
+        except Held as held:
+            self.held += 1
+            self._logger.warning(
+                "re-dispatch: [%s] was accepted and is held for its start "
+                "as [%s] (F-293): %s", task_id, held.held_id, held.detail)
+            if self._held is not None:
+                try:
+                    await self._held(task_id, held.detail)
+                except Exception:  # pylint: disable=broad-except
+                    self._logger.exception(
+                        "re-dispatch: [%s] held, and could not be recorded",
+                        task_id)
+            return _Sent(held=True)
+        except Refusal as refusal:
+            return _Sent(why=refusal.reason, permanent=refusal.permanent)
+        except Exception as exc:  # pylint: disable=broad-except
+            why = str(getattr(exc, "detail", None) or exc) or \
+                type(exc).__name__
+            return _Sent(why=why)
+
+    async def _load(self, task_id: str):
+        """(request, None), or (None, why) when the stored request could
+        not be READ — a database that did not answer is not a request that
+        is not stored."""
+        try:
+            return await self._load_request(task_id), None
+        except Exception as exc:  # pylint: disable=broad-except
+            return None, f"its stored request could not be read: {exc}"
+
+    async def _refused_again(self, task_id: str, why: str, refusals: int,
+                             generation: int, sleep) -> None:
+        """F-441: the mission keeps waiting — say why, then wait."""
+        delay = refusal_backoff(refusals, generation)
+        self.refused += 1
+        self._logger.warning(
+            "re-dispatch of [%s] refused (%d in a row): %s — the mission "
+            "is still waiting for a robot; sent again in %.0f s (F-441)",
+            task_id, refusals, why, delay)
+        if self._refused is not None:
+            try:
+                await self._refused(task_id, why, delay)
+            except Exception:  # pylint: disable=broad-except
+                self._logger.exception(
+                    "re-dispatch: [%s]'s refusal could not be recorded",
+                    task_id)
+        await sleep(delay)
 
     async def _reauction(self, task_id: str, verdict: NoBid,
                          sleep) -> Optional[str]:
         """Auction a mission nobody bid on again, after its backoff (G
         ruling 2026-10-01 item 6; F-435 for the transient answers). The
-        hand-back bookkeeping is carried, never advanced."""
+        hand-back bookkeeping is carried, never advanced. A refused
+        re-auction is sent again (F-441)."""
         if not self._mark(task_id):
             return None
         if verdict.final:
             self.no_bid_exhausted += 1
             self._logger.error(
                 "re-auction: [%s] — the fleet answered %d auctions in a row "
-                "that no robot can ever take this mission (insufficient "
-                "battery capacity); the mission failed (F-435)",
+                "that no robot can ever take this mission (every robot it "
+                "considered cannot finish it on one battery charge); the "
+                "mission failed (F-435, F-442)",
                 task_id, verdict.run)
             return None
         closed_at = self._clock()
         await sleep(verdict.delay_s)
-        if not self._still_wanted(task_id):
-            return None
         said = no_bid_summary(verdict)
-        request = await self._load_request(task_id)
-        if request is None:
-            self.no_bid_abandoned += 1
-            await self._give_up(
-                task_id,
-                f"{said}, and it could not be auctioned again: its request "
-                "is not stored (it was not dispatched through GentleFleet)")
-            return None
-        since = no_bid_since_of(request.labels)
-        if since is None and self._first_seen is not None:
-            try:
-                since = await self._first_seen(task_id)
-            except Exception:  # pylint: disable=broad-except
-                since = None
-        if since is None:
-            since = closed_at
-        labels = next_no_bid_labels(request.labels, task_id, since,
-                                    verdict.permanent)
-        if labels is None:
-            # the state lost its labels and read as an early answer; the
-            # stored request is the truth, and it says this was the last
-            self.no_bid_exhausted += 1
-            await self._give_up(
-                task_id,
-                f"the fleet answered {NO_BID_MAX_ATTEMPTS} auctions in a row "
-                "that no robot can finish this mission on one battery "
-                "charge, and the mission has no auction left")
-            return None
-        request = request.model_copy(update={"labels": labels})
-        try:
-            new_id = await self._dispatch(request)
-        except Exception as exc:  # pylint: disable=broad-except
-            why = getattr(exc, "detail", None) or str(exc)
-            self.no_bid_abandoned += 1
-            await self._give_up(
-                task_id,
-                f"{said}, and it could not be auctioned again: {why}")
-            return None
-        self.reauctioned += 1
-        self._logger.warning(
-            "re-auction: [%s] got no bid; auctioned again as [%s] "
-            "(attempt %d%s)", task_id, new_id, no_bid_attempt_of(labels),
-            f", {no_bid_permanent_of(labels)} of {NO_BID_MAX_ATTEMPTS} "
-            "answered 'no robot can ever take it'" if verdict.permanent
-            else "")
-        return new_id
+        refusals = 0
+        while self._still_wanted(task_id):
+            request, why = await self._load(task_id)
+            if why is None and request is None:
+                self.no_bid_abandoned += 1
+                await self._give_up(
+                    task_id,
+                    f"{said}, and it could not be auctioned again: its "
+                    "request is not stored (it was not dispatched through "
+                    "GentleFleet)")
+                return None
+            if why is None:
+                since = no_bid_since_of(request.labels)
+                if since is None and self._first_seen is not None:
+                    try:
+                        since = await self._first_seen(task_id)
+                    except Exception:  # pylint: disable=broad-except
+                        since = None
+                if since is None:
+                    since = closed_at
+                labels = next_no_bid_labels(request.labels, task_id, since,
+                                            verdict.permanent)
+                if labels is None:
+                    # the state lost its labels and read as an early answer;
+                    # the stored request is the truth, and it says this was
+                    # the last
+                    self.no_bid_exhausted += 1
+                    await self._give_up(
+                        task_id,
+                        f"the fleet answered {NO_BID_MAX_ATTEMPTS} auctions "
+                        "in a row that no robot can finish this mission on "
+                        "one battery charge, and the mission has no auction "
+                        "left")
+                    return None
+                sent = await self._send(
+                    task_id, request.model_copy(update={"labels": labels}))
+                if sent.new_id is not None:
+                    self.reauctioned += 1
+                    self._logger.warning(
+                        "re-auction: [%s] got no bid; auctioned again as [%s] "
+                        "(attempt %d%s)", task_id, sent.new_id,
+                        no_bid_attempt_of(labels),
+                        f", {no_bid_permanent_of(labels)} of "
+                        f"{NO_BID_MAX_ATTEMPTS} answered 'no robot can ever "
+                        "take it'" if verdict.permanent else "")
+                    return sent.new_id
+                if sent.held:
+                    return None
+                if sent.permanent:
+                    self.no_bid_abandoned += 1
+                    await self._give_up(
+                        task_id,
+                        f"{said}, and it could not be auctioned again: "
+                        f"{sent.why}")
+                    return None
+                why = sent.why
+            refusals += 1
+            await self._refused_again(task_id, why, refusals, 0, sleep)
+        return None
 
     async def maybe_redispatch(self, task_id: str, status_value,
                                cancellation_labels, booking_labels=None,
@@ -770,30 +1017,40 @@ class Redispatcher:
             return None
         # F-435: every class waits, progressively, and none is ever
         # stopped — the fleet's state has to change, and it will
-        await sleep(hand_back_backoff(generation_of(booking_labels)))
-        if not self._still_wanted(task_id):
-            return None
-        request = await self._load_request(task_id)
-        if request is None:
-            self._logger.warning(
-                "re-dispatch: [%s] was handed back but its request is not "
-                "stored (a direct mission?) — left canceled", task_id)
-            await self._hand_back_lost(task_id, "its request is not stored")
-            return None
-        labels = next_labels(request.labels, task_id, reason)
-        request = request.model_copy(update={"labels": labels})
-        try:
-            new_id = await self._dispatch(request)
-        except Exception as exc:  # pylint: disable=broad-except
-            self._logger.warning(
-                "re-dispatch of [%s] refused: %s — left canceled with its "
-                "provenance", task_id, exc)
-            await self._hand_back_lost(
-                task_id, str(getattr(exc, "detail", None) or exc))
-            return None
-        self.redispatched += 1
-        self._logger.warning(
-            "re-dispatch: [%s] (%s) is back on the floor as [%s] "
-            "(generation %d)", task_id, reason, new_id,
-            generation_of(labels))
-        return new_id
+        generation = generation_of(booking_labels)
+        await sleep(hand_back_backoff(generation))
+        refusals = 0
+        while self._still_wanted(task_id):
+            request, why = await self._load(task_id)
+            if why is None and request is None:
+                self.hand_back_abandoned += 1
+                await self._give_up(
+                    task_id,
+                    f"handed back by the fleet ({reason}), and it cannot be "
+                    f"sent again: {NOT_STORED}")
+                return None
+            if why is None:
+                labels = next_labels(request.labels, task_id, reason)
+                sent = await self._send(
+                    task_id, request.model_copy(update={"labels": labels}))
+                if sent.new_id is not None:
+                    self.redispatched += 1
+                    self._logger.warning(
+                        "re-dispatch: [%s] (%s) is back on the floor as [%s] "
+                        "(generation %d)", task_id, reason, sent.new_id,
+                        generation_of(labels))
+                    return sent.new_id
+                if sent.held:
+                    return None
+                if sent.permanent:
+                    self.hand_back_abandoned += 1
+                    await self._give_up(
+                        task_id,
+                        f"handed back by the fleet ({reason}), and it cannot "
+                        f"be sent again: {sent.why}")
+                    return None
+                why = sent.why
+            refusals += 1
+            await self._refused_again(task_id, why, refusals, generation,
+                                      sleep)
+        return None

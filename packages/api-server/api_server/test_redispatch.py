@@ -59,8 +59,12 @@ from api_server.redispatch import (
     PERMANENT_NO_BID_DETAIL,
     REASON_LABEL,
     REDISPATCH_LABEL,
+    REFUSED_LABEL,
     ROOT_LABEL,
+    Held,
     Redispatcher,
+    Refusal,
+    RobotJudgement,
     class_of,
     generation_of,
     hand_back_backoff,
@@ -75,9 +79,12 @@ from api_server.redispatch import (
     no_bid_verdict,
     no_bid_verdict_of,
     origin_of,
+    refusal_backoff,
+    robot_judgements,
     root_of,
     supersede,
     transient_no_bid_backoff,
+    unmark_hand_back,
     unsupersede,
     wants_redispatch,
     wants_retry,
@@ -111,6 +118,24 @@ PLANNER = {"code": 9, "category": "Not feasible",
            "detail": "[TaskPlanner] Failed to compute assignments for task_id "
                      "[patrol.dispatch-1]"}
 INTERNAL = {"code": 13, "category": "Internal bug", "detail": "boom"}
+
+
+def judged(*verdicts, fleet="gentle_fleet", task="patrol.dispatch-1",
+           first=1):
+    """F-442: the fleet adapter's naming of every robot it judged, byte for
+    byte as the patch writes it (make_error_str of nlohmann::json::dump,
+    whose objects keep their keys sorted)."""
+    robots = ",".join(
+        f'{{"judgement":"{v}","name":"gentle_bot_{first + i}"}}'
+        for i, v in enumerate(verdicts))
+    return {"code": 9, "category": "Robot judgements",
+            "detail": f'{{"fleet":"{fleet}","robots":[{robots}],'
+                      f'"task_id":"{task}"}}'}
+
+
+# every robot the fleet considered cannot finish it even starting full
+JUDGED_LIMITED = judged("limited_capacity", "limited_capacity",
+                        "limited_capacity")
 
 
 class FakeRequest(BaseModel):
@@ -258,12 +283,24 @@ class RedispatcherTest(unittest.TestCase):
         self.assertIsNone(wants_retry("canceled", child_labels,
                                       [{"code": NO_BID_CODE}]))
 
-    def test_direct_mission_without_a_stored_request_is_left_canceled(self):
+    def test_F441_a_direct_mission_without_a_stored_request_fails_by_name(self):
+        """Nothing can ever be re-sent: the mission is failed with the
+        reason named — never left a marked cancel with no successor."""
+        abandoned = []
+
+        async def abandon(task_id, reason):
+            abandoned.append((task_id, reason))
+
+        self.rd._abandon = abandon      # pylint: disable=protected-access
         self.assertIsNone(self.run_(self.rd.maybe_redispatch(
             "op-send-77", "canceled", [REDISPATCH_LABEL, REASON],
             sleep=self._sleep)))
         self.assertEqual(self.dispatched, [])
-        self.assertEqual(self.rd.refused, 1)
+        self.assertEqual((self.rd.hand_back_abandoned, self.rd.refused), (1, 0))
+        ((task_id, reason),) = abandoned
+        self.assertEqual(task_id, "op-send-77")
+        self.assertIn(f"handed back by the fleet ({REASON})", reason)
+        self.assertIn("cannot be sent again: its request is not stored", reason)
 
     def test_F435_a_chain_past_the_old_hop_cap_is_re_dispatched(self):
         """KNOWN BAD before F-435: generation 8 was refused and the mission
@@ -281,64 +318,27 @@ class RedispatcherTest(unittest.TestCase):
         self.assertEqual((self.rd.redispatched, self.rd.refused), (1, 0))
 
     def test_a_refused_dispatch_is_logged_not_raised(self):
-        async def refuse(_request):
-            raise RuntimeError("destination occupied (F-34)")
+        """F-441: a refusal is sent again, never raised and never a drop."""
+        answers = [RuntimeError("destination occupied (F-34)")]
 
-        rd = Redispatcher(refuse, lambda tid: self.requests_get(tid),
+        async def refuse_once(request):
+            if answers:
+                raise answers.pop()
+            return await self.requests_get_dispatch(request)
+
+        rd = Redispatcher(refuse_once, self.requests_get,
                           logging.getLogger("t"))
-        self.assertIsNone(self.run_(rd.maybe_redispatch(
+        self.assertEqual(self.run_(rd.maybe_redispatch(
             "patrol.dispatch-1", "canceled", [REDISPATCH_LABEL, REASON],
-            sleep=self._sleep)))
-        self.assertEqual(rd.refused, 1)
+            sleep=self._sleep)), "patrol.dispatch-101")
+        self.assertEqual((rd.refused, rd.redispatched), (1, 1))
 
     async def requests_get(self, task_id):
         return self.requests.get(task_id)
 
-    def test_F435_a_hand_back_that_cannot_go_back_is_reported_lost(self):
-        """FIRES: the request is not stored, or the dispatch is refused —
-        the mission is not waiting any more, and whoever shows it as
-        waiting is told. PASSES: a successful re-dispatch and an operator's
-        withdrawal are not losses."""
-        lost = []
-
-        async def on_lost(task_id, reason):
-            lost.append((task_id, reason))
-
-        async def refuse(_request):
-            raise RuntimeError("destination occupied (F-34)")
-
-        async def load(task_id):
-            return self.requests.get(task_id)
-
-        rd = Redispatcher(refuse, load, logging.getLogger("t"), lost=on_lost)
-        self.assertIsNone(self.run_(rd.maybe_redispatch(
-            "patrol.dispatch-1", "canceled", [REDISPATCH_LABEL, REASON],
-            sleep=self._sleep)))
-        self.assertIsNone(self.run_(rd.maybe_redispatch(
-            "not-stored", "canceled", [REDISPATCH_LABEL, REASON],
-            sleep=self._sleep)))
-        self.assertEqual(lost, [
-            ("patrol.dispatch-1", "destination occupied (F-34)"),
-            ("not-stored", "its request is not stored")])
-        self.assertEqual(rd.refused, 2)
-        lost.clear()
-        self.rd._lost = on_lost         # pylint: disable=protected-access
-        self.assertIsNotNone(self.run_(self.rd.maybe_redispatch(
-            "patrol.dispatch-1", "canceled", [REDISPATCH_LABEL, REASON],
-            sleep=self._sleep)))
-        self.rd._wanted = lambda _tid: False  # pylint: disable=protected-access
-        self.requests["w"] = FakeRequest(labels=None)
-        self.assertIsNone(self.run_(self.rd.maybe_redispatch(
-            "w", "canceled", [REDISPATCH_LABEL, REASON], sleep=self._sleep)))
-        self.assertEqual(lost, [])
-
-        async def broken(_task_id, _reason):
-            raise RuntimeError("registry gone")
-
-        rd._lost = broken               # pylint: disable=protected-access
-        self.assertIsNone(self.run_(rd.maybe_redispatch(
-            "patrol.dispatch-9", "canceled", [REDISPATCH_LABEL, REASON],
-            sleep=self._sleep)))
+    async def requests_get_dispatch(self, request):
+        self.dispatched.append(request)
+        return f"patrol.dispatch-{100 + len(self.dispatched)}"
 
 
 class F435HandBackWaitsTest(unittest.TestCase):
@@ -453,7 +453,9 @@ NO_BID = [{"code": NO_BID_CODE}]
 # the real persisted shape when the fleet adapter answered with a refusal:
 # its own error first, then the dispatcher's code 10 (Dispatcher.cpp)
 ANSWERED = [{"code": 9}, {"code": NO_BID_CODE}]
-PERMANENT = [LIMITED, {"code": NO_BID_CODE}]
+# the planner's refusal, the fleet's naming of every robot, the
+# dispatcher's code 10 — the persisted order (Dispatcher.cpp conclude_bid)
+PERMANENT = [LIMITED, JUDGED_LIMITED, {"code": NO_BID_CODE}]
 
 
 def permanent_labels(before: int, attempt: Optional[int] = None) -> List[str]:
@@ -476,12 +478,72 @@ class PermanenceTest(unittest.TestCase):
                          dispatch_reason._LIMITED_CAPACITY)  # noqa: SLF001
         self.assertIn(PERMANENT_NO_BID_DETAIL, LIMITED["detail"])
 
-    def test_FIRES_on_limited_capacity_alone_or_beside_others(self):
-        self.assertTrue(no_bid_is_permanent([LIMITED]))
-        self.assertTrue(no_bid_is_permanent(PERMANENT))
-        self.assertTrue(no_bid_is_permanent([LOW, LIMITED, NO_BID[0]]))
+    def test_FIRES_when_every_robot_considered_has_limited_capacity(self):
         from api_server.models.rmf_api.error import Error
-        self.assertTrue(no_bid_is_permanent([Error(**LIMITED)]))
+        self.assertTrue(no_bid_is_permanent([LIMITED, JUDGED_LIMITED]))
+        self.assertTrue(no_bid_is_permanent(PERMANENT))
+        self.assertTrue(no_bid_is_permanent(
+            [Error(**LIMITED), Error(**JUDGED_LIMITED), Error(**NO_BID[0])]),
+            "the real model, as the state carries it")
+        # a robot that was not commissioned was not considered: named, and
+        # it does not count either way
+        self.assertTrue(no_bid_is_permanent(
+            [LIMITED, judged("limited_capacity", "not_commissioned")]))
+        # two fleets, each refusing and naming its robots
+        self.assertTrue(no_bid_is_permanent(
+            [LIMITED, judged("limited_capacity"), LOW,
+             judged("limited_capacity", fleet="other", first=7), NO_BID[0]]),
+            "every robot of every refusing fleet, whatever each planner said "
+            "of its last one")
+
+    def test_F442_the_planner_s_last_robot_alone_no_longer_decides(self):
+        """THE CONTRACT CHANGED (F-442, D-86 (4)): this used to FIRE on the
+        planner's "insufficient battery capacity" alone. That is the verdict
+        on the robot the planner judged LAST; without the rest named, it
+        cannot convict the mission."""
+        from api_server.models.rmf_api.error import Error
+        for errors in ([LIMITED], [LIMITED, NO_BID[0]], [Error(**LIMITED)],
+                       [LOW, LIMITED, NO_BID[0]]):
+            self.assertFalse(no_bid_is_permanent(errors), errors)
+
+    def test_PASSES_one_robot_that_could_take_it_some_day(self):
+        for verdict in ("low_battery", "feasible", "no_solution", "unknown",
+                        "error", "something new"):
+            errors = [LIMITED, judged("limited_capacity", verdict,
+                                      "limited_capacity"), NO_BID[0]]
+            self.assertFalse(no_bid_is_permanent(errors), verdict)
+
+    def test_PASSES_what_cannot_be_seen_never_convicts(self):
+        unseen = [
+            # nobody considered at all
+            [LIMITED, judged("not_commissioned"), NO_BID[0]],
+            [LIMITED, judged(), NO_BID[0]],
+            # a second fleet refused without naming its robots
+            [LIMITED, LIMITED, JUDGED_LIMITED, NO_BID[0]],
+            # a naming beside an answer that is not a planner refusal
+            [LIMITED, JUDGED_LIMITED, INTERNAL, NO_BID[0]],
+            # a naming that cannot be read
+            [LIMITED, {**JUDGED_LIMITED, "detail": "not json"}],
+            [LIMITED, {**JUDGED_LIMITED, "detail": '{"robots": "x"}'}],
+            [LIMITED, {**JUDGED_LIMITED,
+                       "detail": '{"robots": [{"judgement": "limited_capacity"}]}'}],
+            [LIMITED, {**JUDGED_LIMITED, "detail": None}],
+            # the naming's shape without its category, or under another code
+            [LIMITED, {k: v for k, v in JUDGED_LIMITED.items()
+                       if k != "category"}],
+            [LIMITED, {**JUDGED_LIMITED, "code": 13}],
+        ]
+        for errors in unseen:
+            self.assertFalse(no_bid_is_permanent(errors), errors)
+
+    def test_robot_judgements_read_the_patch_s_detail(self):
+        self.assertEqual(
+            robot_judgements([LIMITED, judged("limited_capacity", "low_battery"),
+                              NO_BID[0]]),
+            [RobotJudgement("gentle_fleet", "gentle_bot_1", "limited_capacity"),
+             RobotJudgement("gentle_fleet", "gentle_bot_2", "low_battery")])
+        self.assertIsNone(robot_judgements([LIMITED, NO_BID[0]]))
+        self.assertIsNone(robot_judgements(None))
 
     def test_PASSES_every_transient_answer(self):
         for errors in ([], None, NO_BID, [LOW, NO_BID[0]],
@@ -959,19 +1021,20 @@ class ReauctionTest(unittest.TestCase):
         self.assertIn("no robot answered the auction (attempt 1)", reason)
         self.assertIn("its request is not stored", reason)
 
-    def test_a_refused_re_auction_is_failed_with_the_refusal(self):
-        class Refusal(Exception):
-            detail = "destination [dock_2] is occupied by parked robot (F-34)"
-
+    def test_F441_only_a_permanent_refusal_fails_a_re_auction(self):
+        """A refusal that says the stored request can never be accepted is
+        the one re-auction refusal that fails the mission, by name. Every
+        other refusal keeps it waiting (F441RefusedRedispatchTest)."""
         async def refuse(_request):
-            raise Refusal()
+            raise Refusal("the dispatcher refuses its stored request as "
+                          "invalid: bad schema", permanent=True)
 
         self.rd._dispatch = refuse      # pylint: disable=protected-access
         self.assertIsNone(self.no_bid("patrol.dispatch-1"))
         self.assertEqual(self.rd.no_bid_abandoned, 1)
-        self.assertEqual(self.rd.reauctioned, 0)
-        self.assertIn("could not be auctioned again: destination [dock_2] "
-                      "is occupied", self.abandoned[0][1])
+        self.assertEqual((self.rd.reauctioned, self.rd.refused), (0, 0))
+        self.assertIn("could not be auctioned again: the dispatcher refuses "
+                      "its stored request as invalid", self.abandoned[0][1])
 
     def test_giving_up_without_a_callback_or_with_a_broken_one_is_safe(self):
         async def load(_task_id):
@@ -1144,7 +1207,7 @@ class SupersedeRealModelTest(unittest.TestCase):
 
     def test_FIRES_a_permanent_answer_is_put_back_while_answers_remain(self):
         state = real_state(labels=permanent_labels(1, 2),
-                           errors=[LIMITED, NO_BID_ERROR])
+                           errors=[LIMITED, JUDGED_LIMITED, NO_BID_ERROR])
         verdict = supersede(state)
         self.assertTrue(verdict.permanent)
         self.assertEqual(state.status, mdl.TaskStatus.canceled)
@@ -1164,7 +1227,7 @@ class SupersedeRealModelTest(unittest.TestCase):
         state = real_state(
             labels=permanent_labels(NO_BID_MAX_ATTEMPTS - 1,
                                     NO_BID_MAX_ATTEMPTS),
-            errors=[LIMITED, NO_BID_ERROR])
+            errors=[LIMITED, JUDGED_LIMITED, NO_BID_ERROR])
         verdict = supersede(state)
         self.assertTrue(verdict.final)
         self.assertEqual(state.status, mdl.TaskStatus.failed)
@@ -1220,6 +1283,248 @@ class SupersedeRealModelTest(unittest.TestCase):
             self.assertFalse(unsupersede(other))
             self.assertEqual(other.model_dump(mode="json"), before)
         self.assertFalse(unsupersede(None))
+
+
+
+class _Timeout(Exception):
+    """What the dispatch path raises when the dispatcher does not answer
+    (rmf_service.py: HTTPException(500, "rmf service timed out"))."""
+    detail = "rmf service timed out"
+
+
+class F441RefusedRedispatchTest(unittest.TestCase):
+    """G close-out ruling 2026-10-01, D-86 (4), F-441: "a refused
+    re-dispatch never drops a mission; it returns to the waiting queue
+    under F-435."
+
+    KNOWN BAD, must act: a re-dispatch refused by a guard (F-34), by the
+    dispatcher not answering, by an answer of no known shape, or by a
+    stored request that cannot be READ keeps the mission waiting — the
+    refusal reported as its reason, the same request sent again on the
+    waiting backoff (one step per refusal, capped at 60 s), forever, on
+    both paths (hand-back and no-bid), until it is placed or an operator
+    withdraws it. Only nothing-re-sendable fails it, by name.
+
+    KNOWN GOOD, must stay quiet: a re-dispatch accepted at once reports no
+    refusal and fails nothing; one the horizon HOLDS (F-293) is accepted,
+    never sent twice; a broken refusal hook cannot stop the retries."""
+
+    def setUp(self):
+        self.requests = {"patrol.dispatch-1": FakeRequest(labels=["x=1"])}
+        self.answers: List[object] = []   # popped per send; then accepted
+        self.sent: List[FakeRequest] = []
+        self.refusals: List[tuple] = []
+        self.abandoned: List[tuple] = []
+        self.held: List[tuple] = []
+        self.slept: List[float] = []
+        self.withdrawn = set()
+
+        async def dispatch(request):
+            self.sent.append(request)
+            if self.answers:
+                answer = self.answers.pop(0)
+                if isinstance(answer, BaseException):
+                    raise answer
+            return f"patrol.dispatch-{100 + len(self.sent)}"
+
+        async def load(task_id):
+            return self.requests.get(task_id)
+
+        async def refused(task_id, why, retry_in_s):
+            self.refusals.append((task_id, why, retry_in_s))
+
+        async def abandon(task_id, reason):
+            self.abandoned.append((task_id, reason))
+
+        async def held(task_id, detail):
+            self.held.append((task_id, detail))
+
+        self.rd = Redispatcher(dispatch, load, logging.getLogger("t"),
+                               abandon=abandon, refused=refused, held=held,
+                               clock=lambda: 5000.0,
+                               wanted=lambda tid: tid not in self.withdrawn)
+
+    async def _sleep(self, seconds):
+        self.slept.append(seconds)
+
+    def run_(self, coro):
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    def hand_back(self, task_id="patrol.dispatch-1", generation=0):
+        labels = ["x=1"] + ([f"{GENERATION_LABEL}{generation}"]
+                            if generation else [])
+        self.requests[task_id] = FakeRequest(labels=labels)
+        return self.run_(self.rd.maybe_redispatch(
+            task_id, "canceled", [REDISPATCH_LABEL, REASON],
+            booking_labels=labels, sleep=self._sleep))
+
+    def no_bid(self, task_id="patrol.dispatch-1"):
+        return self.run_(self.rd.maybe_redispatch(
+            task_id, "failed", None, booking_labels=["x=1"],
+            dispatch_errors=NO_BID, sleep=self._sleep))
+
+    # -- known bad: must act ------------------------------------------------
+
+    def test_FIRES_a_hand_back_refused_by_a_guard_and_a_silent_dispatcher_waits(
+            self):
+        self.answers = [
+            Refusal("destination [j_st2] is occupied by parked robot "
+                    "[gentle_fleet/gentle_bot_10] (F-34); dispatch rejected"),
+            _Timeout(),
+        ]
+        new_id = self.hand_back()
+        self.assertEqual(new_id, "patrol.dispatch-103", "placed at last")
+        self.assertEqual(len(self.sent), 3, "the same request, sent again")
+        self.assertTrue(all(origin_of(r.labels) == "patrol.dispatch-1"
+                            and generation_of(r.labels) == 1
+                            for r in self.sent))
+        self.assertEqual([why for _, why, _ in self.refusals], [
+            "destination [j_st2] is occupied by parked robot "
+            "[gentle_fleet/gentle_bot_10] (F-34); dispatch rejected",
+            "rmf service timed out"])
+        # the waiting backoff: the hand-back's own wait, then one step more
+        # per refusal
+        self.assertEqual(self.slept, [15.0, 15.0, 30.0])
+        self.assertEqual([d for _, _, d in self.refusals], [15.0, 30.0])
+        self.assertEqual(self.abandoned, [], "a refusal never fails a mission")
+        self.assertEqual((self.rd.refused, self.rd.redispatched,
+                          self.rd.hand_back_abandoned), (2, 1, 0))
+
+    def test_FIRES_a_refused_re_auction_waits_and_is_sent_again(self):
+        self.answers = [_Timeout(), _Timeout(),
+                        RuntimeError("dispatcher shutting down")]
+        new_id = self.no_bid()
+        self.assertEqual(new_id, "patrol.dispatch-104")
+        self.assertEqual(self.slept, [NO_BID_BACKOFF_S[0], 15.0, 30.0, 45.0])
+        self.assertEqual([why for _, why, _ in self.refusals], [
+            "rmf service timed out", "rmf service timed out",
+            "dispatcher shutting down"])
+        self.assertTrue(all(no_bid_attempt_of(r.labels) == 2 for r in self.sent),
+                        "a refusal is not another auction")
+        self.assertEqual(self.abandoned, [])
+        self.assertEqual((self.rd.refused, self.rd.reauctioned,
+                          self.rd.no_bid_abandoned), (3, 1, 0))
+
+    def test_FIRES_a_refusal_that_never_clears_is_retried_forever_capped_at_60(
+            self):
+        """No count and no clock stops it (F-435): only an operator."""
+        stop_after = 40
+
+        async def sleep(seconds):
+            self.slept.append(seconds)
+            if len(self.slept) > stop_after:
+                self.withdrawn.add("patrol.dispatch-1")
+
+        self.answers = [Refusal("[j_st2] has no lanes to it right now — a "
+                                "no-go zone has closed every route to that "
+                                "waypoint (F-111)")] * 1000
+        self.requests["patrol.dispatch-1"] = FakeRequest(
+            labels=["x=1", f"{GENERATION_LABEL}2"])
+        self.assertIsNone(self.run_(self.rd.maybe_redispatch(
+            "patrol.dispatch-1", "canceled", [REDISPATCH_LABEL, REASON],
+            booking_labels=["x=1", f"{GENERATION_LABEL}2"], sleep=sleep)))
+        self.assertEqual(len(self.sent), stop_after)
+        self.assertEqual(self.slept[:4], [30.0, 45.0, 60.0, 60.0])
+        self.assertEqual(max(self.slept), HAND_BACK_MAX_BACKOFF_S)
+        self.assertEqual(self.abandoned, [], "F-111 is not permanent (F-435)")
+        self.assertEqual((self.rd.refused, self.rd.withdrawn), (stop_after, 1))
+
+    def test_FIRES_a_stored_request_that_cannot_be_read_is_not_a_missing_one(
+            self):
+        reads = []
+
+        async def load(task_id):
+            reads.append(task_id)
+            if len(reads) == 1:
+                raise RuntimeError("database gone")
+            return self.requests.get(task_id)
+
+        self.rd._load_request = load    # pylint: disable=protected-access
+        self.assertEqual(self.hand_back(), "patrol.dispatch-101")
+        self.assertIn("its stored request could not be read: database gone",
+                      self.refusals[0][1])
+        self.assertEqual(self.abandoned, [])
+
+    def test_FIRES_only_nothing_re_sendable_fails_the_mission_by_name(self):
+        # (1) not stored
+        self.assertIsNone(self.run_(self.rd.maybe_redispatch(
+            "op-send-1", "canceled", [REDISPATCH_LABEL, REASON],
+            sleep=self._sleep)))
+        # (2) the dispatcher refuses the stored request itself
+        self.answers = [Refusal("the dispatcher refuses its stored request "
+                                "as invalid: bad", permanent=True)]
+        self.assertIsNone(self.hand_back())
+        self.assertEqual([t for t, _ in self.abandoned],
+                         ["op-send-1", "patrol.dispatch-1"])
+        self.assertIn("its request is not stored", self.abandoned[0][1])
+        self.assertIn("cannot be sent again: the dispatcher refuses its "
+                      "stored request as invalid", self.abandoned[1][1])
+        self.assertEqual(self.refusals, [], "a permanent answer is not retried")
+        self.assertEqual(self.rd.hand_back_abandoned, 2)
+
+    # -- known good: must stay quiet ----------------------------------------
+
+    def test_PASSES_an_accepted_re_dispatch_reports_no_refusal(self):
+        self.assertEqual(self.hand_back(), "patrol.dispatch-101")
+        self.requests["patrol.dispatch-2"] = FakeRequest(labels=["x=1"])
+        self.assertEqual(self.no_bid("patrol.dispatch-2"), "patrol.dispatch-102")
+        self.assertEqual((self.refusals, self.abandoned, self.held), ([], [], []))
+        self.assertEqual(self.rd.refused, 0)
+
+    def test_PASSES_a_dispatch_held_for_its_start_is_accepted_not_refused(self):
+        self.answers = [Held("deferred-7", "held by GentleFleet (F-293)")]
+        self.assertIsNone(self.hand_back())
+        self.assertEqual(len(self.sent), 1, "held, so never sent twice")
+        self.assertEqual(self.held, [("patrol.dispatch-1",
+                                      "held by GentleFleet (F-293)")])
+        self.assertEqual((self.refusals, self.abandoned), ([], []))
+        self.assertEqual((self.rd.held, self.rd.refused), (1, 0))
+
+    def test_PASSES_a_broken_refusal_hook_cannot_stop_the_retries(self):
+        async def broken(*_args):
+            raise RuntimeError("registry gone")
+
+        self.rd._refused = broken       # pylint: disable=protected-access
+        self.answers = [_Timeout()]
+        self.assertEqual(self.hand_back(), "patrol.dispatch-102")
+
+    def test_the_backoff_is_one_step_per_refusal_capped(self):
+        self.assertEqual([refusal_backoff(k) for k in (1, 2, 3, 4, 9)],
+                         [15.0, 30.0, 45.0, 60.0, 60.0])
+        self.assertEqual(refusal_backoff(1, generation=3), 60.0)
+        self.assertEqual(refusal_backoff(0), 15.0, "garbage reads as the first")
+
+
+class UnmarkHandBackRealModelTest(unittest.TestCase):
+    """F-441: a handed-back attempt that can never be re-sent is recorded
+    as the failure it is — proven on the REAL model (F-343)."""
+
+    def test_FIRES_a_marked_hand_back_becomes_failed_with_its_provenance(self):
+        state = real_state("canceled", labels=["x=1"], dispatch=False,
+                           cancellation=[REDISPATCH_LABEL, REASON,
+                                         f"{REFUSED_LABEL}timed out"])
+        self.assertTrue(unmark_hand_back(state))
+        self.assertEqual(state.status, mdl.TaskStatus.failed)
+        self.assertEqual(state.cancellation.labels,
+                         [REASON, f"{REFUSED_LABEL}timed out"])
+        self.assertIsNone(wants_redispatch(state.status,
+                                           state.cancellation.labels))
+        self.assertFalse(unmark_hand_back(state), "once")
+
+    def test_PASSES_everything_that_is_not_a_marked_hand_back(self):
+        operator = real_state("canceled", dispatch=False,
+                              cancellation=["canceled by admin"])
+        done = real_state("completed", dispatch=False)
+        no_bid = real_state("canceled", cancellation=[REDISPATCH_LABEL, "x"])
+        for state in (operator, done, no_bid):
+            before = state.model_dump()
+            self.assertFalse(unmark_hand_back(state))
+            self.assertEqual(state.model_dump(), before)
+        self.assertFalse(unmark_hand_back(None))
 
 
 if __name__ == "__main__":
