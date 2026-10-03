@@ -340,6 +340,27 @@ class RmfGateway:
         )
         self._subscriptions.append(watch_only_sub)
 
+        # F-469 (G ruling 2026-10-03): every fleet member's OWN pose, from
+        # the adapter — where a robot is while RMF is not being sent its
+        # pose (it cannot place it, D-84) and the fleet state therefore
+        # keeps the last one it accepted. The freshness route serves it
+        # as the pose to draw (own_poses.served_position). Latched at
+        # ~2 Hz by the adapter; this callback only stores.
+        from api_server import own_poses  # noqa: PLC0415
+
+        own_poses_sub = ros_node().create_subscription(
+            RosString,
+            "gf_own_poses",
+            lambda msg: own_poses.on_own_poses(cast(RosString, msg).data),
+            rclpy.qos.QoSProfile(
+                history=rclpy.qos.HistoryPolicy.KEEP_LAST,
+                depth=1,
+                reliability=rclpy.qos.ReliabilityPolicy.RELIABLE,
+                durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL,
+            ),
+        )
+        self._subscriptions.append(own_poses_sub)
+
         # F-386 (D-82): the adapter's CHARGING verdict by battery truth —
         # on its own dock by the LIVE pose and its SoC rising. The
         # dashboard's Charging chip reads this, never the task or the
