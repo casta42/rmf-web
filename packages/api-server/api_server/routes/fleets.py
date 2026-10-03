@@ -127,11 +127,14 @@ def on_fleet_positions(msg, now: Optional[float] = None) -> None:
 def _reset_freshness_for_test() -> None:
     """Test seam: forget every verdict, as a fresh process would."""
     global _watch, _verdict, _at, _motion  # pylint: disable=global-statement
+    from api_server import own_poses  # pylint: disable=import-outside-toplevel
+
     _watch = FreshnessWatch()
     _verdict = None
     _at = None
     _motion = MotionWatch()
     _poses.clear()
+    own_poses._reset_for_test()  # pylint: disable=protected-access
 
 
 def position_is_stale(fleet: str, robot: str) -> bool:
@@ -198,8 +201,22 @@ async def get_position_freshness() -> Dict[str, Any]:
     Never guesses. Before the publish rate has been observed, or with no
     fleet state seen at all, it reports what it does not know instead of
     reporting everything fresh (F-191).
+
+    F-469 (G ruling 2026-10-03): each row also carries `position` — the
+    pose a SURFACE should draw and whether THAT is current. It is the
+    fleet state's pose with the verdict above, except for a robot whose
+    pose the fleet adapter is withholding from RMF (RMF cannot place it)
+    while the robot's own pose is fresh: then it is the robot's own pose,
+    `stale: false`, and the row is marked `placement_withheld` with the
+    reason. `own_poses.served_position` is the one place that is decided.
+
+    The row's own `stale`, `x`, `y`, `map` are UNCHANGED: they are the
+    fleet state's pose and its verdict, which is what every guard and
+    drill pairs with `robot.location` from GET /fleets.
     """
     import time as _t  # pylint: disable=import-outside-toplevel
+
+    from api_server import own_poses  # pylint: disable=import-outside-toplevel
 
     if _verdict is None or _at is None:
         return {
@@ -220,6 +237,17 @@ async def get_position_freshness() -> Dict[str, Any]:
     rows = []
     for entry in _verdict.robots:
         pose = _poses.get(entry.key, {})
+        fleet_stale = bool(entry.stale) or bool(_verdict.feed_frozen)
+        # F-469: where to DRAW it — its own pose while RMF is not being
+        # sent it, the fleet state's otherwise
+        position = own_poses.served_position(
+            pose.get("fleet"),
+            pose.get("robot"),
+            pose,
+            fleet_stale,
+            bool(_verdict.feed_frozen),
+            entry.reason,
+        )
         rows.append(
             {
                 "fleet": pose.get("fleet"),
@@ -228,6 +256,8 @@ async def get_position_freshness() -> Dict[str, Any]:
                 "x": pose.get("x"),
                 "y": pose.get("y"),
                 "map": pose.get("map"),
+                "position": position,
+                "placement_withheld": position["placement_withheld"],
                 "lag_s": round(entry.lag_s, 2),
                 # `stale` is the OPERATOR-facing fault: confirmed, slow to
                 # trip, and what the map draws as unlocated. `judgeable`
@@ -235,7 +265,7 @@ async def get_position_freshness() -> Dict[str, Any]:
                 # — reported for diagnosis, never for display, because a
                 # marker that flickered every time a pose was 0.3 s late
                 # would teach an operator to ignore it.
-                "stale": bool(entry.stale) or bool(_verdict.feed_frozen),
+                "stale": fleet_stale,
                 "judgeable": bool(entry.judgeable) and not _verdict.feed_frozen,
                 "threshold_s": (
                     None if entry.threshold_s is None else round(entry.threshold_s, 2)
@@ -256,5 +286,7 @@ async def get_position_freshness() -> Dict[str, Any]:
         "threshold_s": _verdict.threshold_s,
         "judge_bar_s": _verdict.judge_bar_s,
         "rule": _watch.config(),
+        # F-469: how old a robot's own pose may be and still be drawn
+        "own_pose_max_age_s": own_poses.OWN_DISPLAY_MAX_AGE_S,
         "robots": rows,
     }

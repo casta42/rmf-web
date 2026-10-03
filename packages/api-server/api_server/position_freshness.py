@@ -101,7 +101,19 @@ stamps are all suddenly old — a burst of "stale" that is really one
 hiccup. A robot must therefore lag CONTINUOUSLY for `confirm_s` before
 it is called stale. This is the boring-environment half of the both-ways
 rule: the guard has to pass on a slow machine, not only fire on a ghost.
+
+AND WHEN RMF WILL NOT PLACE A ROBOT, ITS BODY IS STILL THERE (F-469; G
+ruling 2026-10-03). A stale stamp says the FLEET STATE's pose stopped
+being true — not that nobody knows where the robot is. The fleet adapter
+hears every member's odometry whether or not RMF accepts the pose built
+from it, and publishes it on `gf_own_poses`. `OwnPoseFeed` at the bottom
+of this file is the one answer to "may that pose stand in?", for the
+referee and the product alike, and it is the same kind of answer as the
+rest of this module: a pose with its own clock, checked, or nothing.
 """
+
+import json
+import math
 
 # Floors, set from the measurement above and not from taste: 10 s is
 # 2.2x the worst lag a HEALTHY loaded fleet produced and ~40x smaller
@@ -379,3 +391,227 @@ class FreshnessWatch:
         return FreshnessVerdict(robots, stale_keys, unjudgeable,
                                 feed_frozen, frozen_s, self.period_s(),
                                 threshold, judge_bar, clock_reset, newest)
+
+
+# ----------------------------------------------------------------------
+# THE ROBOT'S OWN POSE (F-469; G ruling 2026-10-03: "a robot's body is
+# never invisible. When RMF won't place a robot, the sentinel and every
+# surface use the robot's own reported, freshness-checked pose").
+#
+# The defect: a fleet member resting a hand's width off its lane cannot
+# be placed by RMF, so by D-84 its pose is WITHHELD and the fleet state
+# keeps the last pose RMF accepted, with its old stamp. Every rule above
+# then does the right thing with the wrong consequence — the map shows
+# the robot STALE and the referee skips it — while the robot's odometry
+# is alive and says exactly where it stands. Measured on f1-n70
+# (2026-10-02): gentle_bot_5 withheld for 46 s, 459 reports, at rest
+# 0.9 m from the pose every surface was showing.
+#
+# `gf_own_poses` (std_msgs/String JSON, the fleet adapter, ~2 Hz) lists
+# EVERY member — so "feed alive, robot placed" can be told from "no
+# feed" — with the pose, the age of the odometry sample it came from,
+# the robot interface's own verdict on that age (`stale`), and whether
+# RMF is being told it (`placement`: "placed" | "withheld").
+#
+# TWO BARS HERE TOO, for the same two questions as above:
+#
+#   * MAY I JUDGE A PHYSICAL INVARIANT ON IT? The referee's bar is not
+#     seconds, it is METRES: it refuses to rule on a pose that could be
+#     more than half a footprint (JUDGE_MAX_DRIFT_M) out of date. For a
+#     fleet-state pose nothing says how fast the robot is going, so v_max
+#     is assumed and the bar comes out as 0.3 s — which a 2 Hz feed can
+#     never meet. But this feed SHOWS how fast the robot is going: the
+#     distance between its own consecutive reports. So the same bar is
+#     applied to what is measured: the pose may be judged while the robot
+#     moves no more than JUDGE_MAX_DRIFT_M per feed period (0.3 m/s at
+#     2 Hz) over its last two reports — and a robot the feed has not yet
+#     shown twice is not judged at all.
+#       That is not a corner. A robot RMF cannot place usually stands;
+#     the one of the measurement above drove 1.05 m in the first 3 s of
+#     its withholding (the leg RMF was about to cancel, 0.44 m/s) and
+#     THEN stood for 43 s. Judged on a pose up to 0.6 s old it would have
+#     been drawn a quarter of a metre behind its body while it drove;
+#     skipped for those seconds, as it always was, costs nothing.
+#       And a liveness bar in seconds, for the feed itself: one period,
+#     plus the longest adapter stall the stress bar accepts (1 s, D-85
+#     bar 3), plus the odometry's own age and delivery. It is also the
+#     bar after which the referee already calls a robot it has stopped
+#     hearing "lost".
+#   * MAY THE MAP DRAW IT AS CURRENT? The operator-facing patience — the
+#     same floor below which a fleet-state pose is never called stale —
+#     and no drift bar: a moving marker half a second behind is what
+#     every marker on a 1 Hz map already is.
+#
+# Whatever the bar, a pose the robot interface itself calls stale
+# (odometry silent past its timeout) is never fresh, and a robot the
+# feed does not list, or lists without a pose, is never fresh: absence
+# of evidence is not evidence (F-191). The caller then does what it did
+# before this existed.
+# ----------------------------------------------------------------------
+OWN_JUDGE_MAX_AGE_S = 2.0
+OWN_JUDGE_MAX_DRIFT_M = JUDGE_MAX_DRIFT_M
+OWN_DISPLAY_MAX_AGE_S = STALE_FLOOR_S
+# What the feed says of itself (`period_s`); assumed when it does not.
+OWN_FEED_PERIOD_S = 0.5
+PLACEMENT_PLACED = 'placed'
+PLACEMENT_WITHHELD = 'withheld'
+
+
+def _number(value):
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value))
+
+
+class OwnPose:
+    """One robot's own pose, already judged fresh."""
+
+    __slots__ = ('x', 'y', 'yaw', 'map', 'age_s', 'placement', 'report')
+
+    def __init__(self, x, y, yaw, map_name, age_s, placement, report):
+        self.x = x
+        self.y = y
+        self.yaw = yaw
+        self.map = map_name
+        self.age_s = age_s
+        self.placement = placement
+        self.report = report
+
+    @property
+    def withheld(self):
+        """RMF is NOT being told this pose (it cannot place it)."""
+        return self.placement == PLACEMENT_WITHHELD
+
+
+class OwnPoseFeed:
+    """The latest `gf_own_poses` message per fleet, and its judgment.
+
+    Pure like the rest of this module: callers pass the payload and the
+    clocks they read. `on_message` is safe to call from a ROS callback —
+    it stores, and never raises.
+    """
+
+    def __init__(self):
+        self._latest = {}     # fleet -> (payload, monotonic time received)
+        # (fleet, robot) -> {'at': (x, y, pose_unix), 'speeds': [m/s]}:
+        # the robot's last odometry sample and its speed over its last
+        # two steps, from its own consecutive reports
+        self._motion = {}
+
+    def on_message(self, raw, mono_now):
+        """Keep one payload. Returns the fleet it was for, or None when it
+        is not a usable feed message (and then nothing is kept)."""
+        try:
+            data = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
+        except ValueError:
+            return None
+        if not isinstance(data, dict) or not data.get('fleet'):
+            return None
+        if not isinstance(data.get('robots'), dict) \
+                or not _number(data.get('unix_millis_time')):
+            return None
+        fleet = str(data['fleet'])
+        self._latest[fleet] = (data, float(mono_now))
+        listed = set()
+        for name, entry in data['robots'].items():
+            listed.add((fleet, str(name)))
+            self._track((fleet, str(name)), entry)
+        for key in [k for k in self._motion
+                    if k[0] == fleet and k not in listed]:
+            del self._motion[key]
+        return fleet
+
+    def _track(self, key, entry):
+        """One robot's motion, from its own consecutive odometry samples.
+        A report with no pose forgets what was known (it is not evidence
+        of standing still); the SAME sample reported again teaches
+        nothing and changes nothing."""
+        if not isinstance(entry, dict) or not (
+                _number(entry.get('x')) and _number(entry.get('y'))
+                and _number(entry.get('pose_unix'))):
+            self._motion.pop(key, None)
+            return
+        sample = (float(entry['x']), float(entry['y']),
+                  float(entry['pose_unix']))
+        state = self._motion.get(key)
+        if state is None:
+            self._motion[key] = {'at': sample, 'speeds': []}
+            return
+        x0, y0, t0 = state['at']
+        dt = sample[2] - t0
+        if dt <= 0.0:
+            return
+        speed = math.hypot(sample[0] - x0, sample[1] - y0) / dt
+        state['at'] = sample
+        state['speeds'] = (state['speeds'] + [speed])[-2:]
+
+    def heard(self, fleet):
+        return str(fleet) in self._latest
+
+    def clear(self):
+        self._latest = {}
+        self._motion = {}
+
+    def pose(self, fleet, robot, wall_now, mono_now, max_age_s,
+             max_drift_m=None):
+        """(OwnPose, 'current') when this robot's own pose is fresh
+        enough to use, else (None, why).
+
+        `max_drift_m` is the referee's bar (see TWO BARS above): given,
+        the pose is refused while the robot has moved more than that per
+        feed period over either of its last two reports, and while the
+        feed has not yet shown two steps of it. Left None (the map), a
+        moving robot's pose is as usable as a standing one's.
+
+        The age judged is the age of the ODOMETRY SAMPLE, now: what the
+        adapter measured when it published, plus how old the message has
+        become since. The message's age is read off both clocks and the
+        larger wins — the wall clock catches a latched message from a
+        publisher that has stopped publishing (it is delivered on
+        subscription, however old), the monotonic clock catches a wall
+        clock that stepped — so either one failing reads as OLD, never
+        as fresh.
+        """
+        held = self._latest.get(str(fleet))
+        if held is None:
+            return None, 'no own-pose feed has been heard from this fleet'
+        data, mono_at = held
+        entry = data['robots'].get(str(robot))
+        if not isinstance(entry, dict):
+            return None, 'the own-pose feed does not list this robot'
+        if entry.get('stale') is not False:
+            return None, ("the robot's own odometry is stale"
+                          if entry.get('stale') else
+                          'the robot has not reported a pose')
+        x, y, age = entry.get('x'), entry.get('y'), entry.get('age_s')
+        if not (_number(x) and _number(y) and _number(age)) or age < 0:
+            return None, 'the own-pose entry carries no usable pose'
+        message_age = max(
+            float(wall_now) - float(data['unix_millis_time']) / 1000.0,
+            float(mono_now) - mono_at, 0.0)
+        pose_age = float(age) + message_age
+        if pose_age > float(max_age_s):
+            return None, (f'the own pose is {pose_age:.1f} s old '
+                          f'(bar {float(max_age_s):.1f} s)')
+        if max_drift_m is not None:
+            speeds = (self._motion.get((str(fleet), str(robot)))
+                      or {}).get('speeds') or []
+            if len(speeds) < 2:
+                return None, ('the own-pose feed has not yet shown whether '
+                              'this robot is moving')
+            period = data.get('period_s')
+            if not _number(period) or period <= 0:
+                period = OWN_FEED_PERIOD_S
+            # out of date by the pose's own age, or by the time to the
+            # feed's next report, whichever is more (code review of D-89:
+            # a 2 s old pose of a robot at 0.3 m/s is 0.6 m behind it)
+            drift = max(speeds) * max(float(period), pose_age)
+            if drift > float(max_drift_m):
+                return None, (
+                    f'the robot is moving ({max(speeds):.2f} m/s): its own '
+                    f'pose is up to {drift:.2f} m out of date '
+                    f'(bar {float(max_drift_m):.2f} m)')
+        yaw = entry.get('yaw')
+        return OwnPose(float(x), float(y),
+                       float(yaw) if _number(yaw) else 0.0,
+                       entry.get('map'), pose_age,
+                       entry.get('placement'), entry.get('report')), 'current'
