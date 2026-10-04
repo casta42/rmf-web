@@ -73,7 +73,14 @@ def parked_robot_near(
     # have been here once — and refusing every dispatch to this waypoint
     # on that basis would block a site on a ghost. Same fail-open posture
     # as the rest of this file: no evidence, no objection.
-    from api_server.routes.fleets import position_is_stale  # noqa: PLC0415
+    #
+    # F-469 (D-90 (5), D-91): and the pose it objects on is where the
+    # robot's BODY is — `body_position`, the pose the map draws. A robot
+    # RMF cannot place is rightly stale in the fleet state (the last pose
+    # RMF accepted) and stands somewhere else, on its own fresh report:
+    # the guard used to skip it as unlocated, and a mission could be
+    # dispatched to end on top of it.
+    from api_server.routes.fleets import body_position  # noqa: PLC0415
 
     for fleet in fleet_states:
         if fleet.name is None or not fleet.robots:
@@ -81,11 +88,12 @@ def parked_robot_near(
         for robot_name, robot in fleet.robots.items():
             if f"{fleet.name}/{robot_name}" == exclude:
                 continue
-            if robot.location is None or not _is_parked(robot):
+            if not _is_parked(robot):
                 continue
-            if position_is_stale(str(fleet.name), robot_name):
+            body = body_position(str(fleet.name), robot_name, robot.location)
+            if body is None:
                 continue
-            if math.hypot(robot.location.x - x, robot.location.y - y) <= tolerance:
+            if math.hypot(body["x"] - x, body["y"] - y) <= tolerance:
                 return f"{fleet.name}/{robot_name}"
     return None
 

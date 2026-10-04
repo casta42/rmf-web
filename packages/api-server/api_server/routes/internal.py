@@ -982,40 +982,42 @@ def check_robot_stuck(
     soak, mostly patrols dispatched to the robot's current waypoint that
     finished without any motion). Either way the episode re-arms.
     """
-    if robot.location is None:
-        return None, None
     # F-268: a robot whose position feed has frozen has not moved less
     # than STUCK_MOVE_EPSILON — it has not been SEEN. Judging it stuck
     # would page an operator about an instrument fault dressed as a robot
     # fault; the sentinel and the map already say what is really wrong.
     # The episode is dropped, not paused: when the feed resumes the robot
     # is wherever it actually is, and the clock starts from there.
-    from api_server.routes.fleets import position_is_stale  # noqa: PLC0415
+    #
+    # F-469 (D-90 (5), D-91): the pose judged is where the robot's BODY
+    # is (`body_position`, the pose the map draws): a robot RMF cannot
+    # place is judged on its own fresh report, not dropped as unseen. No
+    # pose that can be vouched for — none at all, or a stale one with no
+    # fresh report of the robot's own — is the unseen robot of F-268.
+    from api_server.routes.fleets import body_position  # noqa: PLC0415
 
     fleet_name, _, robot_name = robot_id.partition("/")
-    if position_is_stale(fleet_name, robot_name):
+    body = body_position(fleet_name, robot_name, robot.location)
+    if body is None:
+        if robot.location is None:
+            return None, None
         state = _stuck_states.pop(robot_id, None)
         resolved = state.alert_id if state is not None else None
         return None, resolved
+    here_x, here_y = float(body["x"]), float(body["y"])
     state = _stuck_states.get(robot_id)
     if state is None:
-        _stuck_states[robot_id] = _StuckState(
-            robot.location.x, robot.location.y, now_millis
-        )
+        _stuck_states[robot_id] = _StuckState(here_x, here_y, now_millis)
         return None, None
-    dist = math.hypot(robot.location.x - state.x, robot.location.y - state.y)
+    dist = math.hypot(here_x - state.x, here_y - state.y)
     if state.alert_id is not None:
         if dist > STUCK_REARM_DISTANCE or not _is_executing_task(robot):
             resolved = state.alert_id
-            _stuck_states[robot_id] = _StuckState(
-                robot.location.x, robot.location.y, now_millis
-            )
+            _stuck_states[robot_id] = _StuckState(here_x, here_y, now_millis)
             return None, resolved
         return None, None
     if dist >= STUCK_MOVE_EPSILON:
-        _stuck_states[robot_id] = _StuckState(
-            robot.location.x, robot.location.y, now_millis
-        )
+        _stuck_states[robot_id] = _StuckState(here_x, here_y, now_millis)
         return None, None
     if not _is_executing_task(robot):
         # an idle or charging robot is expected to be stationary
