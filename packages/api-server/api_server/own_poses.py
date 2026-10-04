@@ -25,13 +25,18 @@ relays that feed and answers the one question a surface asks —
     frozen) -> the fleet state's pose with the F-268 verdict it already
     had. Absence of evidence is not evidence (F-191): today's STALE stays.
 
-What this does NOT change, on purpose: `routes.fleets.position_is_stale`
-and the row's own `stale` still answer "is the FLEET STATE's pose
-current?". Every guard in this process (the dispatch guard, the stuck
-detector, the site-change snapshot) and every drill pairs that verdict
-with `robot.location` from the fleet state — the last ACCEPTED pose,
-which for a withheld robot is still wrong. Telling them "not stale" would
-hand each of them a ghost.
+What this does not change: `routes.fleets.position_is_stale` and the
+row's own `stale` still answer "is the FLEET STATE's pose current?" — the
+drills pair that verdict with `robot.location`.
+
+The guards of this process do NOT read that pair any more (G's ruling on
+D-89, D-90 (5), built under D-91: "a withheld robot's body counts
+everywhere"): the dispatch guard, the stuck detector and the site-change
+snapshot ask `routes.fleets.body_position`, which is `served_position`
+with the fleet state's pose and verdict — the pose drawn is the pose
+decided on. As first built (D-89) they were left on the fleet state's
+pose, which for a withheld robot is the last one RMF accepted: each
+treated the robot as unlocated while the operator saw it drawn.
 
 The freshness judgment itself is `position_freshness.OwnPoseFeed`, the
 file the sentinel referee runs byte for byte: the product and the referee

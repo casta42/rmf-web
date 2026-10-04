@@ -231,6 +231,75 @@ class TestSiteConfigRoutes(AppFixture):
         finally:
             portal.call(lambda: FleetState.filter(name="gentle_fleet").delete())
 
+    def test_validate_plans_around_a_withheld_robot_where_its_body_is(self):
+        """F-469 widened (D-90 (5), D-91), both ways. The fleet state has
+        gentle_bot_5 at the last pose RMF accepted — stale; the robot
+        stands 0.95 m away by its own fresh report. KNOWN BAD (f1-n72):
+        the snapshot said (37.806, 10.3), unjudgeable — the site change
+        was planned around a body it could not count. FIXED: the row is
+        where the body is, judgeable. A stale pose with no report of the
+        robot's own stays unjudgeable at the fleet state's pose."""
+        from api_server import test_body_position as tb
+        from api_server.models.tortoise_models import FleetState
+        from api_server.routes import fleets as fleets_route
+        from api_server.routes.test_internal import _freeze_robot
+
+        portal = self.get_portal()
+        portal.call(
+            lambda: FleetState.update_or_create(
+                {
+                    "data": {
+                        "name": tb.FLEET,
+                        "robots": {
+                            tb.BOT: {"location": {"x": tb.GHOST[0], "y": tb.GHOST[1]}}
+                        },
+                    }
+                },
+                name=tb.FLEET,
+            )
+        )
+
+        def snapshot():
+            calls = []
+            fake = _fake_async_client(calls, _FakeResponse(json_body={"ok": True}))
+            with unittest.mock.patch(
+                "api_server.routes.site_config.httpx.AsyncClient", fake
+            ):
+                resp = self.client.post(
+                    "/site_config/validate",
+                    json={"base_commit": "abc", "zones": {}},
+                )
+            self.assertEqual(200, resp.status_code, resp.content)
+            rows = calls[0][2]["json"]["robot_positions"]
+            return next(r for r in rows if r["name"] == tb.BOT)
+
+        try:
+            _freeze_robot(tb.FLEET, tb.BOT)  # known bad: no own report
+            self.assertEqual(
+                {
+                    "name": tb.BOT,
+                    "x": tb.GHOST[0],
+                    "y": tb.GHOST[1],
+                    "parked": True,
+                    "unjudgeable": True,
+                },
+                snapshot(),
+            )
+            tb.own_feed()  # the robot's own fresh report, withheld
+            self.assertEqual(
+                {
+                    "name": tb.BOT,
+                    "x": tb.BODY[0],
+                    "y": tb.BODY[1],
+                    "parked": True,
+                    "unjudgeable": False,
+                },
+                snapshot(),
+            )
+        finally:
+            fleets_route._reset_freshness_for_test()
+            portal.call(lambda: FleetState.filter(name=tb.FLEET).delete())
+
     def test_validate_blocks_retiring_a_destination_a_template_uses(self):
         # FR-32/D-22: the sidecar says what would be retired; this layer
         # knows what still dispatches to it and turns that into a

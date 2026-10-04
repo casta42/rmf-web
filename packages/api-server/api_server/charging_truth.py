@@ -14,6 +14,17 @@ This module only relays it. Per robot: `charging` (true / false / null =
 cannot tell), `docked`, `moving` (both by the live pose; null = no pose),
 and `why`. A feed older than MAX_AGE_S is not an answer: the route says so
 and every robot is "cannot tell" — never "charging" (F-191).
+
+F-483 (G ruling 2026-10-03, D-90/D-91): the same feed carries the robot's
+REAL battery reading. While a robot is excluded from task allocation (a
+fault, F-42; RMF cannot place it, F-411) the fleet state's `battery` is a
+spoofed 0.0 — a planner device, which reached the dashboard as "Battery
+0 %" in red beside a robot at 60 %. Per robot: `battery` (the reading,
+0..1; null = the fleet has none — "unknown", never a guess) and
+`battery_spoofed` (true while the fleet state is carrying the device;
+null when an older fleet adapter does not say). The battery readouts show
+`battery`, or "unknown" — never the fleet state's number while it is
+spoofed.
 """
 
 import json
@@ -45,6 +56,16 @@ def on_charging(raw: str, now: Optional[float] = None) -> None:
 
 def _reset_for_test() -> None:
     _latest.clear()
+
+
+def _battery(value: Any) -> Optional[float]:
+    """F-483: a state of charge, or None. Anything that is not a number in
+    0..1 is "unknown" — a reading is never invented."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value != value or value < 0.0 or value > 1.0:  # NaN, out of range
+        return None
+    return round(float(value), 4)
 
 
 def snapshot(now: Optional[float] = None) -> Dict[str, Any]:
@@ -86,6 +107,12 @@ def snapshot(now: Optional[float] = None) -> Dict[str, Any]:
                         else None
                     ),
                     "why": str(row.get("why") or ""),
+                    "battery": _battery(row.get("soc")),
+                    "battery_spoofed": (
+                        row.get("soc_published") == "spoofed"
+                        if row.get("soc_published") in ("spoofed", "real")
+                        else None
+                    ),
                 }
             )
     if stale and not rows:

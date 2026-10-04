@@ -98,7 +98,14 @@ async def robot_positions() -> List[Dict[str, Any]]:
     # accepted pose forever. Each row carries the one freshness verdict
     # the api-server already holds, so the planner can refuse a robot it
     # cannot locate instead of evacuating a ghost — or missing one.
-    from api_server.routes.fleets import position_is_stale  # noqa: PLC0415
+    #
+    # F-469 (D-90 (5), D-91): the row is where the robot's BODY is
+    # (`body_position`, the pose the map draws). A robot RMF cannot place
+    # is stale in the fleet state and stands elsewhere on its own fresh
+    # report: it is planned around THERE, judgeable. Only a robot with no
+    # pose that can be vouched for stays `unjudgeable`, at the fleet
+    # state's pose, as before.
+    from api_server.routes.fleets import body_position  # noqa: PLC0415
 
     out: List[Dict[str, Any]] = []
     for row in await DbFleetState.all():
@@ -106,8 +113,9 @@ async def robot_positions() -> List[Dict[str, Any]]:
         fleet_name = str(row.name)
         for name, robot in (state.get("robots") or {}).items():
             location = (robot or {}).get("location") or {}
-            x = location.get("x")
-            y = location.get("y")
+            body = body_position(fleet_name, str(name), location)
+            x = location.get("x") if body is None else body["x"]
+            y = location.get("y") if body is None else body["y"]
             if x is None or y is None:
                 continue
             out.append(
@@ -116,7 +124,7 @@ async def robot_positions() -> List[Dict[str, Any]]:
                     "x": float(x),
                     "y": float(y),
                     "parked": str(name) not in busy,
-                    "unjudgeable": position_is_stale(fleet_name, str(name)),
+                    "unjudgeable": body is None,
                 }
             )
     # FR-42 (k): the robots the fleet may NOT command are bodies too. They

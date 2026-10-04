@@ -147,16 +147,82 @@ def position_is_stale(fleet: str, robot: str) -> bool:
     always did rather than inventing a fault (F-191). Callers that must
     fail closed should check `get_position_freshness()['available']`.
 
-    This is the ONE predicate for every consumer in this process — the
-    stuck detector, the dispatch guard, anything added later. Each of
-    them read `robot.location` and trusted it, which on a frozen feed
-    produced a phantom stuck robot and a phantom obstruction in turn.
+    This is the ONE predicate about the FLEET STATE's pose for every
+    consumer in this process. A guard that needs to know where the robot's
+    BODY is asks `body_position` (below), which pairs this verdict with
+    the pose and lets the robot's own, freshness-checked pose stand in
+    while RMF cannot place it (F-469, D-90 (5)) — the stuck detector, the
+    dispatch guard, the site-change snapshot, anything added later. Each
+    of them once read `robot.location` and trusted it, which on a frozen
+    feed produced a phantom stuck robot and a phantom obstruction in turn.
     """
     if _verdict is None:
         return False
     if _verdict.feed_frozen:
         return True
     return f"{fleet}/{robot}" in _verdict.stale_keys
+
+
+def body_position(
+    fleet: str,
+    robot: str,
+    location: Any,
+    wall_now: Optional[float] = None,
+    mono_now: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    """F-469 (G's ruling on D-89, 2026-10-03, D-90 (5); built under D-91):
+    WHERE IS THIS ROBOT'S BODY, for a decision of this process — the same
+    answer the map draws, from the one place that decides it
+    (`own_poses.served_position`).
+
+        "a withheld robot's body counts everywhere, so the dispatch guard
+        (F-34), the stuck detector and the site-change snapshot use the
+        same freshness-checked own pose the dashboard draws."
+
+    The split this closes: every guard paired `position_is_stale` with
+    `robot.location`, the fleet state's pose. For a robot RMF cannot place
+    that pose is the last one RMF accepted — wrong, and rightly STALE — so
+    each guard treated the robot as unlocated while the operator saw it
+    drawn where it stood: a mission could be dispatched to end ON it, and
+    a site change planned around a body it did not count.
+
+    `location` is the fleet state's pose for the robot (an object or a
+    dict with x / y / yaw / map, or None). Returns the pose a decision may
+    rest on — `x`, `y`, `yaw`, `map`, `source` ("fleet_state" or "robot")
+    and `placement_withheld` — or None when no pose can be vouched for:
+    the fleet state's is stale (or the whole feed frozen) and the robot's
+    own is not fresh, or there is no pose at all. None is "cannot locate":
+    every caller keeps the fail-open or fail-closed posture it had for a
+    stale pose (F-191, F-268).
+    """
+    from api_server import own_poses  # pylint: disable=import-outside-toplevel
+
+    def read(name: str) -> Any:
+        if location is None:
+            return None
+        if isinstance(location, dict):
+            return location.get(name)
+        return getattr(location, name, None)
+
+    fleet_pose = {
+        "x": read("x"),
+        "y": read("y"),
+        "yaw": read("yaw"),
+        "map": read("map") if read("map") is not None else read("level_name"),
+    }
+    served = own_poses.served_position(
+        fleet,
+        robot,
+        fleet_pose,
+        position_is_stale(fleet, robot),
+        bool(_verdict is not None and _verdict.feed_frozen),
+        None,
+        wall_now=wall_now,
+        mono_now=mono_now,
+    )
+    if served["stale"] or served.get("x") is None or served.get("y") is None:
+        return None
+    return served
 
 
 def robot_motion(robot: str, fleet: Optional[str] = None) -> Motion:
@@ -211,8 +277,10 @@ async def get_position_freshness() -> Dict[str, Any]:
     reason. `own_poses.served_position` is the one place that is decided.
 
     The row's own `stale`, `x`, `y`, `map` are UNCHANGED: they are the
-    fleet state's pose and its verdict, which is what every guard and
-    drill pairs with `robot.location` from GET /fleets.
+    fleet state's pose and its verdict, which is what every drill pairs
+    with `robot.location` from GET /fleets. The guards of this process do
+    not read them: they ask `body_position`, the same answer as
+    `position` here (D-90 (5), D-91).
     """
     import time as _t  # pylint: disable=import-outside-toplevel
 
