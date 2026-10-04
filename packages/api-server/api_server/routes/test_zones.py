@@ -228,6 +228,121 @@ class TestMutexStateRoute(AppFixture):
         self.zones_route.on_zone_states("{not json")
         self.assertEqual(503, self.client.get("/zones/mutex_state").status_code)
 
+    # -- FR-43 / FR-45 (D-91): the corridors and the congestion signal --
+    QUEUED = {
+        "id": "corridor j_w3-j_e3",
+        "kind": "through",
+        "length_m": 33.6,
+        "polyline": [[10.2, 29.0], [43.8, 29.0]],
+        "state": "queued",
+        "direction": "+",
+        "toward": [43.8, 29.0],
+        "occupants": [
+            {"robot": "gentle_bot_3", "direction": "+", "entered": True, "held_s": 12.0}
+        ],
+        "waiters": [
+            {
+                "robot": "gentle_bot_5",
+                "direction": "-",
+                "mouth": [43.8, 29.0],
+                "waiting_s": 42.0,
+            }
+        ],
+        "bodies_inside": ["gentle_bot_3"],
+        "expected_wait_s": {"+": 0.0, "-": 75.0},
+        "bays": [
+            {"mouth": [43.8, 29.0], "at": [45.2, 30.1], "occupant": "gentle_bot_5"}
+        ],
+    }
+    SUMMARY = {
+        "waiting": 1,
+        "longest_wait_s": 42.0,
+        "congested": [],
+        "reservations": "on",
+    }
+
+    def _report_roads(self, corridors, congestion):
+        import json
+        import time
+
+        self.zones_route.on_zone_states(
+            json.dumps(
+                {
+                    "fleet": "gentle_fleet",
+                    "zones": [self.HELD],
+                    "corridors": corridors,
+                    "congestion": congestion,
+                }
+            )
+        )
+        self.zones_route._zone_states_at = time.monotonic()
+
+    def test_serves_the_corridors_and_the_congestion_summary(self):
+        """What the adapter reported is what the operator is served: the
+        corridor's state, the direction held, who is in it, who waits at
+        which mouth, its bay — and the site's summary."""
+        self._report_roads([self.QUEUED], self.SUMMARY)
+        resp = self.client.get("/zones/mutex_state")
+        self.assertEqual(200, resp.status_code, resp.content)
+        body = resp.json()
+        self.assertEqual([self.QUEUED], body["corridors"])
+        self.assertEqual(self.SUMMARY, body["congestion"])
+        # the FR-9d facts are still beside them, untouched
+        self.assertEqual("gentle_bot_3", body["zones"][0]["holder"])
+
+    def test_an_older_adapter_serves_no_corridors_and_no_summary(self):
+        """The boring side: a fleet adapter that predates FR-43 sends
+        neither key. The answer is "not reported" — an empty list and
+        null, never a list of free corridors and never a summary of zero
+        waits (F-191) — and the zones are served as before."""
+        self._report(self.HELD)
+        resp = self.client.get("/zones/mutex_state")
+        self.assertEqual(200, resp.status_code, resp.content)
+        body = resp.json()
+        self.assertEqual([], body["corridors"])
+        self.assertIsNone(body["congestion"])
+        self.assertEqual("gentle_bot_3", body["zones"][0]["holder"])
+
+    def test_a_stale_report_serves_no_corridors_either(self):
+        """Same staleness rule as the zones: a queue reported a minute
+        ago is not a queue anybody can vouch for now."""
+        import time
+
+        self._report_roads([self.QUEUED], self.SUMMARY)
+        self.zones_route._zone_states_at = time.monotonic() - 60.0
+        resp = self.client.get("/zones/mutex_state")
+        self.assertEqual(503, resp.status_code)
+        self.assertIn("stale", resp.json()["detail"])
+        self.assertNotIn("corridors", resp.json())
+
+    def test_keys_of_the_wrong_shape_are_not_relayed(self):
+        """A report whose corridors are not a list, or whose summary is
+        not an object, is "not reported" — the route never hands the
+        dashboard a shape it would have to guess at."""
+        self._report_roads({"corridor j_w3-j_e3": "queued"}, ["on"])
+        body = self.client.get("/zones/mutex_state").json()
+        self.assertEqual([], body["corridors"])
+        self.assertIsNone(body["congestion"])
+
+    def test_reservations_off_is_served_as_off(self):
+        """The measurement switch (GF_CORRIDOR_RESERVATIONS=off) is a
+        fact the operator must be able to see: served as reported."""
+        off = dict(self.SUMMARY, waiting=0, longest_wait_s=0.0, reservations="off")
+        self._report_roads([], off)
+        body = self.client.get("/zones/mutex_state").json()
+        self.assertEqual([], body["corridors"])
+        self.assertEqual("off", body["congestion"]["reservations"])
+
+    def test_reading_the_corridors_is_not_admin_only(self):
+        self._report_roads([self.QUEUED], self.SUMMARY)
+        self.client.set_user("operator1")
+        try:
+            resp = self.client.get("/zones/mutex_state")
+            self.assertEqual(200, resp.status_code)
+            self.assertEqual("queued", resp.json()["corridors"][0]["state"])
+        finally:
+            self.client.set_user("admin")
+
     # -- the release ---------------------------------------------------
     def test_release_publishes_the_command_with_actor_and_reason(self):
         import json

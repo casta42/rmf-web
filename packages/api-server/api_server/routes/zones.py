@@ -218,13 +218,27 @@ def _fresh_zone_states() -> Dict[str, Any]:
 async def get_mutex_state() -> Dict[str, Any]:
     """Live FR-9 mutex-zone occupancy: per zone the holder, how long it
     has held, who is queued behind it, and which robot bodies are
-    physically inside the polygon."""
+    physically inside the polygon.
+
+    FR-43 / FR-45 (D-91): the same report carries the reserved single-lane
+    corridors — per corridor its state (free, in_use, queued, congested),
+    the direction held, who is in it, who waits at which mouth and for how
+    long, and its waiting bays — and the site's congestion summary. Both
+    are relayed exactly as the adapter reported them, under the same
+    staleness rule as the zones: this route re-derives nothing (one
+    ledger, one answer). A fleet adapter that predates them sends neither
+    key; the answer is then an empty list and null — "not reported",
+    which no surface may draw as "free" (F-191)."""
     state = _fresh_zone_states()
+    corridors = state.get("corridors")
+    congestion = state.get("congestion")
     return {
         "fleet": state.get("fleet"),
         "unix_millis_time": state.get("unix_millis_time"),
         "age_s": round(_time.monotonic() - (_zone_states_at or 0.0), 1),
         "zones": state.get("zones") or [],
+        "corridors": corridors if isinstance(corridors, list) else [],
+        "congestion": congestion if isinstance(congestion, dict) else None,
     }
 
 
