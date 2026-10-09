@@ -228,6 +228,24 @@ class RmfGateway:
         )
         self._subscriptions.append(zone_states_sub)
 
+        # FR-47 (P5's surface): the traffic controller's reason table,
+        # published after each tick while FR-46's controller runs. Latched
+        # like gf_zone_states, so a restarted api-server answers at once.
+        from api_server.routes.zones import on_traffic_state  # noqa: PLC0415
+
+        traffic_state_sub = ros_node().create_subscription(
+            RosString,
+            "gf_traffic_state",
+            lambda msg: on_traffic_state(cast(RosString, msg).data),
+            rclpy.qos.QoSProfile(
+                history=rclpy.qos.HistoryPolicy.KEEP_LAST,
+                depth=1,
+                reliability=rclpy.qos.ReliabilityPolicy.RELIABLE,
+                durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL,
+            ),
+        )
+        self._subscriptions.append(traffic_state_sub)
+
         # F-268: the per-robot position CLOCK. `location.t` exists only
         # on the ROS message — the RMF API fleet state carries a single
         # fleet-wide `unix_millis_time`, identical for every robot, which
