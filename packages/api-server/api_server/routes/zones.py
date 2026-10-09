@@ -242,6 +242,78 @@ async def get_mutex_state() -> Dict[str, Any]:
     }
 
 
+# FR-47 (P5's surface, TRAFFIC_CONTROLLER_DESIGN.md §f): the traffic
+# controller's reason table, as the fleet adapter publishes it after each
+# 0.5 s tick on gf_traffic_state (FR-46, only while the controller runs).
+# The same staleness rule as the zones: an old or absent report is
+# "unknown", never "no robot is waiting" (F-191).
+TRAFFIC_STATE_MAX_AGE = 10.0  # s
+
+_traffic_state: Dict[str, Any] = {}
+_traffic_state_at: Optional[float] = None
+
+
+def on_traffic_state(payload: str) -> None:
+    """Called from the ros gateway subscription (gf_traffic_state)."""
+    global _traffic_state, _traffic_state_at  # pylint: disable=global-statement
+    try:
+        data = json.loads(payload)
+    except ValueError:
+        logger.warning("gf_traffic_state: undecodable payload")
+        return
+    if not isinstance(data, dict) or not isinstance(data.get("robots"), dict):
+        return
+    _traffic_state = data
+    _traffic_state_at = _time.monotonic()
+
+
+@router.get("/traffic_state")
+async def get_traffic_state() -> Dict[str, Any]:
+    """FR-47: every robot's one reason, from the traffic controller (FR-46)
+    — e.g. "waiting for junction j_e2 — gentle_bot_8 is crossing" — with
+    the robots it names and whether it is faulted. Relayed exactly as the
+    adapter reported it; this route derives nothing. With the controller
+    off (as the product ships) nothing reports, and the answer is 503
+    "unknown", never an empty table."""
+    if _traffic_state_at is None:
+        raise HTTPException(
+            503,
+            "the traffic controller has not reported — it is off (as the "
+            "product ships) or not started; the robots' reasons are unknown",
+        )
+    age = _time.monotonic() - _traffic_state_at
+    if age > TRAFFIC_STATE_MAX_AGE:
+        raise HTTPException(
+            503,
+            f"the traffic controller's report is {age:.0f}s stale — the fleet "
+            "adapter is not reporting; the robots' reasons are unknown",
+        )
+    robots = {}
+    for name, r in sorted(_traffic_state["robots"].items()):
+        if not isinstance(r, dict):
+            continue
+        reason = r.get("reason")
+        robots[name] = {
+            "reason": reason[0] if isinstance(reason, list) and reason else None,
+            "text": r.get("text"),
+            "robots": (
+                list(reason[2])
+                if isinstance(reason, list)
+                and len(reason) > 2
+                and isinstance(reason[2], list)
+                else []
+            ),
+            "faulted": bool(r.get("faulted")),
+            "moving": bool(r.get("moving")),
+        }
+    return {
+        "fleet": _traffic_state.get("fleet"),
+        "unix_millis_time": _traffic_state.get("unix_millis_time"),
+        "age_s": round(age, 1),
+        "robots": robots,
+    }
+
+
 class MutexReleaseBody(BaseModel):
     reason: str
 

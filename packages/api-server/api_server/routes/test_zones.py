@@ -427,6 +427,96 @@ class TestMutexStateRoute(AppFixture):
             self.client.set_user("admin")
 
 
+class TestTrafficStateRoute(AppFixture):
+    """FR-47 (P5's surface) — the traffic controller's reason table, relayed.
+
+    Proven both ways: a held robot's reason, the robot it names and the
+    operator's sentence are served as the adapter reported them; with no
+    report (the controller off, as the product ships), a stale one, or one
+    that is not a table, the answer is 503 "unknown" — never an empty
+    table that reads as "nobody waits" (F-191).
+    """
+
+    def setUp(self):
+        super().setUp()
+        from api_server.routes import zones as zones_route
+
+        self.zones_route = zones_route
+        zones_route._traffic_state = {}
+        zones_route._traffic_state_at = None
+
+    def tearDown(self):
+        self.zones_route._traffic_state = {}
+        self.zones_route._traffic_state_at = None
+        super().tearDown()
+
+    HELD = {
+        "fleet": "gentle_fleet",
+        "unix_millis_time": 1,
+        "tick": 7,
+        "robots": {
+            "gentle_bot_2": {
+                "route": [1, 2, 3],
+                "s": 2.0,
+                "authority": 2.0,
+                "wait": ["cell", 12, ["gentle_bot_8"]],
+                "reason": ["cell", 12, ["gentle_bot_8"]],
+                "text": "waiting for junction j_e2 — gentle_bot_8 is on it",
+                "faulted": False,
+                "moving": False,
+            },
+            "gentle_bot_8": {
+                "route": [3, 4],
+                "s": 0.5,
+                "authority": 4.0,
+                "wait": None,
+                "reason": None,
+                "text": None,
+                "faulted": False,
+                "moving": True,
+            },
+        },
+    }
+
+    def test_serves_each_robots_reason_and_whom_it_names(self):
+        import json
+
+        self.zones_route.on_traffic_state(json.dumps(self.HELD))
+        resp = self.client.get("/zones/traffic_state")
+        self.assertEqual(200, resp.status_code, resp.content)
+        robots = resp.json()["robots"]
+        held = robots["gentle_bot_2"]
+        self.assertEqual("cell", held["reason"])
+        self.assertEqual(["gentle_bot_8"], held["robots"])
+        self.assertIn("gentle_bot_8", held["text"])
+        moving = robots["gentle_bot_8"]
+        self.assertIsNone(moving["reason"])
+        self.assertEqual([], moving["robots"])
+        self.assertTrue(moving["moving"])
+
+    def test_503_when_the_controller_never_reported(self):
+        resp = self.client.get("/zones/traffic_state")
+        self.assertEqual(503, resp.status_code)
+        self.assertIn("unknown", resp.json()["detail"])
+
+    def test_503_when_the_report_is_stale(self):
+        import json
+        import time
+
+        self.zones_route.on_traffic_state(json.dumps(self.HELD))
+        self.zones_route._traffic_state_at = time.monotonic() - 60.0
+        resp = self.client.get("/zones/traffic_state")
+        self.assertEqual(503, resp.status_code)
+        self.assertIn("stale", resp.json()["detail"])
+
+    def test_a_report_that_is_not_a_table_is_not_believed(self):
+        self.zones_route.on_traffic_state("{not json")
+        self.zones_route.on_traffic_state('{"robots": []}')
+        self.zones_route.on_traffic_state("[]")
+        resp = self.client.get("/zones/traffic_state")
+        self.assertEqual(503, resp.status_code)
+
+
 class _FakePub:
     def __init__(self, sink):
         self.sink = sink
