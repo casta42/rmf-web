@@ -451,10 +451,11 @@ class FreshnessWatch:
 OWN_JUDGE_MAX_AGE_S = 2.0
 OWN_JUDGE_MAX_DRIFT_M = JUDGE_MAX_DRIFT_M
 OWN_DISPLAY_MAX_AGE_S = STALE_FLOOR_S
-# What the feed says of itself (`period_s`); assumed when it does not.
-# 0.1 s since F-608 (D-111 (5)): the referee judges every robot on this
-# feed, so it is published as often as the fleet state is.
-OWN_FEED_PERIOD_S = 0.1
+# What the feed says of itself (`period_s`); assumed when it does not —
+# the old 2 Hz cadence, the stricter side of the drift bar: a recording or
+# an older adapter that does not say is never read as faster than it was.
+# (F-608, D-111 (5): the adapter now publishes at 0.1 s and says so.)
+OWN_FEED_PERIOD_S = 0.5
 PLACEMENT_PLACED = 'placed'
 PLACEMENT_WITHHELD = 'withheld'
 
