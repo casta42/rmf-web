@@ -452,7 +452,9 @@ OWN_JUDGE_MAX_AGE_S = 2.0
 OWN_JUDGE_MAX_DRIFT_M = JUDGE_MAX_DRIFT_M
 OWN_DISPLAY_MAX_AGE_S = STALE_FLOOR_S
 # What the feed says of itself (`period_s`); assumed when it does not.
-OWN_FEED_PERIOD_S = 0.5
+# 0.1 s since F-608 (D-111 (5)): the referee judges every robot on this
+# feed, so it is published as often as the fleet state is.
+OWN_FEED_PERIOD_S = 0.1
 PLACEMENT_PLACED = 'placed'
 PLACEMENT_WITHHELD = 'withheld'
 
@@ -546,6 +548,15 @@ class OwnPoseFeed:
 
     def heard(self, fleet):
         return str(fleet) in self._latest
+
+    def period(self, fleet):
+        """The feed's own publish period (`period_s`), or the assumed
+        one when it does not say or nothing was heard (F-608: one term of
+        the record check's allowance)."""
+        held = self._latest.get(str(fleet))
+        period = None if held is None else held[0].get('period_s')
+        return float(period) if _number(period) and period > 0 \
+            else OWN_FEED_PERIOD_S
 
     def clear(self):
         self._latest = {}
