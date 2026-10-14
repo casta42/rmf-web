@@ -68,6 +68,25 @@ def _battery(value: Any) -> Optional[float]:
     return round(float(value), 4)
 
 
+def docked(fleet: str, robot: str, now: Optional[float] = None) -> Optional[bool]:
+    """F-604 (D-111 (3)): is this robot standing on its OWN charger, by the
+    fleet adapter's live-pose verdict? None = cannot tell (no verdict from
+    the fleet, a feed older than MAX_AGE_S, or the robot not in it) — never
+    a guess either way (F-191)."""
+    now = time.monotonic() if now is None else now
+    entry = _latest.get(str(fleet))
+    if entry is None:
+        return None
+    data, at = entry
+    if now - at > MAX_AGE_S:
+        return None
+    row = (data.get("robots") or {}).get(str(robot))
+    if not isinstance(row, dict):
+        return None
+    value = row.get("docked")
+    return value if isinstance(value, bool) else None
+
+
 def snapshot(now: Optional[float] = None) -> Dict[str, Any]:
     """Every fleet's verdicts, or why there are none."""
     now = time.monotonic() if now is None else now

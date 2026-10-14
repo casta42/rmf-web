@@ -966,6 +966,30 @@ def _is_executing_task(robot: mdl.RobotState) -> bool:
     )
 
 
+# F-604 (D-111 (3)): the fleet's own charge tasks — RMF's automatic
+# ChargeBattery and the fleet adapter's own trips home (the trips-home half
+# of the adapter's charge_governor.HOMEBOUND_PREFIXES).
+OWN_CHARGE_TASK_PREFIXES = ("Charge", "f36-", "fr36-", "f87-")
+
+
+def _charging_on_own_charger(robot_id: str, robot: mdl.RobotState) -> bool:
+    """F-604 (D-111 (3)): a robot on the fleet's own charge task whose body
+    stands on its OWN charger by the fleet adapter's live-pose verdict
+    (`gf_charging`'s `docked`, F-386). RMF reports a robot charging inside
+    a Charge task as `working`, so the `charging` status exception below
+    never applied and every auto-charge of 60 s paged the operator (D-109
+    w1: all 18 of its alerts). A robot on a charge task AWAY from its
+    charger (F-331's gentle_bot_1, 5.9 m off it) is not this; neither is a
+    robot on a mission; and a verdict the fleet cannot give is no excuse."""
+    task = str(getattr(robot.task_id, "root", robot.task_id) or "")
+    if not task.startswith(OWN_CHARGE_TASK_PREFIXES):
+        return False
+    from api_server import charging_truth  # noqa: PLC0415
+
+    fleet, _, name = robot_id.partition("/")
+    return charging_truth.docked(fleet, name) is True
+
+
 def check_robot_stuck(
     robot_id: str, robot: mdl.RobotState, now_millis: int
 ) -> Tuple[Optional[str], Optional[str]]:
@@ -1011,7 +1035,11 @@ def check_robot_stuck(
         return None, None
     dist = math.hypot(here_x - state.x, here_y - state.y)
     if state.alert_id is not None:
-        if dist > STUCK_REARM_DISTANCE or not _is_executing_task(robot):
+        if (
+            dist > STUCK_REARM_DISTANCE
+            or not _is_executing_task(robot)
+            or _charging_on_own_charger(robot_id, robot)
+        ):
             resolved = state.alert_id
             _stuck_states[robot_id] = _StuckState(here_x, here_y, now_millis)
             return None, resolved
@@ -1019,8 +1047,10 @@ def check_robot_stuck(
     if dist >= STUCK_MOVE_EPSILON:
         _stuck_states[robot_id] = _StuckState(here_x, here_y, now_millis)
         return None, None
-    if not _is_executing_task(robot):
-        # an idle or charging robot is expected to be stationary
+    if not _is_executing_task(robot) or _charging_on_own_charger(robot_id, robot):
+        # an idle or charging robot is expected to be stationary — and so is
+        # one charging on its own charger under the fleet's charge task
+        # (F-604)
         state.since_millis = now_millis
         return None, None
     if now_millis - state.since_millis >= app_config.stuck_timeout * 1000:

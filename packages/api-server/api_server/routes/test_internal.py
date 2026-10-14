@@ -771,3 +771,87 @@ class TestFleetStateCadenceWiring(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.emitted), 3)  # 500.0, 501.0, 502.0
         self.assertEqual(self.repo.saved, 3)
         self.assertEqual(len(self.heartbeats), 3)
+
+
+class TestF604ChargingOnItsOwnChargerIsNotStuck(unittest.TestCase):
+    """F-604 (D-111 (3)), both ways: a robot charging on its own charger
+    under the fleet's charge task raises no stall alert; a robot really
+    stuck still does — the drill's frozen robot on a patrol, and a robot
+    on a charge task AWAY from its charger (F-331's shape)."""
+
+    def setUp(self):
+        from api_server import charging_truth
+        from api_server.routes import fleets as fleets_route
+
+        _stuck_states.clear()
+        charging_truth._reset_for_test()
+        fleets_route._reset_freshness_for_test()
+        self.timeout_millis = round(app_config.stuck_timeout * 1000)
+
+    def tearDown(self):
+        from api_server import charging_truth
+
+        charging_truth._reset_for_test()
+
+    @staticmethod
+    def _verdict(docked):
+        import json
+
+        from api_server import charging_truth
+
+        charging_truth.on_charging(
+            json.dumps(
+                {
+                    "fleet": "test_fleet",
+                    "robots": {
+                        "test_robot": {
+                            "charging": bool(docked),
+                            "docked": docked,
+                            "moving": False,
+                            "soc": 0.4,
+                            "soc_published": "real",
+                        }
+                    },
+                }
+            )
+        )
+
+    def _pages(self, task_id):
+        state = make_robot_state(task_id=task_id, status=RobotStatus.working)
+        check_robot_stuck(ROBOT_ID, state, 0)
+        new_id, _ = check_robot_stuck(ROBOT_ID, state, self.timeout_millis * 3)
+        return new_id
+
+    def test_FIRES_before_an_auto_charge_on_its_own_dock_paged_the_operator(self):
+        # D-109 w1: RMF's own ChargeBattery, status `working`, on the dock
+        self._verdict(docked=True)
+        self.assertIsNone(self._pages("Charge6c7211"))
+        self.assertIsNone(self._pages("f36-retreat-test_robot-1"))
+
+    def test_PASSES_the_frozen_robot_on_a_patrol_still_pages(self):
+        # D-110 w4's gentle_bot_10, frozen on the connector mid-patrol
+        self._verdict(docked=False)
+        self.assertIsNotNone(self._pages("patrol.dispatch-1791958907925"))
+
+    def test_PASSES_a_charge_task_away_from_its_charger_still_pages(self):
+        # F-331: gentle_bot_1 on Charge403973, 5.9 m off its charger
+        self._verdict(docked=False)
+        self.assertIsNotNone(self._pages("Charge403973"))
+
+    def test_PASSES_a_mission_on_the_dock_still_pages(self):
+        self._verdict(docked=True)
+        self.assertIsNotNone(self._pages("patrol.dispatch-2"))
+
+    def test_PASSES_no_verdict_from_the_fleet_is_no_excuse(self):
+        # no gf_charging at all: judged as before
+        self.assertIsNotNone(self._pages("Charge6c7211"))
+
+    def test_an_open_page_is_resolved_once_it_charges_on_its_dock(self):
+        self._verdict(docked=False)
+        state = make_robot_state(task_id="Charge6c7211")
+        check_robot_stuck(ROBOT_ID, state, 0)
+        new_id, _ = check_robot_stuck(ROBOT_ID, state, self.timeout_millis)
+        self.assertIsNotNone(new_id)
+        self._verdict(docked=True)
+        _, resolved = check_robot_stuck(ROBOT_ID, state, self.timeout_millis + 1000)
+        self.assertEqual(resolved, new_id)
