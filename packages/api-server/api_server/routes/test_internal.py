@@ -464,6 +464,123 @@ class TestProcessFr36Conditions(unittest.IsolatedAsyncioTestCase):
         self.assertIn("b3, b4", row[3])
 
 
+class TestF614AnEscalationNamingNoBlockerSaysSo(unittest.IsolatedAsyncioTestCase):
+    """F-614 (D-113, FR-36): the operator's critical "Blocked route needs an
+    operator" printed "Blocker: None ." whenever the adapter's escalation
+    named no blocker — D-111 w2's cycle that three attempts did not clear,
+    and w3's four F-298 stalls ("Blocker: None at (7.6, 35.1)"). It says so
+    in words now, and leaves out a place it was not given; an escalation
+    that names its blocker reads exactly as before."""
+
+    # D-111 w2 (ops/e6/evidence/f4/d111/windows/w2/alerts.csv): before,
+    # "Blocked route needs an operator: 3 resolution attempts did not clear
+    # the cycle. Blocker: None . Waiting: gentle_bot_10, gentle_bot_4. ..."
+    W2_CYCLE = {
+        "episode": "cycle-(gentle_bot_10,gentle_bot_4)",
+        "blocker": None,
+        "where": "",
+        "reason": "3 resolution attempts did not clear the cycle",
+        "waiting": ["gentle_bot_10", "gentle_bot_4"],
+        "tasks": ["patrol.dispatch-1791984654062", "patrol.dispatch-1791985005908"],
+        "status": "needs_operator",
+    }
+    # D-111 w3 (windows/w3/alerts.csv), F-298's nameless stall — the one
+    # true one of the four: before, "... Blocker: None at (14.7, 7.8).
+    # Waiting: gentle_bot_19. ..."
+    W3_STALL = {
+        "episode": "rescue_stalled-gentle_bot_19",
+        "blocker": None,
+        "where": "at (14.7, 7.8)",
+        "reason": (
+            "[gentle_bot_19] is on its trip home to charge and has not moved "
+            "for 60 s with no robot blocking it (F-298) — check its traffic "
+            "and zone holds"
+        ),
+        "waiting": ["gentle_bot_19"],
+        "tasks": ["f36-retreat-gentle_bot_19-418132995"],
+        "status": "needs_operator",
+    }
+    NAMED = {
+        "episode": "cycle-b1-b3",
+        "blocker": "b3",
+        "where": "at (21.5, 11.6)",
+        "reason": "[b3] is faulted and cannot move",
+        "waiting": ["b1"],
+        "tasks": ["t1"],
+    }
+
+    def setUp(self):
+        from . import internal
+
+        self.internal = internal
+        internal._fr36_alerted.clear()
+        internal._fr36_actions.clear()
+        internal._fr36_stale_swept.clear()
+        self.repo = _FakeAlertRepo()
+        self._real_repo = internal.alert_repo
+        internal.alert_repo = self.repo
+
+    def tearDown(self):
+        self.internal.alert_repo = self._real_repo
+
+    async def _alert(self, detail):
+        robot = (detail.get("waiting") or ["b1"])[0]
+        state = _fr36_fleet_state({robot: [("fleet_blocked_escalation", detail)]})
+        await self.internal.process_fr36_conditions(state, 1000)
+        rows = [c for c in self.repo.created if "action" not in c[0]]
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0][2], self.internal.ttm.Alert.Severity.Critical)
+        return rows[0][3]
+
+    async def test_FIRES_w2_a_cycle_no_attempt_cleared(self):
+        self.assertEqual(
+            await self._alert(self.W2_CYCLE),
+            "Blocked route needs an operator: 3 resolution attempts did not "
+            "clear the cycle. No robot was found in the way — the waiting "
+            "robots block each other: gentle_bot_10, gentle_bot_4. Missions "
+            "affected: patrol.dispatch-1791984654062, "
+            "patrol.dispatch-1791985005908.",
+        )
+
+    async def test_FIRES_w3_a_robot_standing_on_its_trip_home(self):
+        # one robot blocks no one: never "block each other"; the place is
+        # where the robot stands (the adapter's `_where` of the rescuer)
+        self.assertEqual(
+            await self._alert(self.W3_STALL),
+            "Blocked route needs an operator: [gentle_bot_19] is on its trip "
+            "home to charge and has not moved for 60 s with no robot blocking "
+            "it (F-298) — check its traffic and zone holds. No robot was "
+            "found in the way of gentle_bot_19 at (14.7, 7.8). Missions "
+            "affected: f36-retreat-gentle_bot_19-418132995.",
+        )
+
+    async def test_PASSES_a_named_blocker_reads_exactly_as_before(self):
+        self.assertEqual(
+            await self._alert(self.NAMED),
+            "Blocked route needs an operator: [b3] is faulted and cannot "
+            "move. Blocker: b3 at (21.5, 11.6). Waiting: b1. Missions "
+            "affected: t1.",
+        )
+
+    async def test_PASSES_a_named_blocker_with_no_place_leaves_it_out(self):
+        message = await self._alert({**self.NAMED, "where": ""})
+        self.assertIn("Blocker: b3. Waiting: b1.", message)
+        self.assertNotIn(" .", message)
+
+    async def test_the_class_no_missing_field_prints_a_null_or_an_empty_place(self):
+        # every optional field of the escalation absent, one at a time and
+        # all together: never "None", never " ." or ": ."
+        fields = ("blocker", "where", "reason", "waiting", "tasks")
+        variants = [{k: v for k, v in self.W2_CYCLE.items() if k != f} for f in fields]
+        variants += [{k: v for k, v in self.NAMED.items() if k != f} for f in fields]
+        variants.append({"episode": "bare"})
+        for detail in variants:
+            message = self.internal._fr36_message("fleet_blocked_escalation", detail)
+            self.assertTrue(message.startswith("Blocked route needs an operator"))
+            for bad in ("None", " .", ": .", "Waiting: .", "  "):
+                self.assertNotIn(bad, message, (detail, message))
+
+
 # ----------------------------------------------------------------------
 # F-268 / D-64: a frozen position feed is not a stuck robot.
 # ----------------------------------------------------------------------

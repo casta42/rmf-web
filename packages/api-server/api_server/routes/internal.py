@@ -1242,13 +1242,34 @@ def _fr36_message(category: str, detail: dict) -> str:
             f"{waiting} need{'s' if ',' not in waiting else ''} — moving "
             f"it to a clear waypoint.{missions}"
         )
-    where = detail.get("where") or ""
-    waiting = ", ".join(detail.get("waiting") or [])
-    return (
-        f"Blocked route needs an operator: {detail.get('reason')}. "
-        f"Blocker: {detail.get('blocker')} {where}. Waiting: {waiting}."
-        f"{missions}"
-    )
+    reason = detail.get("reason")
+    head = "Blocked route needs an operator" + (f": {reason}." if reason else ".")
+    return f"{head} {_fr36_in_the_way(detail)}{missions}"
+
+
+def _fr36_in_the_way(detail: dict) -> str:
+    """F-614 (D-113, FR-36): who is in the way, in words. An escalation
+    that names no blocker — a cycle no attempt cleared (the waiting robots
+    block each other), or F-298's robot standing on its trip home with no
+    robot blocking it — says so; it printed "Blocker: None ." (D-111 w2,
+    w3). A place the adapter did not give is left out, never printed empty;
+    with no blocker it is where the waiting robot stands (the adapter's
+    `_where` of the rescuer)."""
+    blocker = detail.get("blocker")
+    where = str(detail.get("where") or "").strip()
+    place = f" {where}" if where else ""
+    waiting = [str(name) for name in (detail.get("waiting") or [])]
+    if blocker:
+        text = f"Blocker: {blocker}{place}."
+        return text + (f" Waiting: {', '.join(waiting)}." if waiting else "")
+    if len(waiting) > 1:
+        return (
+            f"No robot was found in the way{place} — the waiting robots "
+            f"block each other: {', '.join(waiting)}."
+        )
+    if waiting:
+        return f"No robot was found in the way of {waiting[0]}{place}."
+    return f"No robot was found in the way{place}."
 
 
 async def process_fr36_conditions(
