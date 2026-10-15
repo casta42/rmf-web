@@ -434,6 +434,31 @@ class InterruptedRequeueRouteTest(AppFixture):
         )
         self.assertEqual(self.waiting_for(task_id), [])
 
+    def test_FIRES_D114_a_saved_cancellation_survives_an_api_server_restart(self):
+        """D-114 (2): an operator canceled the mission and a state of it
+        was saved with the cancellation stamped on; then the api-server
+        restarted (its in-memory latch empty) and the core: the sweep reads
+        the row's own record — the mission stays canceled, never sent again
+        against the operator's word (f1-n86: the empty latch read as "nobody
+        asked it to stop", and it was re-dispatched)."""
+        task_id = self.dispatch()
+        self.ingest(task_msg(task_id, "underway", assigned="gentle_bot_1"))
+        task_cancellation.latch(
+            task_id,
+            Cancellation(
+                unix_millis_request_time=1, labels=["canceled from mission queue by g"]
+            ),
+        )
+        self.ingest(task_msg(task_id, "underway", assigned="gentle_bot_1"))
+        self.assertIsNotNone(self.row(task_id).get("cancellation"))
+        task_cancellation._latched.clear()  # the api-server restarted
+        getattr(task_cancellation, "_ended_at", {}).clear()
+        self.core_was("old-core")
+        self.core_says("new-core", self.after())
+        mock, _ = self.sweep()
+        mock.assert_not_called()
+        self.assertEqual(self.row(task_id)["status"], "canceled")
+
     def test_FIRES_the_new_core_heard_before_its_boot_record(self):
         """The new core's fleet states (the websocket) can reach the
         gateway before its boot record (DDS discovery). A pass in that gap

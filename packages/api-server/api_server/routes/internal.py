@@ -276,11 +276,32 @@ async def _redispatch_held(task_id: str, detail: str) -> None:
     await _resolve_waiting_alert(entry)
 
 
+async def _replaced_in_ledger(task_id: str) -> Optional[bool]:
+    """D-114 (2): has this attempt already been sent again? From the
+    ledger — a stored request created since the attempt that names it
+    `gf:redispatch-of` — never from this process's memory of sending it.
+    None when the attempt's row cannot be found or read (cannot see, so
+    cannot convict)."""
+    row = await ttm.TaskState.get_or_none(id_=task_id)
+    since = getattr(row, "created_at", None) if row is not None else None
+    if since is None:
+        return None
+    ids = [str(i) for i in await ttm.TaskState.filter(
+        created_at__gte=since).values_list("id_", flat=True)]
+    for at in range(0, len(ids), 500):
+        for raw in await ttm.TaskRequest.filter(
+                id___in=ids[at:at + 500]).values_list("request", flat=True):
+            labels = _as_dict(raw).get("labels")
+            if isinstance(labels, list) and origin_of(labels) == task_id:
+                return True
+    return False
+
+
 redispatcher = Redispatcher(
     _redispatch_request, _load_request, logger.getChild("Redispatch"),
     abandon=_fail_abandoned_reauction, first_seen=_first_recorded_s,
     wanted=waiting.wanted, refused=_redispatch_refused,
-    held=_redispatch_held)
+    held=_redispatch_held, replaced=_replaced_in_ledger)
 
 
 async def _preserve_booking_labels(task_state: mdl.TaskState) -> None:
@@ -379,7 +400,6 @@ WAITING_ALERT_PERIOD_S = 5.0
 # 900 s / 8-hop bounds and already reported lost — and re-dispatching it
 # hours later would surprise the operator more than it would help.
 RESUME_WINDOW_S = float(os.environ.get("GF_WAITING_RESUME_WINDOW_S", "3600"))
-RESUME_SCAN_LIMIT = 5000
 _LIVE_RAW = {"queued", "standby", "uninitialized"}
 
 
@@ -565,17 +585,16 @@ async def resume_waiting_chains(now_s: Optional[float] = None) -> list:
     silently gone. Every such TAIL created in the last RESUME_WINDOW_S is
     re-dispatched through the ordinary path, after the ordinary backoff;
     a chain whose latest attempt is live (queued, assigned) is registered
-    as waiting on it. Bounded: at most RESUME_SCAN_LIMIT rows are read.
-    Returns the tail ids it re-dispatched."""
+    as waiting on it. D-114 (2): every row of the window is read — a
+    count limit inside it read "not among the newest N" as "no tail to
+    resume", and dropped the older waiting missions. Returns the tail ids
+    it re-dispatched."""
     now_s = time.time() if now_s is None else now_s
     cutoff = datetime.fromtimestamp(now_s - RESUME_WINDOW_S, tz=timezone.utc)
     rows = await ttm.TaskState.filter(created_at__gte=cutoff).order_by(
-        "-created_at").limit(RESUME_SCAN_LIMIT).values_list(
-        "id_", "status", "created_at")
-    if len(rows) >= RESUME_SCAN_LIMIT:
-        logger.warning(
-            "F-435: the resume scan read its limit of %d rows; chains older "
-            "than the oldest of them are not resumed", RESUME_SCAN_LIMIT)
+        "-created_at").values_list("id_", "status", "created_at")
+    logger.info("F-435: the resume scan read the window's %d rows",
+                len(rows))
     status_of = {str(i): status_tail(s) for i, s, _ in rows}
     created_of = {str(i): c for i, _, c in rows}
     labels_of: Dict[str, list] = {}
@@ -1844,14 +1863,18 @@ async def _close_interrupted_rows(boundary: datetime,
                 logger.error(f"F-141: cannot parse task row {task_id}")
                 done["unreadable"].append(task_id)
                 continue
-            cancel_requested = False
-            if task_cancellation.requested(task_id):
-                task_cancellation.apply(task_state)
-                # a cancellation that itself asks for a re-dispatch (a
-                # hand-back under way when the core went) is not "stop"
-                cancel_requested = (
-                    task_state.cancellation is not None and wants_redispatch(
-                        "canceled", task_state.cancellation.labels) is None)
+            # D-114 (2): "somebody asked it to stop" is read from the task's
+            # own record — its stored row carries any cancellation a state
+            # was saved with (stamped from the latch, or RMF's own) — and
+            # from the latch for one asked since this server started; the
+            # in-memory latch alone is empty after a restart, and reading
+            # its silence as "nobody did" re-dispatched a canceled mission
+            task_cancellation.apply(task_state)
+            # a cancellation that itself asks for a re-dispatch (a
+            # hand-back under way when the core went) is not "stop"
+            cancel_requested = (
+                task_state.cancellation is not None and wants_redispatch(
+                    "canceled", task_state.cancellation.labels) is None)
             leave = task_id.startswith("Charge")
             stored = leave or cancel_requested or (
                 await task_repo.get_task_request(task_id) is not None)

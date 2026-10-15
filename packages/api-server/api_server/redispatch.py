@@ -165,12 +165,18 @@ bottom is what routes/internal.py calls after persisting a task state.
 import json
 import logging
 import time
+from collections import OrderedDict
 from typing import Iterable, List, NamedTuple, Optional
 
 # The marker the fleet adapter puts FIRST in the cancellation labels of
 # a mission it wants back on the floor (gentle_fleet_adapter/
 # charge_governor.py REDISPATCH_LABEL). Byte-identical on both sides.
 REDISPATCH_LABEL = "gf:redispatch"
+# D-114 (2): what this process has sent is cached this long (and at most
+# SEEN_BACKSTOP entries) — a cache, not the record: the ledger is asked
+# whether an attempt was already replaced (`Redispatcher(replaced=...)`)
+SEEN_KEEP_S = 24 * 3600.0
+SEEN_BACKSTOP = 65536
 ORIGIN_LABEL = "gf:redispatch-of="
 GENERATION_LABEL = "gf:redispatch-gen="
 REASON_LABEL = "gf:redispatch-reason="
@@ -797,8 +803,9 @@ class Redispatcher:
     it waited, so it was not dispatched again)."""
 
     def __init__(self, dispatch, load_request, logger: logging.Logger,
-                 cap: int = 2048, abandon=None, first_seen=None,
-                 clock=time.time, wanted=None, refused=None, held=None):
+                 cap: int = SEEN_BACKSTOP, abandon=None, first_seen=None,
+                 clock=time.time, wanted=None, refused=None, held=None,
+                 replaced=None):
         # async (request) -> new task id; raises Refusal, Held, or anything
         # else for an answer of no known shape
         self._dispatch = dispatch
@@ -819,7 +826,13 @@ class Redispatcher:
         self._refused = refused
         # async (task_id, detail): accepted and held for its start (F-293)
         self._held = held
-        self._seen: List[str] = []
+        # D-114 (2): async (task_id) -> True when the ledger already holds
+        # a row sent in this attempt's place (a stored request naming it
+        # gf:redispatch-of), False when it holds none, None when it cannot
+        # be read. The chain's own record — `_seen` below is only a cache of
+        # what this process has sent (lost at a restart, bounded by age)
+        self._replaced = replaced
+        self._seen: "OrderedDict[str, float]" = OrderedDict()
         self._cap = cap
         self.redispatched = 0
         self.refused = 0
@@ -833,10 +846,34 @@ class Redispatcher:
     def _mark(self, task_id: str) -> bool:
         if task_id in self._seen:
             return False
-        self._seen.append(task_id)
-        while len(self._seen) > self._cap:
-            self._seen.pop(0)
+        now = self._clock()
+        self._seen[task_id] = now
+        while self._seen:
+            _first, at = next(iter(self._seen.items()))
+            if now - at <= SEEN_KEEP_S and len(self._seen) <= self._cap:
+                break
+            self._seen.popitem(last=False)
         return True
+
+    async def _already_replaced(self, task_id: str) -> bool:
+        '''D-114 (2): is this attempt already back on the floor? Read from
+        the ledger, never from whether this process remembers sending it —
+        `_seen` forgets at a restart and after SEEN_KEEP_S, and its silence
+        re-dispatched the same attempt a second time (a duplicate chain).
+        A ledger that cannot be read convicts nothing: the attempt is sent.'''
+        if self._replaced is None:
+            return False
+        try:
+            replaced = await self._replaced(task_id)
+        except Exception:  # pylint: disable=broad-except
+            replaced = None
+        if replaced:
+            self._logger.warning(
+                "re-dispatch: [%s] was already sent again (a stored request "
+                "names it %s) — not sent a second time (D-114)",
+                task_id, ORIGIN_LABEL)
+            return True
+        return False
 
     def _still_wanted(self, task_id: str) -> bool:
         if self._wanted is None:
@@ -924,6 +961,8 @@ class Redispatcher:
         hand-back bookkeeping is carried, never advanced. A refused
         re-auction is sent again (F-441)."""
         if not self._mark(task_id):
+            return None
+        if await self._already_replaced(task_id):
             return None
         if verdict.final:
             self.no_bid_exhausted += 1
@@ -1014,6 +1053,8 @@ class Redispatcher:
         if reason is None:
             return None
         if not self._mark(task_id):
+            return None
+        if await self._already_replaced(task_id):
             return None
         # F-435: every class waits, progressively, and none is ever
         # stopped — the fleet's state has to change, and it will
