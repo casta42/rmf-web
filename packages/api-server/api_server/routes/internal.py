@@ -543,13 +543,27 @@ async def withdraw_waiting(task_id: str, labels: list):
                       "will not be dispatched again"}
 
 
-def _apply_withdrawal(task_state: mdl.TaskState) -> None:
+async def _apply_withdrawal(task_state: mdl.TaskState) -> None:
     """A withdrawn attempt stays the operator's cancel: a later broadcast
     of it (a fleet re-sends terminal states) must not bring the marker
-    back."""
+    back. D-114 (2): read from the attempt's own stored row as well as from
+    this process's memory — the registry is empty after a restart, and its
+    silence let a re-sent hand-back state put the marker back and send the
+    mission again against the operator's cancel."""
     labels = waiting.withdrawn_labels(task_state.booking.id)
-    if labels is None or task_state.cancellation is None:
+    if task_state.cancellation is None:
         return
+    if labels is None:
+        if wants_redispatch(task_state.status,
+                            task_state.cancellation.labels) is None:
+            return
+        stored = await task_repo.get_task_state(task_state.booking.id)
+        kept = stored.cancellation if stored is not None else None
+        if stored is None or kept is None or status_tail(
+                stored.status) not in waiting_missions.CANCELED or \
+                wants_redispatch(stored.status, kept.labels) is not None:
+            return
+        labels = list(kept.labels or [])
     task_state.cancellation.labels = labels
 
 
@@ -1983,7 +1997,7 @@ async def process_msg(msg: Dict[str, Any], fleet_repo: FleetRepository) -> None:
         task_cancellation.apply(task_state)
         # F-435: an attempt an operator canceled while its mission waited
         # stays that operator's cancel when the fleet re-sends it
-        _apply_withdrawal(task_state)
+        await _apply_withdrawal(task_state)
         # F-343: `completed` is stored only when every phase is completed —
         # the fleet reports the ACTIVE phase's status as the task's, and a
         # patrol whose next stop had no route read "completed" for eight

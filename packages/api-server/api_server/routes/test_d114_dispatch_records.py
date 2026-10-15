@@ -16,6 +16,7 @@ f1-n86's code (071d7837), PASSES holds both ways.
     and a waiting tail older than them was dropped.
 """
 
+import json
 import time
 from unittest.mock import patch
 from uuid import uuid4
@@ -31,6 +32,7 @@ from api_server.test import AppFixture, make_task_state
 
 from .test_waiting_missions_route import (
     HOLD,
+    hand_back_msg,
     ok_reply,
     short_waits,
     task_msg,
@@ -210,3 +212,75 @@ class D114DispatchRecordsTest(AppFixture):
             mock.side_effect = lambda *a, **k: ok_reply(next(new_ids))
             resumed = self.get_portal().call(internal.resume_waiting_chains)
         self.assertIn(tail, resumed)
+
+
+class D114WithdrawalTest(AppFixture):
+    """An operator canceled a mission while it waited between auctions;
+    the api-server restarted; the fleet re-sends the attempt's hand-back
+    state: the attempt stays the operator's cancel and is never sent again
+    (f1-n86: the in-memory registry forgot the withdrawal, the marker came
+    back, and the mission was re-dispatched against the operator)."""
+
+    def setUp(self):
+        _restart_latch()
+        internal.waiting.clear()
+
+    def test_FIRES_a_withdrawal_survives_an_api_server_restart(self):
+        root = f"patrol.dispatch-{uuid4().hex[:10]}"
+        with patch.object(tasks_service(), "call") as mock:
+            mock.return_value = ok_reply(root)
+            self.client.post(
+                "/tasks/dispatch_task",
+                content=mdl.DispatchTaskRequest(
+                    type="dispatch_task_request",
+                    request=mdl.TaskRequest(
+                        category="patrol", description={"places": ["s1"], "rounds": 1}
+                    ),
+                ).model_dump_json(exclude_none=True),
+            )
+        with short_waits(1.0), patch.object(tasks_service(), "call") as mock:
+            mock.return_value = ok_reply(f"patrol.dispatch-{uuid4().hex[:10]}")
+            self.get_portal().call(internal.process_msg, hand_back_msg(root), None)
+            resp = self.client.post(
+                "/tasks/cancel_task",
+                content=json.dumps(
+                    {
+                        "type": "cancel_task_request",
+                        "task_id": root,
+                        "labels": ["canceled from mission queue by admin"],
+                    }
+                ),
+            )
+            self.assertEqual(200, resp.status_code, resp.content)
+            time.sleep(1.5)
+            mock.assert_not_called()
+        internal.waiting.clear()  # the api-server restarted
+        _restart_latch()
+        with short_waits(0.05), patch.object(tasks_service(), "call") as mock:
+            mock.return_value = ok_reply(f"patrol.dispatch-{uuid4().hex[:10]}")
+            self.get_portal().call(internal.process_msg, hand_back_msg(root), None)
+            time.sleep(0.6)
+            mock.assert_not_called()
+        stored = self.client.get(f"/tasks/{root}/state").json()
+        self.assertNotIn(REDISPATCH_LABEL, stored["cancellation"]["labels"])
+
+    def test_PASSES_a_hand_back_with_nothing_withdrawn_is_sent(self):
+        root = f"patrol.dispatch-{uuid4().hex[:10]}"
+        with patch.object(tasks_service(), "call") as mock:
+            mock.return_value = ok_reply(root)
+            self.client.post(
+                "/tasks/dispatch_task",
+                content=mdl.DispatchTaskRequest(
+                    type="dispatch_task_request",
+                    request=mdl.TaskRequest(
+                        category="patrol", description={"places": ["s1"], "rounds": 1}
+                    ),
+                ).model_dump_json(exclude_none=True),
+            )
+        with short_waits(0.05), patch.object(tasks_service(), "call") as mock:
+            mock.return_value = ok_reply(f"patrol.dispatch-{uuid4().hex[:10]}")
+            self.get_portal().call(internal.process_msg, hand_back_msg(root), None)
+            deadline = time.time() + 5
+            while not mock.called and time.time() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(mock.called)
