@@ -275,3 +275,19 @@ def test_FIRES_PASSES_the_nearest_place_follows_the_graphs_lane_directions_F909(
     assert no_stop_junction(graph, ["j"])["nearest"] == "a"
     assert no_stop_junction(_t_graph(), ["j"])["nearest"] == "b"
 
+
+
+def test_FIRES_PASSES_the_intake_guard_makes_the_junction_check_F909():
+    """Every intake path goes through guard_patrol_destination; it makes the
+    no-stop junction check. FIRE: the same source with the call renamed is
+    told apart."""
+    import inspect
+    import re
+
+    from . import tasks
+
+    source = inspect.getsource(tasks.guard_patrol_destination)
+    call = r"dispatch_guard\.no_stop_junction\s*\("
+    assert re.search(call, source)
+    stripped = re.sub(r"dispatch_guard\.no_stop_junction", "dispatch_guard.nothing", source)
+    assert not re.search(call, stripped)
