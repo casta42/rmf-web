@@ -430,6 +430,17 @@ async def guard_patrol_destination(
                 "somewhere else."
             ),
         )
+    # F-909 (D-142 second addendum, ee3): a named no-stop junction is no
+    # destination; the same reason and nearest place the site gate gives
+    junction = (
+        dispatch_guard.no_stop_junction(
+            nav_graph, dispatch_guard.patrol_places(request)
+        )
+        if nav_graph
+        else None
+    )
+    if junction is not None:
+        raise HTTPException(409, detail=junction["message"])
     vertex = dispatch_guard.find_vertex(building_map, place)
     if vertex is None:
         return

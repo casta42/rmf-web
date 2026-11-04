@@ -105,6 +105,8 @@ class TestZonesRoute(AppFixture):
                 self.assertEqual(0.3, lanes[(2, 0)]["params"]["speed_limit"])
                 # F-388: a site with nothing cut off serves an empty list
                 self.assertEqual([], graph["out_of_service"])
+                # F-909: no named no-stop junction, none refused (boring)
+                self.assertEqual([], graph["refused_destinations"])
             finally:
                 app_config.zones_file = old
 
@@ -143,6 +145,49 @@ class TestZonesRoute(AppFixture):
                 )
             finally:
                 app_config.zones_file = old
+
+    def test_serves_the_named_no_stop_junctions_as_refused_destinations(self):
+        """F-909 (D-142 second addendum, ee2). FIRE: a T, junction j with
+        three lanes and no place mark, is served as a refused destination
+        with the reason and the nearest place (b, 2.0 m); it stays a vertex
+        with its name, for the map. PASS: the same j marked a holding point
+        is a place, none refused."""
+        def graph_yaml(j_params):
+            return (
+                "building_name: t\n"
+                "levels:\n"
+                "  L1:\n"
+                "    vertices:\n"
+                f"    - [0.0, 0.0, {{name: j{j_params}}}]\n"
+                "    - [-4.0, 0.0, {name: a, is_holding_point: true}]\n"
+                "    - [0.0, -2.0, {name: b, is_holding_point: true}]\n"
+                "    - [6.0, 0.0, {name: c, is_holding_point: true}]\n"
+                "    lanes:\n"
+                + "".join(f"    - [0, {i}, {{}}]\n    - [{i}, 0, {{}}]\n" for i in (1, 2, 3))
+            )
+        for j_params, refused in (("", ["j"]), (", is_holding_point: true", [])):
+            with tempfile.TemporaryDirectory() as site_dir:
+                zones_path = os.path.join(site_dir, "zones.yaml")
+                with open(zones_path, "w", encoding="utf8") as f:
+                    f.write(ZONES_YAML)
+                os.mkdir(os.path.join(site_dir, "nav_graphs"))
+                with open(
+                    os.path.join(site_dir, "nav_graphs", "0.yaml"), "w", encoding="utf8"
+                ) as f:
+                    f.write(graph_yaml(j_params))
+                old = app_config.zones_file
+                app_config.zones_file = zones_path
+                try:
+                    graph = self.client.get("/zones/nav_graph").json()
+                    got = graph["refused_destinations"]
+                    self.assertEqual(refused, [r["name"] for r in got])
+                    self.assertIn("j", [v["name"] for v in graph["vertices"]])
+                    if got:
+                        self.assertEqual("b", got[0]["nearest"])
+                        self.assertEqual(2.0, got[0]["metres"])
+                        self.assertIn("no-stop junction", got[0]["message"])
+                finally:
+                    app_config.zones_file = old
 
     def test_nav_graph_404_when_missing(self):
         with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:

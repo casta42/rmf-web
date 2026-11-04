@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional
 import yaml
 from fastapi import APIRouter, HTTPException
 
+from api_server import no_stop_destinations
 from api_server.app_config import app_config
 
 router = APIRouter(tags=["Zones"])
@@ -102,11 +103,22 @@ def _normalize_nav_graph(data: Dict[str, Any]) -> Dict[str, Any]:
                 "params": params,
             }
         )
+    # F-909 (G, 2026-11-03, D-142 second addendum, ee2): every named no-stop
+    # junction is no destination — the map keeps its name, the mission
+    # targets leave it out, and the dispatch guard refuses a mission to it,
+    # each with the reason and the nearest place it can go
+    # (`api_server.no_stop_destinations`, the fleet adapter's file byte for
+    # byte)
+    refused = [
+        {k: r[k] for k in ("name", "reason", "nearest", "metres", "message")}
+        for _n, r in sorted(no_stop_destinations.refused(level).items())
+    ]
     return {
         "level": level_name,
         "vertices": vertices,
         "lanes": list(lanes.values()),
         "out_of_service": out_of_service,
+        "refused_destinations": refused,
     }
 
 

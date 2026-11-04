@@ -14,6 +14,7 @@ import math
 from typing import List, Optional, Tuple
 
 from api_server import models as mdl
+from api_server import no_stop_destinations
 from api_server.models.building_map import BuildingMap
 from api_server.models.rmf_api.robot_state import Status as RobotStatus
 
@@ -154,3 +155,43 @@ def isolated_place(nav_graph: dict, places: List[str]) -> Optional[str]:
         if not attached:
             return place
     return None
+
+
+# F-909 (G, 2026-11-03, D-142 second addendum, reading ee3): a mission any
+# of whose places is a named no-stop junction is refused before any robot is
+# chosen, with the reason and the nearest place it can go: a robot standing
+# on a junction closes every way through it. Read from the DERIVED nav graph,
+# as F-111's guard is, by the same rule the site gate reports it with
+# (`api_server.no_stop_destinations`, a byte-for-byte copy of the fleet
+# adapter's). Same fail-open posture: no graph, or a place it does not know,
+# is no objection.
+def _level(nav_graph: dict) -> dict:
+    """The normalized graph (`routes.zones._normalize_nav_graph`) as a level:
+    each vertex with its name back in its params, each lane directed (a
+    two-way lane both ways)."""
+    vertices = []
+    for vertex in nav_graph.get("vertices") or []:
+        params = dict(vertex.get("params") or {})
+        if vertex.get("name"):
+            params["name"] = vertex["name"]
+        vertices.append([float(vertex.get("x", 0.0)), float(vertex.get("y", 0.0)), params])
+    lanes = []
+    for lane in nav_graph.get("lanes") or []:
+        a, b = int(lane.get("a")), int(lane.get("b"))
+        lanes.append([a, b, {}])
+        if lane.get("bidirectional"):
+            lanes.append([b, a, {}])
+    return {"vertices": vertices, "lanes": lanes}
+
+
+def no_stop_junction(nav_graph: dict, places: List[str]) -> Optional[dict]:
+    """The refusal (`no_stop_destinations.refused`'s dict) of the first place
+    that is a named no-stop junction, or None."""
+    if not places:
+        return None
+    refused = no_stop_destinations.refused(_level(nav_graph))
+    for place in places:
+        if place in refused:
+            return refused[place]
+    return None
+

@@ -10,6 +10,7 @@ from .dispatch_guard import (
     OCCUPIED_TOLERANCE,
     find_vertex,
     isolated_place,
+    no_stop_junction,
     parked_robot_near,
     patrol_places,
     patrol_final_place,
@@ -232,3 +233,45 @@ class TestOccupancyIgnoresFrozenFeeds(unittest.TestCase):
         fleets_route._reset_freshness_for_test()
         fleets = [make_fleet(26.1, 1.5)]
         self.assertEqual(parked_robot_near(fleets, 26.1, 1.5), "test_fleet/test_robot")
+
+
+def _t_graph(**j_params):
+    """A T in the /zones/nav_graph shape: junction j (0, 0), three two-way
+    arms to named holding points a (4 m west), b (2 m south), c (6 m east)."""
+    hold = {"is_holding_point": True}
+    return {
+        "vertices": [
+            {"name": "j", "x": 0.0, "y": 0.0, "params": dict(j_params)},
+            {"name": "a", "x": -4.0, "y": 0.0, "params": dict(hold)},
+            {"name": "b", "x": 0.0, "y": -2.0, "params": dict(hold)},
+            {"name": "c", "x": 6.0, "y": 0.0, "params": dict(hold)},
+        ],
+        "lanes": [{"a": 0, "b": i, "bidirectional": True} for i in (1, 2, 3)],
+    }
+
+
+def test_FIRES_PASSES_a_mission_to_a_named_no_stop_junction_is_refused_F909():
+    """F-909 (D-142 second addendum, ee3). FIRE: a patrol through j, three
+    lanes and no place mark, is refused with the reason and the nearest place
+    (b, 2.0 m). PASS: the same patrol with j marked a holding point (a place
+    at a junction), a patrol to places only, and a name the graph does not
+    know (left to the fleet)."""
+    got = no_stop_junction(_t_graph(), ["a", "j", "c"])
+    assert got is not None and got["name"] == "j"
+    assert got["nearest"] == "b" and got["metres"] == 2.0
+    assert "no-stop junction" in got["message"] and "[b], 2.0 m" in got["message"]
+    assert no_stop_junction(_t_graph(is_holding_point=True), ["j"]) is None
+    assert no_stop_junction(_t_graph(), ["a", "c"]) is None
+    assert no_stop_junction(_t_graph(), ["elsewhere"]) is None
+    assert no_stop_junction(_t_graph(), []) is None
+
+
+def test_FIRES_PASSES_the_nearest_place_follows_the_graphs_lane_directions_F909():
+    """The normalized graph keeps each lane's direction: with j-b one way
+    (b to j only, stored a=2, b=0), b cannot be reached from j and a (4 m)
+    is named. PASS as two-way: b."""
+    graph = _t_graph()
+    graph["lanes"][1] = {"a": 2, "b": 0, "bidirectional": False}
+    assert no_stop_junction(graph, ["j"])["nearest"] == "a"
+    assert no_stop_junction(_t_graph(), ["j"])["nearest"] == "b"
+
