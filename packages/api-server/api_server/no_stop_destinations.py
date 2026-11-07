@@ -4,7 +4,12 @@
 D-142 second addendum, word for word: "A destination on a no-stop junction is
 refused when it's created, with the reason and the nearest place it can go,
 and the mission intake refuses a mission to one, with the same reason."
-Readings ee1-ee3, REQUIREMENTS.md).
+Readings ee1-ee3, REQUIREMENTS.md). AND ON EVERY OTHER NO-STOP KIND (G,
+2026-11-06, D-142 fourth addendum ruling 5: "The other no-stop kinds: (a),
+refused with the same reason and the nearest place"; reading gg4): a turn's
+vertex, a place's way out (its path past the place) and a single-lane
+corridor's mouth (its end vertex), as the builder lays them
+(`safe_stops.areas`), each with the reason for its kind.
 
 A NO-STOP JUNCTION (ee1): a vertex where three or more lanes meet — the
 builder's `junction` no-stop area (`safe_stops.areas`) — that is no place by
@@ -14,10 +19,18 @@ junction is a place, and is not refused. Read from the lanes, never from the
 level's `gf_no_stop` marks: an imported site is judged before the builder
 marks it.
 
-A named one is no destination (ee2): the site goes ahead, the junction stays
+The other kinds are read from the no-stop areas the caller gives
+(`safe_stops.areas` of the level: the caller's, so this file imports
+nothing), or else from the level's own carried marks (`gf_no_stop`, the
+builder's: every served graph carries them); a level with neither has only
+its junctions read (`readable` says so, and a caller says it cannot see the
+rest). A vertex that is a place is never one: a place's own vertex is a safe
+stop.
+
+A named one is no destination (ee2): the site goes ahead, the vertex stays
 track and keeps its name on the map, it is not offered as a mission target,
-and a mission to it is refused at intake (ee3) — each with this reason and
-the nearest place it can go: the nearest named place by the way a robot
+and a mission to it is refused at intake (ee3) — each with its kind's reason
+and the nearest place it can go: the nearest named place by the way a robot
 drives (the level's directed lanes, each its straight length) that is not
 itself refused and is no robot's home (a charger or a parking spot: its robot
 stands there, so a mission to it is refused as occupied, F-34), else the
@@ -39,6 +52,23 @@ PLACE_KEYS = ('dock_name',)
 CODE = 'destination_on_no_stop_junction'
 REASON = ('it is a no-stop junction: a robot standing on it closes every way '
           'through it')
+# the fourth addendum's ruling 5: the other kinds, each its own code and reason
+# (`safe_stops.KINDS`; a vertex in several areas takes the first kind here)
+KINDS = ('junction', 'turn', 'way_out', 'mouth')
+CODES = {'junction': CODE,
+         'mouth': 'destination_on_corridor_mouth',
+         'way_out': 'destination_on_way_out',
+         'turn': 'destination_on_turn'}
+REASONS = {'junction': REASON,
+           'mouth': ("it is at a single-lane corridor's mouth: a robot "
+                     'standing on it closes the corridor both ways'),
+           'way_out': ("it is on [%s]'s way out: a robot standing on it "
+                       'shuts that place in'),
+           'turn': ('it is a turn: a robot standing on it blocks the turning '
+                    'circle a robot needs there')}
+# the key the builder carries a derived level's no-stop areas under
+# (`safe_stops.KEY`; a test pins them equal)
+AREAS_KEY = 'gf_no_stop'
 
 
 def _params(entry):
@@ -87,12 +117,69 @@ def junctions(level):
                   if len(n) >= 3 and not _is_place(params[v], len(n)))
 
 
-def refused(level):
-    '''{name: refusal} for every named no-stop junction of the level. A
-    refusal is a dict: code, name, reason, nearest (a name or None), metres
-    (or None) and message (the operator's sentence).'''
+def _areas(level, areas):
+    if areas is not None:
+        return areas
+    return level.get(AREAS_KEY)
+
+
+def readable(level, areas=None):
+    '''Whether the kinds beyond the junctions can be read on this level: the
+    caller gave its no-stop areas, or the level carries the builder's.'''
+    return _areas(level, areas) is not None
+
+
+def no_stop_vertices(level, areas=None):
+    '''{vertex: (kind, the place whose way out it is or None)} for every
+    vertex no robot may be sent to stop at, as the core reads it: the
+    junctions, read from the lanes; a turn's vertex; and a place's way out
+    past the place and a mouth's end vertex, except a single-lane corridor's
+    inner vertices (each mouth area's `corridor`, its ends dropped), where a
+    robot holding the corridor's direction may stand (FR-43) unless a turn's
+    circle is there (STOP3) — the kinds beyond the junctions read from
+    `areas` (`safe_stops.areas(level)`) or the level's carried marks. A
+    place's own spur is no corridor: standing in it shuts the place in.
+    Never a place. The first kind of KINDS names a vertex in several areas.'''
+    _xy, params, _outs, nbrs = _read(level)
+    marks = _areas(level, areas) or ()
+    inner = set()
+    for a in marks:
+        if a.get('kind') == 'mouth':
+            inner |= {int(v) for v in list(a.get('corridor') or [])[1:-1]}
+    found = {v: [('junction', None)] for v in junctions(level)}
+    for a in marks:
+        k = a.get('kind')
+        if k == 'turn':
+            vs, place = [a.get('vertex')], None
+        elif k == 'way_out':
+            vs, place = list(a.get('path') or [])[1:], a.get('place')
+        elif k == 'mouth':
+            # its end vertex only: the corridor's own vertices are the
+            # corridor's (a robot holding its direction may stand there,
+            # FR-43; a turn on it is a turn)
+            vs, place = list(a.get('lane') or [])[-1:], None
+        else:
+            continue                          # junctions: from the lanes
+        for v in vs:
+            v = int(v)
+            if v not in nbrs or _is_place(params[v], len(nbrs[v])):
+                continue
+            if k != 'turn' and v in inner:
+                continue
+            found.setdefault(v, []).append((k, place))
+    out = {}
+    for v, ks in found.items():
+        out[v] = min(ks, key=lambda kp: KINDS.index(kp[0]))
+    return out
+
+
+def refused(level, areas=None):
+    '''{name: refusal} for every named no-stop vertex of the level (its
+    junctions; with `areas`, or the level's carried marks, every other kind
+    too). A refusal is a dict: code, kind, name, reason, nearest (a name or
+    None), metres (or None) and message (the operator's sentence).'''
     xy, params, outs, nbrs = _read(level)
-    bad = set(junctions(level))
+    bad = no_stop_vertices(level, areas)
     named = {v: _name(params[v]) for v in nbrs if _name(params[v])}
     targets = {v for v in named if v not in bad and
                _is_place(params[v], len(nbrs[v]))}
@@ -102,9 +189,13 @@ def refused(level):
     for v in sorted(bad):
         if v not in named:
             continue
+        kind, place = bad[v]
+        reason = REASONS[kind]
+        if kind == 'way_out':
+            reason = reason % (named.get(place) or '#%s' % place)
         near = _nearest(v, xy, outs, targets - homes, named) or \
             _nearest(v, xy, outs, homes, named)
-        r = dict(code=CODE, name=named[v], reason=REASON,
+        r = dict(code=CODES[kind], kind=kind, name=named[v], reason=reason,
                  nearest=near[1] if near else None,
                  metres=round(near[0], 1) if near else None)
         r['message'] = message(r)
@@ -112,10 +203,10 @@ def refused(level):
     return out
 
 
-def refusal(level, name):
+def refusal(level, name, areas=None):
     '''The refusal of a destination called `name` on this level, or None
-    when it is not a named no-stop junction.'''
-    return refused(level).get(name)
+    when it is not a named no-stop vertex.'''
+    return refused(level, areas).get(name)
 
 
 def message(r):

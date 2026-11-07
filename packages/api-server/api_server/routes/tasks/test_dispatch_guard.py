@@ -12,8 +12,8 @@ from .dispatch_guard import (
     isolated_place,
     no_stop_junction,
     parked_robot_near,
-    patrol_places,
     patrol_final_place,
+    patrol_places,
 )
 
 
@@ -275,6 +275,40 @@ def test_FIRES_PASSES_the_nearest_place_follows_the_graphs_lane_directions_F909(
     assert no_stop_junction(graph, ["j"])["nearest"] == "a"
     assert no_stop_junction(_t_graph(), ["j"])["nearest"] == "b"
 
+
+
+def _l_graph(**k_params):
+    """An L in the /zones/nav_graph shape: holding point a (0, 0), k (5, 0)
+    and holding point b (5, 5), both ways: k is a right-angle turn."""
+    hold = {"is_holding_point": True}
+    return {
+        "vertices": [
+            {"name": "a", "x": 0.0, "y": 0.0, "params": dict(hold)},
+            {"name": "k", "x": 5.0, "y": 0.0, "params": dict(k_params)},
+            {"name": "b", "x": 5.0, "y": 5.0, "params": dict(hold)},
+        ],
+        "lanes": [{"a": 0, "b": 1, "bidirectional": True},
+                  {"a": 1, "b": 2, "bidirectional": True}],
+    }
+
+
+def test_FIRES_PASSES_ruling5_a_mission_to_a_turn_is_refused():
+    """The fourth addendum's ruling 5 (G, 2026-11-06). FIRE: read from the
+    lanes alone (no areas), as F-909 refused, the turn k is a destination.
+    PASS: the guard reads the level's no-stop areas (its copy of
+    `safe_stops`): a patrol through k is refused, a turn, the nearest place
+    5.0 m; marked a holding point k is a place, none refused."""
+    from api_server import no_stop_destinations
+
+    from .dispatch_guard import _level
+
+    assert no_stop_destinations.refused(_level(_l_graph())) == {}
+    got = no_stop_junction(_l_graph(), ["a", "k"])
+    assert got is not None and got["name"] == "k" and got["kind"] == "turn"
+    assert got["metres"] == 5.0 and got["nearest"] in ("a", "b")
+    assert got["message"].startswith("[k] cannot be a destination — it is a turn: ")
+    assert no_stop_junction(_l_graph(is_holding_point=True), ["k"]) is None
+    assert no_stop_junction(_l_graph(), ["a", "b"]) is None
 
 
 def test_FIRES_PASSES_the_intake_guard_makes_the_junction_check_F909():

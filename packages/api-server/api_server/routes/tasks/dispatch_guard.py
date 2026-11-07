@@ -14,7 +14,7 @@ import math
 from typing import List, Optional, Tuple
 
 from api_server import models as mdl
-from api_server import no_stop_destinations
+from api_server import no_stop_destinations, safe_stops
 from api_server.models.building_map import BuildingMap
 from api_server.models.rmf_api.robot_state import Status as RobotStatus
 
@@ -186,10 +186,16 @@ def _level(nav_graph: dict) -> dict:
 
 def no_stop_junction(nav_graph: dict, places: List[str]) -> Optional[dict]:
     """The refusal (`no_stop_destinations.refused`'s dict) of the first place
-    that is a named no-stop junction, or None."""
+    that is a named no-stop junction (F-909) or, the fourth addendum's ruling
+    5, any other no-stop vertex the core ends no grant on (a turn, a place's
+    way out, a corridor mouth's end), or None. The name is kept: every intake
+    path calls it (`tasks.guard_patrol_destination`)."""
     if not places:
         return None
-    refused = no_stop_destinations.refused(_level(nav_graph))
+    level = _level(nav_graph)
+    # the fourth addendum's ruling 5: every no-stop kind, read from the level's
+    # own lanes (`api_server.safe_stops`, the adapter's file byte for byte)
+    refused = no_stop_destinations.refused(level, safe_stops.areas(level))
     for place in places:
         if place in refused:
             return refused[place]

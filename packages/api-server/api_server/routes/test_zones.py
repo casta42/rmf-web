@@ -105,8 +105,12 @@ class TestZonesRoute(AppFixture):
                 self.assertEqual(0.3, lanes[(2, 0)]["params"]["speed_limit"])
                 # F-388: a site with nothing cut off serves an empty list
                 self.assertEqual([], graph["out_of_service"])
-                # F-909: no named no-stop junction, none refused (boring)
-                self.assertEqual([], graph["refused_destinations"])
+                # F-909: no named no-stop junction, none refused as one
+                # (boring); the fourth addendum's ruling 5: j_sw is the
+                # triangle's sharp bend, a turn, refused as a turn
+                refused = graph["refused_destinations"]
+                self.assertEqual([], [r["name"] for r in refused if r["kind"] == "junction"])
+                self.assertEqual(["j_sw"], [r["name"] for r in refused if r["kind"] == "turn"])
             finally:
                 app_config.zones_file = old
 
@@ -143,6 +147,47 @@ class TestZonesRoute(AppFixture):
                     ],
                     graph["out_of_service"],
                 )
+            finally:
+                app_config.zones_file = old
+
+    def test_serves_a_turn_as_a_refused_destination_ruling5(self):
+        """The fourth addendum's ruling 5 (G, 2026-11-06): an L, holding
+        points a and b either side of the right-angle turn k, is served with k
+        refused, its kind 'turn' and the turn's sentence; FIRE as F-909 served
+        it (the module on the lanes alone): none."""
+        graph_yaml = (
+            "building_name: l\n"
+            "levels:\n"
+            "  L1:\n"
+            "    vertices:\n"
+            "    - [0.0, 0.0, {name: a, is_holding_point: true}]\n"
+            "    - [5.0, 0.0, {name: k}]\n"
+            "    - [5.0, 5.0, {name: b, is_holding_point: true}]\n"
+            "    lanes:\n"
+            "    - [0, 1, {}]\n    - [1, 0, {}]\n    - [1, 2, {}]\n    - [2, 1, {}]\n"
+        )
+        import yaml
+
+        from api_server import no_stop_destinations
+
+        level = yaml.safe_load(graph_yaml)["levels"]["L1"]
+        self.assertEqual({}, no_stop_destinations.refused(level))
+        with tempfile.TemporaryDirectory() as site_dir:
+            zones_path = os.path.join(site_dir, "zones.yaml")
+            with open(zones_path, "w", encoding="utf8") as f:
+                f.write(ZONES_YAML)
+            os.mkdir(os.path.join(site_dir, "nav_graphs"))
+            with open(os.path.join(site_dir, "nav_graphs", "0.yaml"), "w", encoding="utf8") as f:
+                f.write(graph_yaml)
+            old = app_config.zones_file
+            app_config.zones_file = zones_path
+            try:
+                graph = self.client.get("/zones/nav_graph").json()
+                got = graph["refused_destinations"]
+                self.assertEqual(["k"], [r["name"] for r in got])
+                self.assertEqual("turn", got[0]["kind"])
+                self.assertEqual(5.0, got[0]["metres"])
+                self.assertIn("it is a turn: ", got[0]["message"])
             finally:
                 app_config.zones_file = old
 

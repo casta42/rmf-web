@@ -12,7 +12,7 @@ from typing import Any, Dict, Optional
 import yaml
 from fastapi import APIRouter, HTTPException
 
-from api_server import no_stop_destinations
+from api_server import no_stop_destinations, safe_stops
 from api_server.app_config import app_config
 
 router = APIRouter(tags=["Zones"])
@@ -108,10 +108,15 @@ def _normalize_nav_graph(data: Dict[str, Any]) -> Dict[str, Any]:
     # targets leave it out, and the dispatch guard refuses a mission to it,
     # each with the reason and the nearest place it can go
     # (`api_server.no_stop_destinations`, the fleet adapter's file byte for
-    # byte)
+    # byte). The fourth addendum's ruling 5 (G, 2026-11-06): every other
+    # no-stop kind the core ends no grant on too (a turn, a place's way out,
+    # a corridor's mouth), read from the level's no-stop areas
+    # (`api_server.safe_stops`, the adapter's file byte for byte)
     refused = [
-        {k: r[k] for k in ("name", "reason", "nearest", "metres", "message")}
-        for _n, r in sorted(no_stop_destinations.refused(level).items())
+        {k: r[k] for k in ("name", "kind", "reason", "nearest", "metres",
+                           "message")}
+        for _n, r in sorted(no_stop_destinations.refused(
+            level, safe_stops.areas(level)).items())
     ]
     return {
         "level": level_name,
