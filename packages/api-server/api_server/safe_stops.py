@@ -29,7 +29,12 @@ can be compared exactly (reading s3):
             r1, confirmed by D-139 ruling 8): from the place along the
             lanes to the first vertex where a robot leaving has a real
             choice of ways on, that vertex included — the place's own
-            vertex is a safe stop, not part of it;
+            vertex is a safe stop, not part of it. Where every lane of it
+            past the place's own first lane is served one way, it ends at
+            the first vertex past the place's own lane (`oneway_cut`; D-142
+            twentieth addendum, G's ruling 5; CORE_DESIGN.md §4.14 class
+            (1)): there a robot leaving can only follow the robot ahead of
+            it, and nobody can come at a robot standing there the other way;
   mouth     each single-lane corridor — a chain of two-way lanes through
             vertices of two lanes, a junction (no dead end) at each end —
             at each end: its last lane to the end vertex and the turning
@@ -151,6 +156,19 @@ def way_out(g, place):
         path.append(v)
 
 
+def oneway_cut(g, path):
+    '''The way out's MARK (D-142 twentieth addendum, G's ruling 5; F-982;
+    CORE_DESIGN.md §4.14 (a) 1, class (1)'s clause): a way out of more than
+    one lane whose every lane past the place's own first lane is served one
+    way (no lane back) is marked no-stop only to the first vertex past the
+    place's own lane; else the path as it is. The way out itself
+    (`way_out`) is the way a robot leaves, and is not changed.'''
+    if len(path) > 2 and all((path[j + 1], path[j]) not in g.directed
+                             for j in range(1, len(path) - 1)):
+        return path[:2]
+    return path
+
+
 def turning_vertices(g, lim=TURN_IN_PLACE):
     '''{vertex: the largest bend a robot drives there} for every vertex
     where it turns more than `lim`: a lane in, then a lane out to another
@@ -238,7 +256,7 @@ def areas(level, lim=TURN_IN_PLACE):
         out.append({'kind': 'turn', 'vertex': v, 'name': g.name(v),
                     'bend': round(bend, 4)})
     for p in places(g):
-        path = way_out(g, p)
+        path = oneway_cut(g, way_out(g, p))
         if len(path) > 1:
             out.append({'kind': 'way_out', 'place': p, 'path': path,
                         'name': g.name(p)})
